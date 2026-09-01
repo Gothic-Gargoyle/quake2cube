@@ -98,6 +98,13 @@ void SWimp_Shutdown( void )
 
 int SWimp_Init( void *hInstance, void *wndProc )
 {
+  /*
+   * The desktop config.cfg may contain "sw_mode 0".
+   * GameCube has a fixed 640x480 presentation target, so override
+   * the software-renderer mode here, after configs have loaded.
+   */
+  ri.Cvar_SetValue("sw_mode", 3);
+
   if (SDL_Init(SDL_INIT_VIDEO) < 0)
   {
     Sys_Error("VID: Couldn't load SDL: %s", SDL_GetError());
