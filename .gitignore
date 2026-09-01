@@ -6,3 +6,9 @@ baseq2*
 x64
 Debug
 Release
+
+# GameCube build outputs
+build-gamecube/
+*.elf
+*.dol
+*.iso

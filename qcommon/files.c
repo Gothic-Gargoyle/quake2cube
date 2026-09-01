@@ -453,7 +453,7 @@ pack_t *FS_LoadPackFile (char *packfile)
 	int				numpackfiles;
 	pack_t			*pack;
 	FILE			*packhandle;
-	dpackfile_t		info[MAX_FILES_IN_PACK];
+	dpackfile_t		*info;
 	unsigned		checksum;
 
 	packhandle = fopen(packfile, "rb");
@@ -470,6 +470,8 @@ pack_t *FS_LoadPackFile (char *packfile)
 
 	if (numpackfiles > MAX_FILES_IN_PACK)
 		Com_Error (ERR_FATAL, "%s has %i files", packfile, numpackfiles);
+
+	info = Z_Malloc (header.dirlen);
 
 	newfiles = Z_Malloc (numpackfiles * sizeof(packfile_t));
 
@@ -490,6 +492,8 @@ pack_t *FS_LoadPackFile (char *packfile)
 		newfiles[i].filepos = LittleLong(info[i].filepos);
 		newfiles[i].filelen = LittleLong(info[i].filelen);
 	}
+
+	Z_Free (info);
 
 	pack = Z_Malloc (sizeof (pack_t));
 	strcpy (pack->filename, packfile);

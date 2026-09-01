@@ -1,0 +1,90 @@
+PROJECT_DIR := $(patsubst %/,%,$(dir $(abspath $(firstword $(MAKEFILE_LIST)))))
+CARRY_ROOT ?= $(abspath $(PROJECT_DIR)/../carryhandle)
+
+TARGET := quake2cube
+BUILD  := build-gamecube
+
+SOURCES := \
+	$(PROJECT_DIR)/client \
+	$(PROJECT_DIR)/qcommon \
+	$(PROJECT_DIR)/server \
+	$(PROJECT_DIR)/game \
+	$(PROJECT_DIR)/ref_soft \
+	$(PROJECT_DIR)/other \
+	$(PROJECT_DIR)/null \
+	$(PROJECT_DIR)/net \
+	$(PROJECT_DIR)/sound \
+	$(PROJECT_DIR) \
+	$(CARRY_ROOT)/source
+
+CFILES := \
+	$(notdir $(wildcard $(PROJECT_DIR)/client/*.c)) \
+	$(notdir $(wildcard $(PROJECT_DIR)/qcommon/*.c)) \
+	$(filter-out sv_null.c,$(notdir $(wildcard $(PROJECT_DIR)/server/*.c))) \
+	$(notdir $(wildcard $(PROJECT_DIR)/game/*.c)) \
+	$(notdir $(wildcard $(PROJECT_DIR)/ref_soft/*.c)) \
+	q_hunk.c \
+	vid_menu.c \
+	vid_lib.c \
+	q_system.c \
+	glob.c \
+	cd_null.c \
+	net_loopback.c \
+	snddma_null.c \
+	port_platform_gamecube.c \
+	port_soft_gamecube.c \
+	ch_dvd.c \
+	ch_input.c \
+	ch_pad_bus.c \
+	ch_time.c
+
+APP_INCLUDES = \
+	$(CARRY_ROOT)/include \
+	$(DEVKITPRO)/libogc2/gamecube/include \
+	$(DEVKITPRO)/libogc2/gamecube/include/SDL2 \
+	$(PORTLIBS_PATH)/ppc/include
+
+APP_LIBDIRS = \
+	$(DEVKITPRO)/libogc2/gamecube \
+	$(PORTLIBS_PATH)/ppc
+
+APP_CFLAGS = \
+	-fcommon \
+	-Wno-error=incompatible-pointer-types \
+	-Dstricmp=strcasecmp \
+	-include strings.h \
+	-DSDL_MAIN_HANDLED
+
+APP_LIBS = \
+	-lSDL2 \
+	-lopengx \
+	-laesnd \
+	-logc \
+	-lz \
+	-lstdc++ \
+	-lm
+
+include $(CARRY_ROOT)/make/gamecube.mk
+
+
+# --- GameCube disc image ---
+
+Q2_DISC_ROOT  := $(PROJECT_DIR)/$(BUILD)/disc
+Q2_DISC_STAMP := $(PROJECT_DIR)/$(BUILD)/.disc.stamp
+
+GCM_ROOT    := $(Q2_DISC_ROOT)
+GCM_OUTPUT  := $(PROJECT_DIR)/quake2cube.iso
+GCM_TITLE   := QUAKE2CUBE
+GCM_REGION  := PAL
+GCM_PREPARE := $(Q2_DISC_STAMP)
+
+$(Q2_DISC_STAMP): $(PROJECT_DIR)/baseq2/pak0.pak
+	@echo "staging Quake II data ..."
+	@rm -rf "$(Q2_DISC_ROOT)"
+	@mkdir -p "$(Q2_DISC_ROOT)"
+	@cp -a "$(PROJECT_DIR)/baseq2" "$(Q2_DISC_ROOT)/baseq2"
+	@touch "$@"
+
+include $(CARRY_ROOT)/make/image.mk
+
+include $(CARRY_ROOT)/make/dolphin.mk
