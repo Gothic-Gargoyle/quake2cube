@@ -28,8 +28,6 @@ SOURCES := \
 	$(PROJECT_DIR)/net \
 	$(PROJECT_DIR)/sound \
 	$(PROJECT_DIR) \
-	$(CARRY_ROOT)/source \
-	$(CARRY_ROOT)/source/video
 
 CFILES := \
 	$(notdir $(wildcard $(PROJECT_DIR)/client/*.c)) \
@@ -47,12 +45,6 @@ CFILES := \
 	snddma_null.c \
 	port_platform_gamecube.c \
 	port_soft_gamecube.c \
-	ch_dvd.c \
-	ch_input.c \
-	ch_input_physical.c \
-	ch_pad_bus.c \
-	ch_time.c \
-	ch_video_gamecube.c
 
 CPPFILES :=
 sFILES   :=
@@ -100,53 +92,93 @@ export LIBPATHS := \
 	-L$(DEVKITPRO)/portlibs/ppc/lib \
 	-L$(LIBOGC_LIB)
 
+# Q2GC_CARRYHANDLE_MODULES
+#
+# Quake selects the CarryHandle modules it uses.
+# CarryHandle owns their physical source directories.
+#
+CH_CFILES := \
+	ch_dvd.c \
+	ch_input.c \
+	ch_input_physical.c \
+	ch_pad_bus.c \
+	ch_time.c \
+	ch_video_gamecube.c
+
 include $(CARRY_ROOT)/make/gamecube.mk
+# ------------------------------------------------------------------
+# Quake2Cube-specific disc contents.
+#
+# CarryHandle owns native GCM construction and Dolphin launching.
+# ------------------------------------------------------------------
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))
 
-.PHONY: clean iso test
+Q2_DISC_STAGE := q2-disc-stage
 
-clean:
-	@echo clean ...
-	@rm -rf \
-		"$(PROJECT_DIR)/$(BUILD)" \
-		"$(PROJECT_DIR)/$(TARGET).elf" \
-		"$(PROJECT_DIR)/$(TARGET).dol" \
-		"$(PROJECT_DIR)/$(TARGET).iso"
+.PHONY: $(Q2_DISC_STAGE)
 
-iso: all
-	@test -f "$(CARRY_ROOT)/tools/native-gcm/mkdoomcube.py" || \
-		( echo "ERROR: missing native GCM builder." && false )
-	@test -f "$(CARRY_ROOT)/tools/native-gcm/apploader.bin" || \
-		( echo "ERROR: missing apploader.bin." && false )
+$(Q2_DISC_STAGE):
 	@test -f "$(PROJECT_DIR)/baseq2/pak0.pak" || \
-		( echo "ERROR: missing baseq2/pak0.pak." && false )
+		( echo "ERROR: missing baseq2/pak0.pak."; false )
 
 	@rm -rf "$(PROJECT_DIR)/$(BUILD)/disc"
 	@mkdir -p "$(PROJECT_DIR)/$(BUILD)/disc"
+
 	@echo "Adding Quake II data"
-	@cp -a "$(PROJECT_DIR)/baseq2" "$(PROJECT_DIR)/$(BUILD)/disc/baseq2"
 
-	python3 "$(CARRY_ROOT)/tools/native-gcm/mkdoomcube.py" \
-		--dol "$(PROJECT_DIR)/$(TARGET).dol" \
-		--apploader "$(CARRY_ROOT)/tools/native-gcm/apploader.bin" \
-		--root "$(PROJECT_DIR)/$(BUILD)/disc" \
-		--output "$(PROJECT_DIR)/$(TARGET).iso" \
-		--title "QUAKE2CUBE" \
-		--region PAL
-
-test:
-	$(MAKE) -f "$(PROJECT_DIR)/Makefile.gamecube" clean
-	$(MAKE) -f "$(PROJECT_DIR)/Makefile.gamecube"
-	$(MAKE) -f "$(PROJECT_DIR)/Makefile.gamecube" iso
-
-	@echo
-	@echo "Launching Quake2Cube..."
-	@echo
-
-	flatpak run \
-		--filesystem="$(PROJECT_DIR)" \
-		org.DolphinEmu.dolphin-emu \
-		-b -e "$(PROJECT_DIR)/$(TARGET).iso"
+	@cp -a \
+		"$(PROJECT_DIR)/baseq2" \
+		"$(PROJECT_DIR)/$(BUILD)/disc/baseq2"
 
 endif
+
+
+GCM_ROOT := \
+	$(PROJECT_DIR)/$(BUILD)/disc
+
+GCM_OUTPUT := \
+	$(PROJECT_DIR)/$(TARGET).iso
+
+GCM_TITLE := QUAKE2CUBE
+
+GCM_REGION := PAL
+
+GCM_PREPARE := \
+	$(Q2_DISC_STAGE)
+
+
+include $(CARRY_ROOT)/make/image.mk
+
+
+# ------------------------------------------------------------------
+# Quake2Cube test policy.
+#
+# Preserve the established GameCube test contract:
+#
+#     clean
+#       -> fresh normal build
+#       -> fresh ISO
+#       -> Dolphin
+#
+# CarryHandle owns the generic Dolphin launch. TEST_TARGET keeps the
+# application-specific serialized build policy in Quake2Cube.
+# ------------------------------------------------------------------
+
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+
+Q2_TEST_TARGET := q2-test-image
+
+.PHONY: $(Q2_TEST_TARGET)
+
+$(Q2_TEST_TARGET):
+	$(MAKE) -f "$(PROJECT_MAKEFILE)" clean
+	$(MAKE) -f "$(PROJECT_MAKEFILE)"
+	$(MAKE) -f "$(PROJECT_MAKEFILE)" iso
+
+TEST_TARGET := $(Q2_TEST_TARGET)
+
+endif
+
+
+include $(CARRY_ROOT)/make/dolphin.mk
