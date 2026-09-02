@@ -480,3 +480,61 @@ typedef struct
 	int		numareaportals;
 	int		firstareaportal;
 } darea_t;
+
+#ifdef HW_DOL
+/*
+ * Q2GC_PACKAGED_MAP_LIMITS
+ *
+ * Quake II's original MAX_MAP_* values were chosen for a PC
+ * address space and produce several MiB of permanently resident
+ * static arrays.
+ *
+ * The complete packaged Quake2Cube BSP set was scanned before
+ * choosing these values. Each ceiling is the next power of two
+ * at or above 125% of the largest packaged map value.
+ *
+ * Limits that were already close to real packaged usage are left
+ * at their original values.
+ *
+ * This is deliberately GameCube-only. Other builds retain the
+ * original Quake II limits.
+ */
+#undef MAX_MAP_MODELS
+#define MAX_MAP_MODELS          256
+
+#undef MAX_MAP_TEXINFO
+#define MAX_MAP_TEXINFO         2048
+
+#undef MAX_MAP_AREAS
+#define MAX_MAP_AREAS           32
+
+#undef MAX_MAP_AREAPORTALS
+#define MAX_MAP_AREAPORTALS     64
+
+#undef MAX_MAP_PLANES
+#define MAX_MAP_PLANES          32768
+
+#undef MAX_MAP_NODES
+#define MAX_MAP_NODES           16384
+
+#undef MAX_MAP_LEAFS
+#define MAX_MAP_LEAFS           16384
+
+#undef MAX_MAP_LEAFFACES
+#define MAX_MAP_LEAFFACES       32768
+
+#undef MAX_MAP_LEAFBRUSHES
+#define MAX_MAP_LEAFBRUSHES     16384
+
+#undef MAX_MAP_EDGES
+#define MAX_MAP_EDGES           65536
+
+#undef MAX_MAP_SURFEDGES
+#define MAX_MAP_SURFEDGES       131072
+
+#undef MAX_MAP_FACES
+#define MAX_MAP_FACES           32768
+
+#undef MAX_MAP_VISIBILITY
+#define MAX_MAP_VISIBILITY      524288
+#endif
