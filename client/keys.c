@@ -144,6 +144,22 @@ keyname_t keynames[] =
 	{"KP_PLUS",			K_KP_PLUS },
 
 	{"MWHEELUP", K_MWHEELUP },
+
+	{"GC_DPAD_UP", K_GC_DPAD_UP},
+	{"GC_DPAD_DOWN", K_GC_DPAD_DOWN},
+	{"GC_DPAD_LEFT", K_GC_DPAD_LEFT},
+	{"GC_DPAD_RIGHT", K_GC_DPAD_RIGHT},
+
+	{"GC_STICK_UP", K_GC_STICK_UP},
+	{"GC_STICK_DOWN", K_GC_STICK_DOWN},
+	{"GC_STICK_LEFT", K_GC_STICK_LEFT},
+	{"GC_STICK_RIGHT", K_GC_STICK_RIGHT},
+
+	{"GC_CSTICK_UP", K_GC_CSTICK_UP},
+	{"GC_CSTICK_DOWN", K_GC_CSTICK_DOWN},
+	{"GC_CSTICK_LEFT", K_GC_CSTICK_LEFT},
+	{"GC_CSTICK_RIGHT", K_GC_CSTICK_RIGHT},
+
 	{"MWHEELDOWN", K_MWHEELDOWN },
 
 	{"PAUSE", K_PAUSE},
@@ -763,7 +779,29 @@ void Key_Event (int key, qboolean down, unsigned time)
 			&& key_repeats[key] > 1)
 			return;	// ignore most autorepeats
 			
+#ifdef HW_DOL
+		/*
+		 * Q2GC_PHYSICAL_DIRECTION_NO_UNBOUND_WARNING
+		 *
+		 * GameCube directional identities live in the >= 200
+		 * key namespace, but an unbound analogue-stick direction
+		 * is perfectly normal.
+		 *
+		 * Do not spam Quake II's ancient "hit F4" warning for:
+		 *
+		 *     D-pad directions
+		 *     main-stick directions
+		 *     C-stick directions
+		 *
+		 * Their identities still pass through Key_Event normally.
+		 */
+		if (key >= 200 &&
+		    !keybindings[key] &&
+		    !(key >= K_GC_DPAD_UP &&
+		      key <= K_GC_CSTICK_RIGHT))
+#else
 		if (key >= 200 && !keybindings[key])
+#endif
 			Com_Printf ("%s is unbound, hit F4 to set.\n", Key_KeynumToString (key) );
 	}
 	else
@@ -940,4 +978,3 @@ int Key_GetKey (void)
 
 	return key_waiting;
 }
-

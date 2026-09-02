@@ -8,7 +8,7 @@ of the License, or (at your option) any later version.
 
 This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
 See the GNU General Public License for more details.
 
@@ -20,6 +20,21 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // cl.input.c  -- builds an intended movement command to send to the server
 
 #include "client.h"
+
+#ifdef HW_DOL
+/*
+ * Q2GC_TRUE_ANALOG_CL_INPUT
+ *
+ * Native signed GameCube axes supplied by port_soft_gamecube.c.
+ */
+extern void QG_GetGamepadAxes(
+    float *move_x,
+    float *move_y,
+    float *look_x,
+    float *look_y
+);
+#endif
+
 
 cvar_t	*cl_nodelta;
 
@@ -67,7 +82,7 @@ void KeyDown (kbutton_t *b)
 {
 	int		k;
 	char	*c;
-	
+
 	c = Cmd_Argv(1);
 	if (c[0])
 		k = atoi(c);
@@ -76,7 +91,7 @@ void KeyDown (kbutton_t *b)
 
 	if (k == b->down[0] || k == b->down[1])
 		return;		// repeating key
-	
+
 	if (!b->down[0])
 		b->down[0] = k;
 	else if (!b->down[1])
@@ -86,7 +101,7 @@ void KeyDown (kbutton_t *b)
 		Com_Printf ("Three keys down for a button!\n");
 		return;
 	}
-	
+
 	if (b->state & 1)
 		return;		// still down
 
@@ -242,7 +257,7 @@ void CL_AdjustAngles (void)
 {
 	float	speed;
 	float	up, down;
-	
+
 	if (in_speed.state & 1)
 		speed = cls.frametime * cl_anglespeedkey->value;
 	else
@@ -258,12 +273,55 @@ void CL_AdjustAngles (void)
 		cl.viewangles[PITCH] -= speed*cl_pitchspeed->value * CL_KeyState (&in_forward);
 		cl.viewangles[PITCH] += speed*cl_pitchspeed->value * CL_KeyState (&in_back);
 	}
-	
+
 	up = CL_KeyState (&in_lookup);
 	down = CL_KeyState(&in_lookdown);
-	
+
 	cl.viewangles[PITCH] -= speed*cl_pitchspeed->value * up;
 	cl.viewangles[PITCH] += speed*cl_pitchspeed->value * down;
+
+
+#ifdef HW_DOL
+	/*
+	 * GameCube C-stick: true analogue camera rate.
+	 *
+	 * This deliberately follows Quake II's existing keyboard angular
+	 * speed model instead of pretending the stick is a mouse.
+	 */
+	if (cls.key_dest == key_game &&
+	    cls.state == ca_active)
+	{
+		float gc_move_x;
+		float gc_move_y;
+		float gc_look_x;
+		float gc_look_y;
+
+		QG_GetGamepadAxes(
+			&gc_move_x,
+			&gc_move_y,
+			&gc_look_x,
+			&gc_look_y
+		);
+
+		/*
+		 * Positive GameCube C-stick X = right.
+		 * Quake II turns right by subtracting yaw.
+		 */
+		cl.viewangles[YAW] -=
+			speed *
+			cl_yawspeed->value *
+			gc_look_x;
+
+		/*
+		 * Positive GameCube C-stick Y = up.
+		 * Quake II looks up by subtracting pitch.
+		 */
+		cl.viewangles[PITCH] -=
+			speed *
+			cl_pitchspeed->value *
+			gc_look_y;
+	}
+#endif
 }
 
 /*
@@ -274,11 +332,11 @@ Send the intended movement message to the server
 ================
 */
 void CL_BaseMove (usercmd_t *cmd)
-{	
+{
 	CL_AdjustAngles ();
-	
+
 	memset (cmd, 0, sizeof(*cmd));
-	
+
 	VectorCopy (cl.viewangles, cmd->angles);
 	if (in_strafe.state & 1)
 	{
@@ -293,20 +351,56 @@ void CL_BaseMove (usercmd_t *cmd)
 	cmd->upmove -= cl_upspeed->value * CL_KeyState (&in_down);
 
 	if (! (in_klook.state & 1) )
-	{	
+	{
 		cmd->forwardmove += cl_forwardspeed->value * CL_KeyState (&in_forward);
 		cmd->forwardmove -= cl_forwardspeed->value * CL_KeyState (&in_back);
-	}	
+	}
 
 //
 // adjust for speed key / running
 //
-	if ( (in_speed.state & 1) ^ (int)(cl_run->value) )
+
+#ifdef HW_DOL
+	/*
+	 * GameCube main stick: true analogue movement.
+	 *
+	 * X = strafe
+	 * Y = forward/back
+	 *
+	 * This sits before Quake II's normal run multiplier, so the
+	 * engine keeps ownership of cl_run / +speed behavior.
+	 */
+	if (cls.key_dest == key_game &&
+	    cls.state == ca_active)
+	{
+		float gc_move_x;
+		float gc_move_y;
+		float gc_look_x;
+		float gc_look_y;
+
+		QG_GetGamepadAxes(
+			&gc_move_x,
+			&gc_move_y,
+			&gc_look_x,
+			&gc_look_y
+		);
+
+		cmd->sidemove +=
+			cl_sidespeed->value *
+			gc_move_x;
+
+		cmd->forwardmove +=
+			cl_forwardspeed->value *
+			gc_move_y;
+	}
+#endif
+
+if ( (in_speed.state & 1) ^ (int)(cl_run->value) )
 	{
 		cmd->forwardmove *= 2;
 		cmd->sidemove *= 2;
 		cmd->upmove *= 2;
-	}	
+	}
 }
 
 void CL_ClampPitch (void)
@@ -334,11 +428,11 @@ void CL_FinishMove (usercmd_t *cmd)
 
 //
 // figure button bits
-//	
+//
 	if ( in_attack.state & 3 )
 		cmd->buttons |= BUTTON_ATTACK;
 	in_attack.state &= ~2;
-	
+
 	if (in_use.state & 3)
 		cmd->buttons |= BUTTON_USE;
 	in_use.state &= ~2;
@@ -377,7 +471,7 @@ usercmd_t CL_CreateCmd (void)
 		frame_msec = 1;
 	if (frame_msec > 200)
 		frame_msec = 200;
-	
+
 	// get basic movement from keyboard
 	CL_BaseMove (&cmd);
 
@@ -479,7 +573,7 @@ void CL_SendCmd (void)
 	if ( cls.state == ca_connected)
 	{
 		if (cls.netchan.message.cursize	|| curtime - cls.netchan.last_sent > 1000 )
-			Netchan_Transmit (&cls.netchan, 0, buf.data);	
+			Netchan_Transmit (&cls.netchan, 0, buf.data);
 		return;
 	}
 
@@ -494,7 +588,7 @@ void CL_SendCmd (void)
 
 	SZ_Init (&buf, data, sizeof(data));
 
-	if (cmd->buttons && cl.cinematictime > 0 && !cl.attractloop 
+	if (cmd->buttons && cl.cinematictime > 0 && !cl.attractloop
 		&& cls.realtime - cl.cinematictime > 1000)
 	{	// skip the rest of the cinematic
 		SCR_FinishCinematic ();
@@ -539,7 +633,5 @@ void CL_SendCmd (void)
 	//
 	// deliver the message
 	//
-	Netchan_Transmit (&cls.netchan, buf.cursize, buf.data);	
+	Netchan_Transmit (&cls.netchan, buf.cursize, buf.data);
 }
-
-

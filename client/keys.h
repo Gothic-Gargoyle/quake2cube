@@ -129,6 +129,38 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define K_MWHEELDOWN	239
 #define K_MWHEELUP		240
 
+
+/*
+ * GameCube physical directional inputs.
+ *
+ * These are intentionally distinct from K_UPARROW etc.
+ *
+ * CarryHandle preserves the physical distinction between:
+ *
+ *     D-pad
+ *     main analogue stick
+ *     C-stick
+ *
+ * Quake therefore needs distinct virtual key identities as well,
+ * particularly for Customize Controls / binding persistence.
+ *
+ * 241..252 were unused in the original 0..255 key namespace.
+ */
+#define K_GC_DPAD_UP        241
+#define K_GC_DPAD_DOWN      242
+#define K_GC_DPAD_LEFT      243
+#define K_GC_DPAD_RIGHT     244
+
+#define K_GC_STICK_UP       245
+#define K_GC_STICK_DOWN     246
+#define K_GC_STICK_LEFT     247
+#define K_GC_STICK_RIGHT    248
+
+#define K_GC_CSTICK_UP      249
+#define K_GC_CSTICK_DOWN    250
+#define K_GC_CSTICK_LEFT    251
+#define K_GC_CSTICK_RIGHT   252
+
 extern char		*keybindings[256];
 extern	int		key_repeats[256];
 
@@ -143,4 +175,3 @@ void Key_WriteBindings (FILE *f);
 void Key_SetBinding (int keynum, char *binding);
 void Key_ClearStates (void);
 int Key_GetKey (void);
-

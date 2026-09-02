@@ -7,6 +7,7 @@
 
 #include <carryhandle/ch_dvd.h>
 #include <carryhandle/ch_input.h>
+#include <carryhandle/ch_input_physical.h>
 #include <carryhandle/ch_time.h>
 #include <carryhandle/ch_video.h>
 
@@ -278,11 +279,142 @@ int ConvertToQuakeKey(unsigned int keysym)
 
 #define GC_STICK_PRESS_THRESHOLD   24
 #define GC_STICK_RELEASE_THRESHOLD 12
+#define GC_CSTICK_PRESS_THRESHOLD   CH_INPUT_CSTICK_DEADZONE
+#define GC_CSTICK_RELEASE_THRESHOLD 16
 
-static bool gc_menu_up;
-static bool gc_menu_down;
-static bool gc_menu_left;
-static bool gc_menu_right;
+
+/*
+ * Q2GC_DISTINCT_DIRECTION_KEYS
+ *
+ * Separate event state for each physical directional control.
+ *
+ * NEVER merge:
+ *
+ *     D-pad
+ *     main stick
+ *     C-stick
+ */
+static bool gc_dpad_up;
+static bool gc_dpad_down;
+static bool gc_dpad_left;
+static bool gc_dpad_right;
+
+static bool gc_stick_up;
+static bool gc_stick_down;
+static bool gc_stick_left;
+static bool gc_stick_right;
+
+static bool gc_cstick_up;
+static bool gc_cstick_down;
+static bool gc_cstick_left;
+static bool gc_cstick_right;
+
+
+/*
+ * Q2GC_TRUE_ANALOG_PROVIDER
+ *
+ * CarryHandle gives us native signed GameCube stick axes.
+ * Keep the latest snapshot here so Quake's command builder can consume
+ * continuously variable movement instead of fake keyboard presses.
+ */
+
+static CH_PadState gc_analog_pad;
+static bool gc_analog_pad_valid;
+static bool gc_gameplay_capture;
+
+
+
+
+
+/*
+ * Native GameCube axis contract consumed by client/cl_input.c.
+ *
+ * move_x:
+ *   -1 = strafe left
+ *   +1 = strafe right
+ *
+ * move_y:
+ *   -1 = backwards
+ *   +1 = forwards
+ *
+ * look_x:
+ *   -1 = turn left
+ *   +1 = turn right
+ *
+ * look_y:
+ *   -1 = look down
+ *   +1 = look up
+ */
+void QG_GetGamepadAxes(
+    float *move_x,
+    float *move_y,
+    float *look_x,
+    float *look_y)
+{
+    if (move_x)
+        *move_x = 0.0f;
+
+    if (move_y)
+        *move_y = 0.0f;
+
+    if (look_x)
+        *look_x = 0.0f;
+
+    if (look_y)
+        *look_y = 0.0f;
+
+    if (!gc_analog_pad_valid)
+    {
+        return;
+    }
+
+    /*
+     * CarryHandle owns physical-axis selection,
+     * deadzones and rescaling.
+     *
+     * D-pad is deliberately NOT involved.
+     */
+    if (move_x)
+    {
+        *move_x =
+            CH_InputAnalogAxisFloat(
+                &gc_analog_pad,
+                CH_PHYSICAL_STICK_LEFT,
+                CH_PHYSICAL_STICK_RIGHT
+            );
+    }
+
+    if (move_y)
+    {
+        *move_y =
+            CH_InputAnalogAxisFloat(
+                &gc_analog_pad,
+                CH_PHYSICAL_STICK_DOWN,
+                CH_PHYSICAL_STICK_UP
+            );
+    }
+
+    if (look_x)
+    {
+        *look_x =
+            CH_InputAnalogAxisFloat(
+                &gc_analog_pad,
+                CH_PHYSICAL_CSTICK_LEFT,
+                CH_PHYSICAL_CSTICK_RIGHT
+            );
+    }
+
+    if (look_y)
+    {
+        *look_y =
+            CH_InputAnalogAxisFloat(
+                &gc_analog_pad,
+                CH_PHYSICAL_CSTICK_DOWN,
+                CH_PHYSICAL_CSTICK_UP
+            );
+    }
+}
+
 
 
 static void GC_SendLogicalKey(
@@ -345,6 +477,8 @@ void HandleInput(void)
 
     CH_InputPoll();
 
+    gc_analog_pad_valid = false;
+
     if (!CH_InputGetPad(
             0,
             &pad) ||
@@ -353,69 +487,183 @@ void HandleInput(void)
         return;
     }
 
+    gc_analog_pad =
+        pad;
+
+    gc_analog_pad_valid =
+        true;
+
+
+
+
     /*
-     * DoomCube-proven main-stick deadzone.  Combine the physical
-     * D-pad and analogue stick into one logical Quake direction so
-     * the two inputs cannot fight over the same key state.
-     */
-    /*
-     * Use hysteresis for analogue menu navigation.
+     * Q2GC_DISTINCT_DIRECTION_KEYS
      *
-     * A direction engages at the wider PRESS threshold but remains
-     * held until the stick returns inside the narrower RELEASE
-     * threshold. This prevents neutral-position jitter from emitting
-     * alternating arrow presses.
+     * Preserve each physical direction as its own Quake key.
+     *
+     * IMPORTANT:
+     *
+     * There are NO K_UPARROW / K_DOWNARROW / K_LEFTARROW /
+     * K_RIGHTARROW events here anymore.
+     *
+     * Ordinary menu navigation converts D-pad/main-stick keys to
+     * arrows later, inside Default_MenuKey().
+     *
+     * Customize Controls therefore sees the original physical key.
      */
+
+    /* --------------------------------------------------------- */
+    /* DIGITAL D-PAD                                             */
+    /* --------------------------------------------------------- */
+
+    GC_SendLogicalKey(
+        CH_InputPhysicalHeld(
+            &pad,
+            CH_PHYSICAL_DPAD_UP),
+        &gc_dpad_up,
+        K_GC_DPAD_UP);
+
+    GC_SendLogicalKey(
+        CH_InputPhysicalHeld(
+            &pad,
+            CH_PHYSICAL_DPAD_DOWN),
+        &gc_dpad_down,
+        K_GC_DPAD_DOWN);
+
+    GC_SendLogicalKey(
+        CH_InputPhysicalHeld(
+            &pad,
+            CH_PHYSICAL_DPAD_LEFT),
+        &gc_dpad_left,
+        K_GC_DPAD_LEFT);
+
+    GC_SendLogicalKey(
+        CH_InputPhysicalHeld(
+            &pad,
+            CH_PHYSICAL_DPAD_RIGHT),
+        &gc_dpad_right,
+        K_GC_DPAD_RIGHT);
+
+
+    /* --------------------------------------------------------- */
+    /* MAIN ANALOGUE STICK — digital identity for menus/binding  */
+    /* --------------------------------------------------------- */
+
     {
-        bool physical_up =
-            (pad.buttons_held & CH_PAD_BUTTON_UP) != 0;
-        bool physical_down =
-            (pad.buttons_held & CH_PAD_BUTTON_DOWN) != 0;
-        bool physical_left =
-            (pad.buttons_held & CH_PAD_BUTTON_LEFT) != 0;
-        bool physical_right =
-            (pad.buttons_held & CH_PAD_BUTTON_RIGHT) != 0;
+        bool held;
 
-        bool stick_up =
-            gc_menu_up
-                ? pad.stick_y > GC_STICK_RELEASE_THRESHOLD
-                : pad.stick_y > GC_STICK_PRESS_THRESHOLD;
-
-        bool stick_down =
-            gc_menu_down
-                ? pad.stick_y < -GC_STICK_RELEASE_THRESHOLD
-                : pad.stick_y < -GC_STICK_PRESS_THRESHOLD;
-
-        bool stick_left =
-            gc_menu_left
-                ? pad.stick_x < -GC_STICK_RELEASE_THRESHOLD
-                : pad.stick_x < -GC_STICK_PRESS_THRESHOLD;
-
-        bool stick_right =
-            gc_menu_right
-                ? pad.stick_x > GC_STICK_RELEASE_THRESHOLD
-                : pad.stick_x > GC_STICK_PRESS_THRESHOLD;
+        held =
+            gc_stick_up
+                ? pad.stick_y >
+                    GC_STICK_RELEASE_THRESHOLD
+                : pad.stick_y >
+                    GC_STICK_PRESS_THRESHOLD;
 
         GC_SendLogicalKey(
-            physical_up || stick_up,
-            &gc_menu_up,
-            K_UPARROW);
+            held,
+            &gc_stick_up,
+            K_GC_STICK_UP);
+
+
+        held =
+            gc_stick_down
+                ? pad.stick_y <
+                    -GC_STICK_RELEASE_THRESHOLD
+                : pad.stick_y <
+                    -GC_STICK_PRESS_THRESHOLD;
 
         GC_SendLogicalKey(
-            physical_down || stick_down,
-            &gc_menu_down,
-            K_DOWNARROW);
+            held,
+            &gc_stick_down,
+            K_GC_STICK_DOWN);
+
+
+        held =
+            gc_stick_left
+                ? pad.stick_x <
+                    -GC_STICK_RELEASE_THRESHOLD
+                : pad.stick_x <
+                    -GC_STICK_PRESS_THRESHOLD;
 
         GC_SendLogicalKey(
-            physical_left || stick_left,
-            &gc_menu_left,
-            K_LEFTARROW);
+            held,
+            &gc_stick_left,
+            K_GC_STICK_LEFT);
+
+
+        held =
+            gc_stick_right
+                ? pad.stick_x >
+                    GC_STICK_RELEASE_THRESHOLD
+                : pad.stick_x >
+                    GC_STICK_PRESS_THRESHOLD;
 
         GC_SendLogicalKey(
-            physical_right || stick_right,
-            &gc_menu_right,
-            K_RIGHTARROW);
+            held,
+            &gc_stick_right,
+            K_GC_STICK_RIGHT);
     }
+
+
+    /* --------------------------------------------------------- */
+    /* C-STICK — distinct identity, NEVER menu arrows            */
+    /* --------------------------------------------------------- */
+
+    {
+        bool held;
+
+        held =
+            gc_cstick_up
+                ? pad.cstick_y >
+                    GC_CSTICK_RELEASE_THRESHOLD
+                : pad.cstick_y >
+                    GC_CSTICK_PRESS_THRESHOLD;
+
+        GC_SendLogicalKey(
+            held,
+            &gc_cstick_up,
+            K_GC_CSTICK_UP);
+
+
+        held =
+            gc_cstick_down
+                ? pad.cstick_y <
+                    -GC_CSTICK_RELEASE_THRESHOLD
+                : pad.cstick_y <
+                    -GC_CSTICK_PRESS_THRESHOLD;
+
+        GC_SendLogicalKey(
+            held,
+            &gc_cstick_down,
+            K_GC_CSTICK_DOWN);
+
+
+        held =
+            gc_cstick_left
+                ? pad.cstick_x <
+                    -GC_CSTICK_RELEASE_THRESHOLD
+                : pad.cstick_x <
+                    -GC_CSTICK_PRESS_THRESHOLD;
+
+        GC_SendLogicalKey(
+            held,
+            &gc_cstick_left,
+            K_GC_CSTICK_LEFT);
+
+
+        held =
+            gc_cstick_right
+                ? pad.cstick_x >
+                    GC_CSTICK_RELEASE_THRESHOLD
+                : pad.cstick_x >
+                    GC_CSTICK_PRESS_THRESHOLD;
+
+        GC_SendLogicalKey(
+            held,
+            &gc_cstick_right,
+            K_GC_CSTICK_RIGHT);
+    }
+
 
     /*
      * Expose GameCube buttons as Quake joystick keys.
@@ -465,11 +713,25 @@ void QG_GetMouseDiff(
 
 void QG_CaptureMouse(void)
 {
+    /*
+     * QuakeGeneric calls this when gameplay owns pointer-style input.
+     *
+     * On GameCube we don't have a mouse to capture, but this is the
+     * perfect platform boundary for switching the main stick from
+     * digital menu arrows to true analogue gameplay movement.
+     */
+    gc_gameplay_capture = true;
 }
 
 
 void QG_ReleaseMouse(void)
 {
+    /*
+     * QuakeGeneric releases the mouse when menus own input.
+     *
+     * Re-enable main-stick -> menu-arrow synthesis.
+     */
+    gc_gameplay_capture = false;
 }
 
 

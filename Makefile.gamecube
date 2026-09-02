@@ -49,6 +49,7 @@ CFILES := \
 	port_soft_gamecube.c \
 	ch_dvd.c \
 	ch_input.c \
+	ch_input_physical.c \
 	ch_pad_bus.c \
 	ch_time.c \
 	ch_video_gamecube.c

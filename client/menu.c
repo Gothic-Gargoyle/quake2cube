@@ -72,6 +72,8 @@ typedef struct
 menulayer_t	m_layers[MAX_MENU_DEPTH];
 int		m_menudepth;
 
+static int bind_grab;
+
 static void M_Banner( char *name )
 {
 	int w, h;
@@ -143,6 +145,46 @@ const char *Default_MenuKey( menuframework_s *m, int key )
 {
 	const char *sound = NULL;
 	menucommon_s *item;
+
+
+#ifdef HW_DOL
+	/*
+	 * Q2GC_DISTINCT_DIRECTION_MENU_TRANSLATION
+	 *
+	 * Preserve physical GameCube key identity through Key_Event and
+	 * binding capture.
+	 *
+	 * Only at the generic MENU-navigation boundary do D-pad and
+	 * main-stick directions behave like traditional arrow keys.
+	 *
+	 * C-stick deliberately does NOT navigate menus.
+	 */
+	switch ( key )
+	{
+	case K_GC_DPAD_UP:
+	case K_GC_STICK_UP:
+		key = K_UPARROW;
+		break;
+
+	case K_GC_DPAD_DOWN:
+	case K_GC_STICK_DOWN:
+		key = K_DOWNARROW;
+		break;
+
+	case K_GC_DPAD_LEFT:
+	case K_GC_STICK_LEFT:
+		key = K_LEFTARROW;
+		break;
+
+	case K_GC_DPAD_RIGHT:
+	case K_GC_STICK_RIGHT:
+		key = K_RIGHTARROW;
+		break;
+
+	default:
+		break;
+	}
+#endif
 
 	if ( m )
 	{
@@ -611,7 +653,6 @@ char *bindnames[][2] =
 };
 
 int				keys_cursor;
-static int		bind_grab;
 
 static menuframework_s	s_keys_menu;
 static menuaction_s		s_keys_attack_action;
@@ -685,20 +726,17 @@ static void M_FindKeysForCommand (char *command, int *twokeys)
 
 static void KeyCursorDrawFunc( menuframework_s *menu )
 {
+
 	if ( bind_grab )
-		re.DrawChar( menu->x, menu->y + menu->cursor * 9, '=' );
+		re.DrawChar(
+			menu->x,
+			menu->y + menu->cursor * 9,
+			'=' );
 	else
-#ifdef HW_DOL
-		/*
-		 * The stock cursor alternates glyphs 12/13.
-		 * One animation frame is not reliably visible on GameCube,
-		 * making the selection marker appear to disappear.
-		 */
-		re.DrawChar( menu->x, menu->y + menu->cursor * 9, 12 );
-#else
-		re.DrawChar( menu->x, menu->y + menu->cursor * 9,
+		re.DrawChar(
+			menu->x,
+			menu->y + menu->cursor * 9,
 			12 + ( ( int ) ( Sys_Milliseconds() / 250 ) & 1 ) );
-#endif
 }
 
 static void DrawKeyBindingFunc( void *self )
@@ -996,6 +1034,7 @@ static const char *Keys_MenuKey( int key )
 
 	switch ( key )
 	{
+	case K_JOY1:		/* GameCube A = change binding */
 	case K_KP_ENTER:
 	case K_ENTER:
 		KeyBindingFunc( item );
@@ -4018,11 +4057,55 @@ M_Keydown
 */
 void M_Keydown (int key)
 {
+
+#ifdef HW_DOL
+	/*
+	 * Q2GC_GLOBAL_PHYSICAL_MENU_NAV
+	 *
+	 * Every Quake II menu ultimately passes through M_Keydown(),
+	 * including the main menu which does NOT use Default_MenuKey().
+	 *
+	 * Preserve raw GC_* identities while Customize Controls is
+	 * actively capturing a binding.
+	 */
+	if (!bind_grab)
+	{
+		switch (key)
+		{
+		case K_GC_DPAD_UP:
+		case K_GC_STICK_UP:
+			key = K_UPARROW;
+			break;
+
+		case K_GC_DPAD_DOWN:
+		case K_GC_STICK_DOWN:
+			key = K_DOWNARROW;
+			break;
+
+		case K_GC_DPAD_LEFT:
+		case K_GC_STICK_LEFT:
+			key = K_LEFTARROW;
+			break;
+
+		case K_GC_DPAD_RIGHT:
+		case K_GC_STICK_RIGHT:
+			key = K_RIGHTARROW;
+			break;
+
+		default:
+			/*
+			 * C-stick deliberately remains untouched:
+			 * no normal menu navigation, but still available
+			 * as a distinct binding while bind_grab is active.
+			 */
+			break;
+		}
+	}
+#endif
+
 	const char *s;
 
 	if (m_keyfunc)
 		if ( ( s = m_keyfunc( key ) ) != 0 )
 			S_StartLocalSound( ( char * ) s );
 }
-
-

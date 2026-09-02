@@ -377,6 +377,9 @@ void Menu_Draw( menuframework_s *menu )
 
 	item = Menu_ItemAtCursor( menu );
 
+
+
+
 	if ( item && item->cursordraw )
 	{
 		item->cursordraw( item );
