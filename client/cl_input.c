@@ -38,6 +38,22 @@ extern void QG_GetGamepadAxes(
 
 cvar_t	*cl_nodelta;
 
+#ifdef HW_DOL
+/*
+ * Q2GC_DOOM_STYLE_TURN_SENSITIVITY
+ *
+ * Match DoomCube's controller-turn sensitivity contract:
+ *
+ *     25% .. 200%
+ *     default 100%
+ *
+ * CarryHandle supplies the proportional physical axis.
+ * Quake owns how that axis becomes camera angular velocity.
+ */
+static cvar_t *gc_turn_sensitivity;
+#endif
+
+
 extern	unsigned	sys_frame_time;
 unsigned	frame_msec;
 unsigned	old_sys_frame_time;
@@ -307,19 +323,34 @@ void CL_AdjustAngles (void)
 		 * Positive GameCube C-stick X = right.
 		 * Quake II turns right by subtracting yaw.
 		 */
-		cl.viewangles[YAW] -=
-			speed *
-			cl_yawspeed->value *
-			gc_look_x;
+		{
+			float gc_turn_percent =
+				gc_turn_sensitivity
+					? gc_turn_sensitivity->value
+					: 100.0f;
+
+			if (gc_turn_percent < 25.0f)
+				gc_turn_percent = 25.0f;
+
+			if (gc_turn_percent > 200.0f)
+				gc_turn_percent = 200.0f;
+
+			cl.viewangles[YAW] -=
+				speed *
+				cl_yawspeed->value *
+				(gc_turn_percent / 100.0f) *
+				gc_look_x;
 
 		/*
 		 * Positive GameCube C-stick Y = up.
 		 * Quake II looks up by subtracting pitch.
 		 */
-		cl.viewangles[PITCH] -=
-			speed *
-			cl_pitchspeed->value *
-			gc_look_y;
+			cl.viewangles[PITCH] -=
+				speed *
+				cl_pitchspeed->value *
+				(gc_turn_percent / 100.0f) *
+				gc_look_y;
+		}
 	}
 #endif
 }
@@ -500,6 +531,15 @@ CL_InitInput
 */
 void CL_InitInput (void)
 {
+
+#ifdef HW_DOL
+	gc_turn_sensitivity =
+		Cvar_Get(
+			"gc_turn_sensitivity",
+			"100",
+			CVAR_ARCHIVE);
+#endif
+
 	Cmd_AddCommand ("centerview",IN_CenterView);
 
 	Cmd_AddCommand ("+moveup",IN_UpDown);

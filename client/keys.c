@@ -809,6 +809,25 @@ void Key_Event (int key, qboolean down, unsigned time)
 		key_repeats[key] = 0;
 	}
 
+#ifdef HW_DOL
+	/*
+	 * Q2GC_ANALOG_AXES_NO_DIGITAL_GAMEPLAY
+	 *
+	 * Same rule as DoomCube:
+	 * a stick consumed as an analogue gameplay axis must not also
+	 * execute its directional digital binding.
+	 *
+	 * Raw GC_* identities remain available in menus and binding capture.
+	 * D-pad remains digital.
+	 */
+	if (cls.key_dest == key_game &&
+	    key >= K_GC_STICK_UP &&
+	    key <= K_GC_CSTICK_RIGHT)
+	{
+		return;
+	}
+#endif
+
 	if (key == K_SHIFT)
 		shift_down = down;
 

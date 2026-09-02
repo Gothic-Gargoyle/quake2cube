@@ -74,6 +74,22 @@ int		m_menudepth;
 
 static int bind_grab;
 
+static float ClampCvar( float min, float max, float value );
+
+#ifdef HW_DOL
+/*
+ * Q2GC_TURN_SENSITIVITY_SLIDER
+ *
+ * curvalue is percentage / 5:
+ *
+ *      5  =  25%
+ *     20  = 100%
+ *     40  = 200%
+ */
+static menuslider_s s_keys_gc_turn_sensitivity_slider;
+#endif
+
+
 static void M_Banner( char *name )
 {
 	int w, h;
@@ -769,6 +785,32 @@ static void DrawKeyBindingFunc( void *self )
 	}
 }
 
+
+#ifdef HW_DOL
+static void GameCubeTurnSensitivityFunc( void *unused )
+{
+	float percent;
+
+	(void)unused;
+
+	percent =
+		s_keys_gc_turn_sensitivity_slider.curvalue *
+		5.0f;
+
+	if (percent < 25.0f)
+		percent = 25.0f;
+
+	if (percent > 200.0f)
+		percent = 200.0f;
+
+	Cvar_SetValue(
+		"gc_turn_sensitivity",
+		percent);
+}
+
+
+#endif
+
 static void KeyBindingFunc( void *self )
 {
 	menuaction_s *a = ( menuaction_s * ) self;
@@ -1003,6 +1045,42 @@ static void Keys_MenuInit( void )
 
 	Menu_AddItem( &s_keys_menu, ( void * ) &s_keys_help_computer_action );
 	
+
+#ifdef HW_DOL
+	s_keys_gc_turn_sensitivity_slider.generic.type =
+		MTYPE_SLIDER;
+
+	s_keys_gc_turn_sensitivity_slider.generic.x =
+		0;
+
+	s_keys_gc_turn_sensitivity_slider.generic.y =
+		y += 18;
+
+	s_keys_gc_turn_sensitivity_slider.generic.name =
+		"turn sensitivity";
+
+	s_keys_gc_turn_sensitivity_slider.generic.callback =
+		GameCubeTurnSensitivityFunc;
+
+	s_keys_gc_turn_sensitivity_slider.minvalue =
+		5;
+
+	s_keys_gc_turn_sensitivity_slider.maxvalue =
+		40;
+
+	s_keys_gc_turn_sensitivity_slider.curvalue =
+		ClampCvar(
+			5,
+			40,
+			Cvar_VariableValue(
+				"gc_turn_sensitivity") /
+			5.0f);
+
+	Menu_AddItem(
+		&s_keys_menu,
+		(void *)&s_keys_gc_turn_sensitivity_slider);
+#endif
+
 	Menu_SetStatusBar( &s_keys_menu, "enter to change, backspace to clear" );
 	Menu_Center( &s_keys_menu );
 }
@@ -1037,6 +1115,15 @@ static const char *Keys_MenuKey( int key )
 	case K_JOY1:		/* GameCube A = change binding */
 	case K_KP_ENTER:
 	case K_ENTER:
+#ifdef HW_DOL
+		if (item &&
+		    item->generic.type == MTYPE_SLIDER)
+		{
+			return Default_MenuKey(
+				&s_keys_menu,
+				K_RIGHTARROW);
+		}
+#endif
 		KeyBindingFunc( item );
 		return menu_in_sound;
 	case K_BACKSPACE:		// delete bindings
