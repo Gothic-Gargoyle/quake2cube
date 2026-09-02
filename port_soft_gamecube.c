@@ -258,6 +258,32 @@ int ConvertToQuakeKey(unsigned int keysym)
   return key;
 }
 
+#define GC_STICK_DEADZONE 16
+
+static bool gc_menu_up;
+static bool gc_menu_down;
+static bool gc_menu_left;
+static bool gc_menu_right;
+
+
+static void GC_SendLogicalKey(
+    bool held,
+    bool *was_held,
+    int quake_key)
+{
+    if (held == *was_held)
+    {
+        return;
+    }
+
+    *was_held = held;
+
+    Quake2_SendKey(
+        quake_key,
+        held);
+}
+
+
 static void GC_SendPadButton(
     const CH_PadState *pad,
     uint16_t button,
@@ -308,46 +334,69 @@ void HandleInput(void)
         return;
     }
 
-    GC_SendPadButton(
-        &pad,
-        CH_PAD_BUTTON_UP,
+    /*
+     * DoomCube-proven main-stick deadzone.  Combine the physical
+     * D-pad and analogue stick into one logical Quake direction so
+     * the two inputs cannot fight over the same key state.
+     */
+    GC_SendLogicalKey(
+        (pad.buttons_held & CH_PAD_BUTTON_UP) != 0 ||
+            pad.stick_y > GC_STICK_DEADZONE,
+        &gc_menu_up,
         K_UPARROW);
 
-    GC_SendPadButton(
-        &pad,
-        CH_PAD_BUTTON_DOWN,
+    GC_SendLogicalKey(
+        (pad.buttons_held & CH_PAD_BUTTON_DOWN) != 0 ||
+            pad.stick_y < -GC_STICK_DEADZONE,
+        &gc_menu_down,
         K_DOWNARROW);
 
-    GC_SendPadButton(
-        &pad,
-        CH_PAD_BUTTON_LEFT,
+    GC_SendLogicalKey(
+        (pad.buttons_held & CH_PAD_BUTTON_LEFT) != 0 ||
+            pad.stick_x < -GC_STICK_DEADZONE,
+        &gc_menu_left,
         K_LEFTARROW);
 
-    GC_SendPadButton(
-        &pad,
-        CH_PAD_BUTTON_RIGHT,
+    GC_SendLogicalKey(
+        (pad.buttons_held & CH_PAD_BUTTON_RIGHT) != 0 ||
+            pad.stick_x > GC_STICK_DEADZONE,
+        &gc_menu_right,
         K_RIGHTARROW);
 
-    GC_SendPadButton(
-        &pad,
-        CH_PAD_BUTTON_A,
-        K_ENTER);
+    /*
+     * Expose GameCube buttons as Quake joystick keys.
+     * Gameplay actions remain entirely user-bindable through
+     * Quake II's existing Customize Controls menu.
+     */
+    GC_SendPadButton(&pad, CH_PAD_BUTTON_A, K_JOY1);
+    GC_SendPadButton(&pad, CH_PAD_BUTTON_B, K_JOY2);
+    GC_SendPadButton(&pad, CH_PAD_BUTTON_X, K_JOY3);
+    GC_SendPadButton(&pad, CH_PAD_BUTTON_Y, K_JOY4);
+    GC_SendPadButton(&pad, CH_PAD_BUTTON_L, K_AUX1);
+    GC_SendPadButton(&pad, CH_PAD_BUTTON_R, K_AUX2);
+    GC_SendPadButton(&pad, CH_PAD_BUTTON_Z, K_AUX3);
 
-    GC_SendPadButton(
-        &pad,
-        CH_PAD_BUTTON_B,
-        K_ESCAPE);
-
-    GC_SendPadButton(
-        &pad,
-        CH_PAD_BUTTON_START,
-        K_ESCAPE);
+    /*
+     * Start remains the system/menu button rather than a
+     * configurable gameplay action.
+     */
+    GC_SendPadButton(&pad, CH_PAD_BUTTON_START, K_ESCAPE);
 }
 
 
 int QG_Milliseconds(void)
 {
-    return (int)CH_TimeMilliseconds();
+    static uint64_t origin;
+    static bool initialized;
+    uint64_t now = CH_TimeMilliseconds();
+
+    if (!initialized)
+    {
+        origin = now;
+        initialized = true;
+    }
+
+    return (int)(now - origin);
 }
 
 

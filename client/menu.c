@@ -158,6 +158,7 @@ const char *Default_MenuKey( menuframework_s *m, int key )
 
 	switch ( key )
 	{
+	case K_JOY2:
 	case K_ESCAPE:
 		M_PopMenu();
 		return menu_out_sound;
@@ -208,7 +209,6 @@ const char *Default_MenuKey( menuframework_s *m, int key )
 	case K_MOUSE2:
 	case K_MOUSE3:
 	case K_JOY1:
-	case K_JOY2:
 	case K_JOY3:
 	case K_JOY4:
 	case K_AUX1:
@@ -437,6 +437,7 @@ const char *M_Main_Key (int key)
 
 	switch (key)
 	{
+	case K_JOY2:		/* GameCube B = Back */
 	case K_ESCAPE:
 		M_PopMenu ();
 		break;
@@ -453,6 +454,7 @@ const char *M_Main_Key (int key)
 			m_main_cursor = MAIN_ITEMS - 1;
 		return sound;
 
+	case K_JOY1:		/* GameCube A = Select */
 	case K_KP_ENTER:
 	case K_ENTER:
 		m_entersound = true;
@@ -686,7 +688,17 @@ static void KeyCursorDrawFunc( menuframework_s *menu )
 	if ( bind_grab )
 		re.DrawChar( menu->x, menu->y + menu->cursor * 9, '=' );
 	else
-		re.DrawChar( menu->x, menu->y + menu->cursor * 9, 12 + ( ( int ) ( Sys_Milliseconds() / 250 ) & 1 ) );
+#ifdef HW_DOL
+		/*
+		 * The stock cursor alternates glyphs 12/13.
+		 * One animation frame is not reliably visible on GameCube,
+		 * making the selection marker appear to disappear.
+		 */
+		re.DrawChar( menu->x, menu->y + menu->cursor * 9, 12 );
+#else
+		re.DrawChar( menu->x, menu->y + menu->cursor * 9,
+			12 + ( ( int ) ( Sys_Milliseconds() / 250 ) & 1 ) );
+#endif
 }
 
 static void DrawKeyBindingFunc( void *self )

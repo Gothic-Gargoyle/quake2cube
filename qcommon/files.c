@@ -20,6 +20,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "qcommon.h"
 
+#ifdef HW_DOL
+#include <errno.h>
+
+/* Q2GC FS_READ DIAGNOSTIC */
+static const char *q2gc_fs_read_path;
+#endif
+
+
 // define this to dissalow any data but the demo pak file
 //#define	NO_ADDONS
 
@@ -363,6 +371,20 @@ void FS_Read (void *buffer, int len, FILE *f)
 		read = fread (buf, 1, block, f);
 		if (read == 0)
 		{
+#ifdef HW_DOL
+			Com_Printf (
+				"Q2GC FS zero: path=%s len=%d remaining=%d block=%d "
+				"ftell=%ld feof=%d ferror=%d errno=%d try=%d\\n",
+				q2gc_fs_read_path ? q2gc_fs_read_path : "<direct FS_Read>",
+				len,
+				remaining,
+				block,
+				(long)ftell(f),
+				feof(f),
+				ferror(f),
+				errno,
+				tries);
+#endif
 			// we might have been trying to read from a CD
 			if (!tries)
 			{
@@ -417,7 +439,15 @@ int FS_LoadFile (char *path, void **buffer)
 	buf = Z_Malloc(len);
 	*buffer = buf;
 
+#ifdef HW_DOL
+	q2gc_fs_read_path = path;
+#endif
+
 	FS_Read (buf, len, h);
+
+#ifdef HW_DOL
+	q2gc_fs_read_path = NULL;
+#endif
 
 	fclose (h);
 

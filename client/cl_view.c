@@ -319,18 +319,42 @@ void CL_PrepRefresh (void)
 	}
 	
 	Com_Printf ("                                     \r");
-	for (i=0 ; i<MAX_CLIENTS ; i++)
-	{
-		if (!cl.configstrings[CS_PLAYERSKINS+i][0])
-			continue;
-		Com_Printf ("client %i\r", i); 
-		SCR_UpdateScreen ();
-		Sys_SendKeyEvents ();	// pump message loop
-		CL_ParseClientinfo (i);
-		Com_Printf ("                                     \r");
-	}
+#ifdef HW_DOL
+	Com_Printf(
+		"Q2GC: CS_MAXCLIENTS='%s'\n",
+		cl.configstrings[CS_MAXCLIENTS]);
 
-	CL_LoadClientinfo (&cl.baseclientinfo, "unnamed\\male/grunt");
+	if (!strcmp(cl.configstrings[CS_MAXCLIENTS], "1")
+		|| !cl.configstrings[CS_MAXCLIENTS][0])
+	{
+		/*
+		 * In singleplayer the only client is the local viewer.
+		 * Its third-person model, weapon, skin and icon are not
+		 * needed for the normal first-person scene, and consume
+		 * hundreds of KiB of scarce MEM1 during registration.
+		 */
+		memset(cl.clientinfo, 0, sizeof(cl.clientinfo));
+		memset(&cl.baseclientinfo, 0, sizeof(cl.baseclientinfo));
+
+		Com_Printf(
+			"Q2GC: skipped singleplayer third-person client assets\n");
+	}
+	else
+#endif
+	{
+		for (i=0 ; i<MAX_CLIENTS ; i++)
+		{
+			if (!cl.configstrings[CS_PLAYERSKINS+i][0])
+				continue;
+			Com_Printf ("client %i\r", i);
+			SCR_UpdateScreen ();
+			Sys_SendKeyEvents ();	// pump message loop
+			CL_ParseClientinfo (i);
+			Com_Printf ("                                     \r");
+		}
+
+		CL_LoadClientinfo (&cl.baseclientinfo, "unnamed\\male/grunt");
+	}
 
 	// set sky textures and speed
 	Com_Printf ("sky\r", i); 

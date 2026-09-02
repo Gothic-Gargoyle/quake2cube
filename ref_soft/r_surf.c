@@ -390,10 +390,19 @@ void R_InitCaches (void)
 	{
 		size = SURFCACHE_SIZE_AT_320X240;
 
+#ifdef HW_DOL
+		/*
+		 * MEM1 is more valuable for permanent BSP/model/image data.
+		 * Keep a smaller software-renderer cache and accept extra
+		 * surface-cache churn instead of failing map registration.
+		 */
+		size = 512 * 1024;
+#else
 		pix = vid.width*vid.height;
 		if (pix > 64000)
 			size += (pix-64000)*3;
-	}		
+#endif
+	}
 
 	// round up to page size
 	size = (size + 8191) & ~8191;

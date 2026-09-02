@@ -1194,6 +1194,16 @@ Z_Malloc
 */
 void *Z_Malloc (int size)
 {
+#ifdef HW_DOL
+	if (size >= 50000)
+	{
+		Com_Printf (
+			"Q2GC Z_Malloc: size=%i caller=%p\n",
+			size,
+			__builtin_return_address(0));
+	}
+#endif
+
 	return Z_TagMalloc (size, 0);
 }
 
@@ -1430,6 +1440,9 @@ void Qcommon_Init (int argc, char **argv)
 	FS_InitFilesystem ();
 
 	Cbuf_AddText ("exec default.cfg\n");
+	#ifdef HW_DOL
+	Cbuf_AddText ("exec gamecube.cfg\n");
+#endif
 	Cbuf_AddText ("exec config.cfg\n");
 
 	Cbuf_AddEarlyCommands (true);

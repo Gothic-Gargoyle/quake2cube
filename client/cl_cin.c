@@ -19,6 +19,16 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 #include "client.h"
 
+#ifdef HW_DOL
+/*
+ * Cinematic Huffman nodes contain only -1 or indices 0..510.
+ * Use 16-bit nodes on GameCube to halve the table from 512 to 256 KiB.
+ */
+typedef short cin_hnode_t;
+#else
+typedef int cin_hnode_t;
+#endif
+
 typedef struct
 {
 	byte	*data;
@@ -38,7 +48,7 @@ typedef struct
 	byte	*pic_pending;
 
 	// order 1 huffman stuff
-	int		*hnodes1;	// [256][256][2];
+	cin_hnode_t	*hnodes1;	// [256][256][2];
 	int		numhnodes1[256];
 
 	int		h_used[512];
@@ -248,12 +258,12 @@ void Huff1TableInit (void)
 {
 	int		prev;
 	int		j;
-	int		*node, *nodebase;
+	cin_hnode_t	*node, *nodebase;
 	byte	counts[256];
 	int		numhnodes;
 
-	cin.hnodes1 = Z_Malloc (256*256*2*4);
-	memset (cin.hnodes1, 0, 256*256*2*4);
+	cin.hnodes1 = Z_Malloc (256*256*2*sizeof(*cin.hnodes1));
+	memset (cin.hnodes1, 0, 256*256*2*sizeof(*cin.hnodes1));
 
 	for (prev=0 ; prev<256 ; prev++)
 	{
@@ -303,7 +313,7 @@ cblock_t Huff1Decompress (cblock_t in)
 	int			count;
 	cblock_t	out;
 	int			inbyte;
-	int			*hnodes, *hnodesbase;
+	cin_hnode_t	*hnodes, *hnodesbase;
 //int		i;
 
 	// get decompressed count
@@ -582,6 +592,16 @@ void SCR_PlayCinematic (char *arg)
 
 	// make sure CD isn't playing music
 	CDAudio_Stop();
+
+#ifdef HW_DOL
+	/*
+	 * A cinematic/static attract item does not begin a renderer
+	 * registration of its own. Drop the previous demo/map assets
+	 * now so the cinematic decoder has MEM1 headroom.
+	 */
+	extern void R_GC_PurgeRegistrationResources(void);
+	R_GC_PurgeRegistrationResources();
+#endif
 
 	cl.cinematicframe = 0;
 	dot = strstr (arg, ".");

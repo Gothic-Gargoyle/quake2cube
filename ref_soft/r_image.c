@@ -20,6 +20,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "r_local.h"
 
+#ifdef HW_DOL
+#include <stddef.h>
+#include <stdio.h>
+
+extern int FS_FOpenFile (char *filename, FILE **file);
+extern void FS_FCloseFile (FILE *f);
+#endif
+
 
 #define	MAX_RIMAGES	1024
 image_t		r_images[MAX_RIMAGES];
@@ -94,6 +102,166 @@ void LoadPCX (char *filename, byte **pic, byte **palette, int *width, int *heigh
 	byte	*out, *pix;
 
 	*pic = NULL;
+
+#ifdef HW_DOL
+	/*
+	 * Stream PCX data directly from the filesystem instead of using
+	 * FS_LoadFile. This avoids keeping the complete compressed PCX
+	 * in MEM1 alongside its decoded pixel buffer.
+	 */
+	{
+		FILE *f = NULL;
+		pcx_t header;
+		byte inbuf[4096];
+		int header_size = (int)offsetof(pcx_t, data);
+		int remaining;
+		int inpos = 0;
+		int inlen = 0;
+		int outsize;
+		long start;
+
+		if (palette)
+			*palette = NULL;
+
+		len = FS_FOpenFile(filename, &f);
+		if (len < header_size + 768 || !f)
+		{
+			ri.Con_Printf(PRINT_DEVELOPER,
+				"Bad pcx file %s\n", filename);
+			if (f)
+				FS_FCloseFile(f);
+			return;
+		}
+
+		start = ftell(f);
+
+		if (fread(&header, 1, header_size, f) != (size_t)header_size)
+			goto gc_pcx_bad;
+
+		header.xmin = LittleShort(header.xmin);
+		header.ymin = LittleShort(header.ymin);
+		header.xmax = LittleShort(header.xmax);
+		header.ymax = LittleShort(header.ymax);
+		header.hres = LittleShort(header.hres);
+		header.vres = LittleShort(header.vres);
+		header.bytes_per_line = LittleShort(header.bytes_per_line);
+		header.palette_type = LittleShort(header.palette_type);
+
+		if (header.manufacturer != 0x0a
+			|| header.version != 5
+			|| header.encoding != 1
+			|| header.bits_per_pixel != 8
+			|| header.xmax >= 640
+			|| header.ymax >= 480)
+			goto gc_pcx_bad;
+
+		outsize = (header.ymax + 1) * (header.xmax + 1);
+		out = malloc(outsize);
+		if (!out)
+		{
+			ri.Con_Printf(PRINT_ALL,
+				"LoadPCX: couldn't allocate %i bytes for %s\n",
+				outsize, filename);
+			FS_FCloseFile(f);
+			return;
+		}
+
+		*pic = out;
+		pix = out;
+
+		if (palette)
+		{
+			*palette = malloc(768);
+			if (!*palette)
+				goto gc_pcx_bad;
+		}
+
+		if (width)
+			*width = header.xmax + 1;
+		if (height)
+			*height = header.ymax + 1;
+
+		remaining = len - header_size;
+
+#define GC_PCX_BYTE(dst)                                                \
+		do {                                                        \
+			if (inpos >= inlen) {                              \
+				int want = remaining;                       \
+				if (want > (int)sizeof(inbuf))              \
+					want = sizeof(inbuf);                \
+				if (want <= 0)                              \
+					goto gc_pcx_bad;                    \
+				inlen = fread(inbuf, 1, want, f);           \
+				if (inlen <= 0)                             \
+					goto gc_pcx_bad;                    \
+				remaining -= inlen;                         \
+				inpos = 0;                                  \
+			}                                                   \
+			(dst) = inbuf[inpos++];                              \
+		} while (0)
+
+		for (y = 0; y <= header.ymax;
+			y++, pix += header.xmax + 1)
+		{
+			for (x = 0; x <= header.xmax; )
+			{
+				GC_PCX_BYTE(dataByte);
+
+				if ((dataByte & 0xC0) == 0xC0)
+				{
+					runLength = dataByte & 0x3F;
+					GC_PCX_BYTE(dataByte);
+				}
+				else
+				{
+					runLength = 1;
+				}
+
+				while (runLength-- > 0)
+				{
+					if (x > header.xmax)
+						goto gc_pcx_bad;
+					pix[x++] = dataByte;
+				}
+			}
+		}
+
+#undef GC_PCX_BYTE
+
+		if (palette)
+		{
+			if (fseek(f, start + len - 768, SEEK_SET) != 0)
+				goto gc_pcx_bad;
+
+			if (fread(*palette, 1, 768, f) != 768)
+				goto gc_pcx_bad;
+		}
+
+		FS_FCloseFile(f);
+		return;
+
+gc_pcx_bad:
+		ri.Con_Printf(PRINT_DEVELOPER,
+			"PCX file %s was malformed\n", filename);
+
+		if (*pic)
+		{
+			free(*pic);
+			*pic = NULL;
+		}
+
+		if (palette && *palette)
+		{
+			free(*palette);
+			*palette = NULL;
+		}
+
+		if (f)
+			FS_FCloseFile(f);
+
+		return;
+	}
+#endif
 
 	//
 	// load the file
@@ -427,7 +595,16 @@ image_t *GL_LoadPic (char *name, byte *pic, int width, int height, imagetype_t t
 	image->type = type;
 
 	c = width*height;
+#ifdef HW_DOL
+	/*
+	 * LoadPCX already returned a malloc-owned width*height buffer.
+	 * Keep it directly instead of allocating and copying a second
+	 * complete image in MEM1.
+	 */
+	image->pixels[0] = pic;
+#else
 	image->pixels[0] = malloc (c);
+#endif
 	image->transparent = false;
 	for (i=0 ; i<c ; i++)
 	{
@@ -522,6 +699,10 @@ image_t	*R_FindImage (char *name, imagetype_t type)
 		if (!pic)
 			return NULL;	// ri.Sys_Error (ERR_DROP, "R_FindImage: can't load %s", name);
 		image = GL_LoadPic (name, pic, width, height, type);
+#ifdef HW_DOL
+		/* GL_LoadPic transferred ownership to image->pixels[0]. */
+		pic = NULL;
+#endif
 	}
 	else if (!strcmp(name+len-4, ".wal"))
 	{

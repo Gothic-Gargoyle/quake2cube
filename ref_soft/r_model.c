@@ -92,6 +92,9 @@ model_t *Mod_ForName (char *name, qboolean crash)
 	model_t	*mod;
 	unsigned *buf;
 	int		i;
+#ifdef HW_DOL
+	qboolean gc_alias_in_place = false;
+#endif
 	
 	if (!name[0])
 		ri.Sys_Error (ERR_DROP,"Mod_ForName: NULL name");
@@ -153,7 +156,18 @@ model_t *Mod_ForName (char *name, qboolean crash)
 	switch (LittleLong(*(unsigned *)buf))
 	{
 	case IDALIASHEADER:
+#ifdef HW_DOL
+		/*
+		 * The PC loader keeps the FS_LoadFile buffer alive while
+		 * allocating a second complete MD2 copy. MEM1 cannot afford
+		 * that peak. Transform the loaded buffer in place and transfer
+		 * its Z_Malloc ownership to the model instead.
+		 */
+		loadmodel->extradata = buf;
+		gc_alias_in_place = true;
+#else
 		loadmodel->extradata = Hunk_Begin (0x200000);
+#endif
 		Mod_LoadAliasModel (mod, buf);
 		break;
 		
@@ -172,9 +186,22 @@ model_t *Mod_ForName (char *name, qboolean crash)
 		break;
 	}
 
+#ifdef HW_DOL
+	if (gc_alias_in_place)
+	{
+		loadmodel->extradatasize = modfilelen;
+		buf = NULL;	/* ownership transferred to loadmodel->extradata */
+	}
+	else
+	{
+		loadmodel->extradatasize = Hunk_End ();
+	}
+#else
 	loadmodel->extradatasize = Hunk_End ();
+#endif
 
-	ri.FS_FreeFile (buf);
+	if (buf)
+		ri.FS_FreeFile (buf);
 
 	return mod;
 }
@@ -968,7 +995,11 @@ void Mod_LoadAliasModel (model_t *mod, void *buffer)
 		ri.Sys_Error (ERR_DROP, "%s has wrong version number (%i should be %i)",
 				 mod->name, version, ALIAS_VERSION);
 
+#ifdef HW_DOL
+	pheader = pinmodel;
+#else
 	pheader = Hunk_Alloc (LittleLong(pinmodel->ofs_end));
+#endif
 	
 	// byte swap the header fields and sanity check
 	for (i=0 ; i<sizeof(dmdl_t)/4 ; i++)
@@ -1131,12 +1162,84 @@ void R_BeginRegistration (char *model)
 	// explicitly free the old map if different
 	// this guarantees that mod_known[0] is the world map
 	flushmap = ri.Cvar_Get ("flushmap", "0", 0);
-	if ( strcmp(mod_known[0].name, fullname) || flushmap->value)
+
+#ifdef HW_DOL
+	if (strcmp(mod_known[0].name, fullname) || flushmap->value)
+	{
+		int i;
+		int freed_models = 0;
+		model_t *oldmod;
+
+		/*
+		 * The PC renderer keeps stale resources alive until
+		 * R_EndRegistration(). That creates a large old-map +
+		 * new-map memory peak which MEM1 cannot afford.
+		 *
+		 * Once the old world is gone, stale non-world models and
+		 * images cannot be needed by the new registration. Purge
+		 * them before loading the replacement world.
+		 */
 		Mod_Free (&mod_known[0]);
+
+		for (i = 1, oldmod = mod_known + 1;
+		     i < mod_numknown;
+		     i++, oldmod++)
+		{
+			if (!oldmod->name[0])
+				continue;
+
+			if (oldmod->registration_sequence == registration_sequence)
+				continue;
+
+			if (oldmod->type == mod_alias)
+				ri.FS_FreeFile (oldmod->extradata);
+			else
+				Hunk_Free (oldmod->extradata);
+
+			memset (oldmod, 0, sizeof(*oldmod));
+			freed_models++;
+		}
+
+		R_FreeUnusedImages ();
+
+		Com_Printf (
+			"Q2GC registration: purged %i stale models "
+			"before new world\n",
+			freed_models);
+	}
+#else
+	if (strcmp(mod_known[0].name, fullname) || flushmap->value)
+		Mod_Free (&mod_known[0]);
+#endif
+
 	r_worldmodel = R_RegisterModel (fullname);
 	R_NewMap ();
 }
 
+
+
+#ifdef HW_DOL
+void R_GC_PurgeRegistrationResources(void)
+{
+	int old_sequence = registration_sequence;
+
+	D_FlushCaches();
+	Mod_FreeAll();
+	r_worldmodel = NULL;
+
+	/*
+	 * Make all non-pic images stale, then free them.
+	 * it_pic images are deliberately retained by R_FreeUnusedImages(),
+	 * so menus/HUD remain available during cinematics.
+	 */
+	registration_sequence++;
+	R_FreeUnusedImages();
+
+	Com_Printf(
+		"Q2GC cinematic: purged renderer registration %i -> %i\n",
+		old_sequence, registration_sequence);
+}
+#endif
 
 /*
 @@@@@@@@@@@@@@@@@@@@@
@@ -1198,7 +1301,14 @@ void R_EndRegistration (void)
 			continue;
 		if (mod->registration_sequence != registration_sequence)
 		{	// don't need this model
+#ifdef HW_DOL
+			if (mod->type == mod_alias)
+				ri.FS_FreeFile (mod->extradata);
+			else
+				Hunk_Free (mod->extradata);
+#else
 			Hunk_Free (mod->extradata);
+#endif
 			memset (mod, 0, sizeof(*mod));
 		}
 		else
@@ -1220,7 +1330,14 @@ Mod_Free
 */
 void Mod_Free (model_t *mod)
 {
+#ifdef HW_DOL
+	if (mod->type == mod_alias)
+		ri.FS_FreeFile (mod->extradata);
+	else
+		Hunk_Free (mod->extradata);
+#else
 	Hunk_Free (mod->extradata);
+#endif
 	memset (mod, 0, sizeof(*mod));
 }
 
