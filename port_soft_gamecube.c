@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 
 #include "ref_soft/r_local.h"
@@ -9,47 +8,60 @@
 #include <carryhandle/ch_dvd.h>
 #include <carryhandle/ch_input.h>
 #include <carryhandle/ch_time.h>
+#include <carryhandle/ch_video.h>
 
 
 #include <SDL.h>
 #include <ogc/system.h>
-
-static SDL_Color colors[256];
-static SDL_Palette* sdlPalette = NULL;
-
-
 int _old_mouse_buttonstate = 0;
 
 static int _width = 640;
 static int _height = 480;
 
-static SDL_Surface *_screenSurface = NULL;
 static SDL_Surface *surface = NULL;
-static SDL_Window* _window = NULL;
+
+
 
 /*****************************************************************************/
 
 static void setupWindow(qboolean fullscreen)
 {
-  if (_window)
-  {
-    SDL_DestroyWindow(_window);
-  }
+  (void)fullscreen;
 
   if (surface)
   {
     SDL_FreeSurface(surface);
+    surface = NULL;
   }
 
-  int flags = SDL_WINDOW_SHOWN;
-  if (fullscreen)
+  if (!CH_VideoInit(
+          (unsigned int)_width,
+          (unsigned int)_height,
+          "Quake2Cube"))
   {
-    flags |= SDL_WINDOW_FULLSCREEN;
+    ri.Sys_Error(
+        ERR_FATAL,
+        "CH_VideoInit failed: %s",
+        SDL_GetError());
   }
-  _window = SDL_CreateWindow("Quake2", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, _width, _height, flags);
-  _screenSurface = SDL_GetWindowSurface(_window);
-  surface = SDL_CreateRGBSurface(0, _width, _height, 8, 0, 0, 0, 0);
-  SDL_SetSurfacePalette(surface, sdlPalette);
+
+  surface = SDL_CreateRGBSurface(
+      0,
+      _width,
+      _height,
+      8,
+      0,
+      0,
+      0,
+      0);
+
+  if (!surface)
+  {
+    ri.Sys_Error(
+        ERR_FATAL,
+        "SDL_CreateRGBSurface failed: %s",
+        SDL_GetError());
+  }
 
   vid.rowbytes = surface->pitch;
   vid.buffer = surface->pixels;
@@ -90,34 +102,37 @@ rserr_t SWimp_SetMode( int *pwidth, int *pheight, int mode, qboolean fullscreen 
 
 void SWimp_Shutdown( void )
 {
-    //TODO: check if there are buffers need to be freed
+  if (surface)
+  {
+    SDL_FreeSurface(surface);
+    surface = NULL;
+  }
 
-	SDL_Quit();
+  CH_VideoShutdown();
+  SDL_Quit();
 }
 
 
 int SWimp_Init( void *hInstance, void *wndProc )
 {
+  (void)hInstance;
+  (void)wndProc;
+
   /*
-   * The desktop config.cfg may contain "sw_mode 0".
-   * GameCube has a fixed 640x480 presentation target, so override
-   * the software-renderer mode here, after configs have loaded.
+   * GameCube uses the fixed 640x480 software-renderer mode.
    */
   ri.Cvar_SetValue("sw_mode", 3);
 
-  if (SDL_Init(SDL_INIT_VIDEO) < 0)
+  if (SDL_Init(0) < 0)
   {
-    Sys_Error("VID: Couldn't load SDL: %s", SDL_GetError());
+    Sys_Error(
+        "VID: Couldn't load SDL: %s",
+        SDL_GetError());
   }
-
-  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-
-
-  sdlPalette = SDL_AllocPalette(256);
 
   setupWindow(false);
 
-	return true;
+  return true;
 }
 
 static qboolean SWimp_InitGraphics( qboolean fullscreen )
@@ -130,20 +145,14 @@ static qboolean SWimp_InitGraphics( qboolean fullscreen )
 
 void SWimp_SetPalette( const unsigned char *palette )
 {
-	for (int i=0; i<256; ++i)
-    {
-        colors[i].r = *palette++;
-        colors[i].g = *palette++;
-        colors[i].b = *palette++;
-        colors[i].a = SDL_ALPHA_OPAQUE;
-        palette++;
-    }
-
-    if (sdlPalette)
-    {
-        SDL_SetPaletteColors(sdlPalette, colors, 0, 256);
-        SDL_SetSurfacePalette(surface, sdlPalette);
-    }
+  if (!CH_VideoSetPaletteRGB8(
+          palette,
+          4u))
+  {
+    ri.Sys_Error(
+        ERR_FATAL,
+        "CH_VideoSetPaletteRGB8 failed");
+  }
 }
 
 void SWimp_BeginFrame( float camera_seperation )
@@ -160,8 +169,17 @@ void SWimp_BeginFrame( float camera_seperation )
 */
 void SWimp_EndFrame (void)
 {
-  SDL_BlitSurface(surface, NULL, _screenSurface, NULL);
-  SDL_UpdateWindowSurface(_window);
+
+  if (!surface ||
+      !CH_VideoPresentIndexed8(
+          (const uint8_t *)surface->pixels,
+          (unsigned int)surface->pitch))
+  {
+    ri.Sys_Error(
+        ERR_FATAL,
+        "CH_VideoPresentIndexed8 failed: %s",
+        SDL_GetError());
+  }
 }
 
 
@@ -258,7 +276,8 @@ int ConvertToQuakeKey(unsigned int keysym)
   return key;
 }
 
-#define GC_STICK_DEADZONE 16
+#define GC_STICK_PRESS_THRESHOLD   24
+#define GC_STICK_RELEASE_THRESHOLD 12
 
 static bool gc_menu_up;
 static bool gc_menu_down;
@@ -339,29 +358,64 @@ void HandleInput(void)
      * D-pad and analogue stick into one logical Quake direction so
      * the two inputs cannot fight over the same key state.
      */
-    GC_SendLogicalKey(
-        (pad.buttons_held & CH_PAD_BUTTON_UP) != 0 ||
-            pad.stick_y > GC_STICK_DEADZONE,
-        &gc_menu_up,
-        K_UPARROW);
+    /*
+     * Use hysteresis for analogue menu navigation.
+     *
+     * A direction engages at the wider PRESS threshold but remains
+     * held until the stick returns inside the narrower RELEASE
+     * threshold. This prevents neutral-position jitter from emitting
+     * alternating arrow presses.
+     */
+    {
+        bool physical_up =
+            (pad.buttons_held & CH_PAD_BUTTON_UP) != 0;
+        bool physical_down =
+            (pad.buttons_held & CH_PAD_BUTTON_DOWN) != 0;
+        bool physical_left =
+            (pad.buttons_held & CH_PAD_BUTTON_LEFT) != 0;
+        bool physical_right =
+            (pad.buttons_held & CH_PAD_BUTTON_RIGHT) != 0;
 
-    GC_SendLogicalKey(
-        (pad.buttons_held & CH_PAD_BUTTON_DOWN) != 0 ||
-            pad.stick_y < -GC_STICK_DEADZONE,
-        &gc_menu_down,
-        K_DOWNARROW);
+        bool stick_up =
+            gc_menu_up
+                ? pad.stick_y > GC_STICK_RELEASE_THRESHOLD
+                : pad.stick_y > GC_STICK_PRESS_THRESHOLD;
 
-    GC_SendLogicalKey(
-        (pad.buttons_held & CH_PAD_BUTTON_LEFT) != 0 ||
-            pad.stick_x < -GC_STICK_DEADZONE,
-        &gc_menu_left,
-        K_LEFTARROW);
+        bool stick_down =
+            gc_menu_down
+                ? pad.stick_y < -GC_STICK_RELEASE_THRESHOLD
+                : pad.stick_y < -GC_STICK_PRESS_THRESHOLD;
 
-    GC_SendLogicalKey(
-        (pad.buttons_held & CH_PAD_BUTTON_RIGHT) != 0 ||
-            pad.stick_x > GC_STICK_DEADZONE,
-        &gc_menu_right,
-        K_RIGHTARROW);
+        bool stick_left =
+            gc_menu_left
+                ? pad.stick_x < -GC_STICK_RELEASE_THRESHOLD
+                : pad.stick_x < -GC_STICK_PRESS_THRESHOLD;
+
+        bool stick_right =
+            gc_menu_right
+                ? pad.stick_x > GC_STICK_RELEASE_THRESHOLD
+                : pad.stick_x > GC_STICK_PRESS_THRESHOLD;
+
+        GC_SendLogicalKey(
+            physical_up || stick_up,
+            &gc_menu_up,
+            K_UPARROW);
+
+        GC_SendLogicalKey(
+            physical_down || stick_down,
+            &gc_menu_down,
+            K_DOWNARROW);
+
+        GC_SendLogicalKey(
+            physical_left || stick_left,
+            &gc_menu_left,
+            K_LEFTARROW);
+
+        GC_SendLogicalKey(
+            physical_right || stick_right,
+            &gc_menu_right,
+            K_RIGHTARROW);
+    }
 
     /*
      * Expose GameCube buttons as Quake joystick keys.

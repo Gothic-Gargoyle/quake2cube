@@ -28,7 +28,8 @@ SOURCES := \
 	$(PROJECT_DIR)/net \
 	$(PROJECT_DIR)/sound \
 	$(PROJECT_DIR) \
-	$(CARRY_ROOT)/source
+	$(CARRY_ROOT)/source \
+	$(CARRY_ROOT)/source/video
 
 CFILES := \
 	$(notdir $(wildcard $(PROJECT_DIR)/client/*.c)) \
@@ -49,7 +50,8 @@ CFILES := \
 	ch_dvd.c \
 	ch_input.c \
 	ch_pad_bus.c \
-	ch_time.c
+	ch_time.c \
+	ch_video_gamecube.c
 
 CPPFILES :=
 sFILES   :=
