@@ -1,3 +1,16 @@
+.SUFFIXES:
+.DEFAULT_GOAL := all
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error "Please set DEVKITPRO in your environment.")
+endif
+
+ifeq ($(strip $(DEVKITPPC)),)
+$(error "Please set DEVKITPPC in your environment.")
+endif
+
+include $(DEVKITPRO)/libogc2/gamecube_rules
+
 PROJECT_DIR := $(patsubst %/,%,$(dir $(abspath $(firstword $(MAKEFILE_LIST)))))
 CARRY_ROOT ?= $(abspath $(PROJECT_DIR)/../carryhandle)
 
@@ -38,24 +51,28 @@ CFILES := \
 	ch_pad_bus.c \
 	ch_time.c
 
-APP_INCLUDES = \
-	$(CARRY_ROOT)/include \
-	$(DEVKITPRO)/libogc2/gamecube/include \
-	$(DEVKITPRO)/libogc2/gamecube/include/SDL2 \
-	$(PORTLIBS_PATH)/ppc/include
+CPPFILES :=
+sFILES   :=
+SFILES   :=
 
-APP_LIBDIRS = \
-	$(DEVKITPRO)/libogc2/gamecube \
-	$(PORTLIBS_PATH)/ppc
-
-APP_CFLAGS = \
+CFLAGS := \
+	-g -O2 -Wall \
 	-fcommon \
 	-Wno-error=incompatible-pointer-types \
 	-Dstricmp=strcasecmp \
 	-include strings.h \
-	-DSDL_MAIN_HANDLED
+	-DSDL_MAIN_HANDLED \
+	$(MACHDEP) \
+	$(INCLUDE)
 
-APP_LIBS = \
+CXXFLAGS := $(CFLAGS)
+
+LDFLAGS := \
+	-g \
+	$(MACHDEP) \
+	-Wl,-Map,$(notdir $@).map
+
+LIBS := \
 	-lSDL2 \
 	-lopengx \
 	-laesnd \
@@ -64,27 +81,69 @@ APP_LIBS = \
 	-lstdc++ \
 	-lm
 
+PROJECT_MAKEFILE := $(PROJECT_DIR)/Makefile.gamecube
+
+export INCLUDE := \
+	-I$(CARRY_ROOT)/include \
+	-I$(PROJECT_DIR) \
+	-I$(PROJECT_DIR)/$(BUILD) \
+	-I$(DEVKITPRO)/libogc2/gamecube/include \
+	-I$(DEVKITPRO)/libogc2/gamecube/include/SDL2 \
+	-I$(DEVKITPRO)/portlibs/ppc/include \
+	-I$(LIBOGC_INC)
+
+export LIBPATHS := \
+	-L$(DEVKITPRO)/libogc2/gamecube/lib \
+	-L$(DEVKITPRO)/portlibs/ppc/lib \
+	-L$(LIBOGC_LIB)
+
 include $(CARRY_ROOT)/make/gamecube.mk
 
+ifneq ($(BUILD),$(notdir $(CURDIR)))
 
-# --- GameCube disc image ---
+.PHONY: clean iso test
 
-Q2_DISC_ROOT  := $(PROJECT_DIR)/$(BUILD)/disc
-Q2_DISC_STAMP := $(PROJECT_DIR)/$(BUILD)/.disc.stamp
+clean:
+	@echo clean ...
+	@rm -rf \
+		"$(PROJECT_DIR)/$(BUILD)" \
+		"$(PROJECT_DIR)/$(TARGET).elf" \
+		"$(PROJECT_DIR)/$(TARGET).dol" \
+		"$(PROJECT_DIR)/$(TARGET).iso"
 
-GCM_ROOT    := $(Q2_DISC_ROOT)
-GCM_OUTPUT  := $(PROJECT_DIR)/quake2cube.iso
-GCM_TITLE   := QUAKE2CUBE
-GCM_REGION  := PAL
-GCM_PREPARE := $(Q2_DISC_STAMP)
+iso: all
+	@test -f "$(CARRY_ROOT)/tools/native-gcm/mkdoomcube.py" || \
+		( echo "ERROR: missing native GCM builder." && false )
+	@test -f "$(CARRY_ROOT)/tools/native-gcm/apploader.bin" || \
+		( echo "ERROR: missing apploader.bin." && false )
+	@test -f "$(PROJECT_DIR)/baseq2/pak0.pak" || \
+		( echo "ERROR: missing baseq2/pak0.pak." && false )
 
-$(Q2_DISC_STAMP): $(PROJECT_DIR)/baseq2/pak0.pak
-	@echo "staging Quake II data ..."
-	@rm -rf "$(Q2_DISC_ROOT)"
-	@mkdir -p "$(Q2_DISC_ROOT)"
-	@cp -a "$(PROJECT_DIR)/baseq2" "$(Q2_DISC_ROOT)/baseq2"
-	@touch "$@"
+	@rm -rf "$(PROJECT_DIR)/$(BUILD)/disc"
+	@mkdir -p "$(PROJECT_DIR)/$(BUILD)/disc"
+	@echo "Adding Quake II data"
+	@cp -a "$(PROJECT_DIR)/baseq2" "$(PROJECT_DIR)/$(BUILD)/disc/baseq2"
 
-include $(CARRY_ROOT)/make/image.mk
+	python3 "$(CARRY_ROOT)/tools/native-gcm/mkdoomcube.py" \
+		--dol "$(PROJECT_DIR)/$(TARGET).dol" \
+		--apploader "$(CARRY_ROOT)/tools/native-gcm/apploader.bin" \
+		--root "$(PROJECT_DIR)/$(BUILD)/disc" \
+		--output "$(PROJECT_DIR)/$(TARGET).iso" \
+		--title "QUAKE2CUBE" \
+		--region PAL
 
-include $(CARRY_ROOT)/make/dolphin.mk
+test:
+	$(MAKE) -f "$(PROJECT_DIR)/Makefile.gamecube" clean
+	$(MAKE) -f "$(PROJECT_DIR)/Makefile.gamecube"
+	$(MAKE) -f "$(PROJECT_DIR)/Makefile.gamecube" iso
+
+	@echo
+	@echo "Launching Quake2Cube..."
+	@echo
+
+	flatpak run \
+		--filesystem="$(PROJECT_DIR)" \
+		org.DolphinEmu.dolphin-emu \
+		-b -e "$(PROJECT_DIR)/$(TARGET).iso"
+
+endif
