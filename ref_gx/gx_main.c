@@ -594,6 +594,23 @@ static unsigned int q2gx_alias_invalid_skin_window;
 static unsigned int q2gx_alias_custom_skin_fallback_window;
 static unsigned int q2gx_alias_animated_samples_window;
 
+/* Q2GC_VIEW_WEAPON_V1 */
+static cvar_t *q2gx_viewweapon_hand;
+
+static unsigned int q2gx_viewweapon_frames_window;
+static unsigned int q2gx_viewweapon_seen_window;
+static unsigned int q2gx_viewweapon_drawn_window;
+static unsigned int q2gx_viewweapon_hidden_hand2_window;
+static unsigned int q2gx_viewweapon_mirrored_hand1_window;
+static unsigned int q2gx_viewweapon_depthhack_window;
+static unsigned int q2gx_viewweapon_triangles_window;
+static unsigned int q2gx_viewweapon_vertices_window;
+static unsigned int q2gx_viewweapon_skin_binds_window;
+static unsigned int q2gx_viewweapon_tlut_loads_window;
+static unsigned int q2gx_viewweapon_invalid_frame_window;
+static unsigned int q2gx_viewweapon_invalid_skin_window;
+static qboolean q2gx_viewweapon_first_draw_logged;
+
 static unsigned int q2gx_world_plane_count;
 
 static size_t q2gx_world_bytes;
@@ -6877,6 +6894,532 @@ static void Q2GX_DrawAliasEntities(refdef_t *fd)
     }
 }
 
+
+/*
+ * Q2GC_VIEW_WEAPON_V1
+ *
+ * Stock Quake II view-weapon semantics recovered from ref_gl:
+ *
+ *   RF_WEAPONMODEL:
+ *     no frustum cull
+ *
+ *   hand == 2:
+ *     suppress the view model
+ *
+ *   hand == 1:
+ *     mirror the perspective projection horizontally
+ *
+ *   RF_DEPTHHACK:
+ *     map the weapon into the nearest 30% of the normal
+ *     viewport depth range, then restore normal 3D state.
+ *
+ * Geometry, skinning and interpolation remain the exact
+ * already-proven ALIAS_MD2 core.
+ */
+static void Q2GX_LoadMirroredViewWeaponProjection(
+    refdef_t *fd)
+{
+    Mtx44 projection;
+    f32 aspect;
+
+    if (
+        !fd
+        ||
+        fd->width <= 0
+        ||
+        fd->height <= 0
+    )
+    {
+        return;
+    }
+
+    aspect =
+        (f32)fd->width
+        /
+        (f32)fd->height;
+
+    guPerspective(
+        projection,
+        fd->fov_y,
+        aspect,
+        4.0f,
+        4096.0f
+    );
+
+    /*
+     * Stock GL does:
+     *
+     *   glScalef(-1, 1, 1);
+     *   Perspective(...)
+     *
+     * The perspective used here is symmetric, so negating its
+     * X scale produces the same horizontal mirror.
+     *
+     * Alias V1 currently uses GX_CULL_NONE, so no winding/cull
+     * reversal is needed for this correctness milestone.
+     */
+    projection[0][0] =
+        -projection[0][0];
+
+    GX_LoadProjectionMtx(
+        projection,
+        GX_PERSPECTIVE
+    );
+}
+
+
+static void Q2GX_SetViewWeaponDepthRange(
+    refdef_t *fd,
+    f32 near_depth,
+    f32 far_depth)
+{
+    if (!fd)
+        return;
+
+    GX_SetViewport(
+        (f32)fd->x,
+        (f32)fd->y,
+        (f32)fd->width,
+        (f32)fd->height,
+        near_depth,
+        far_depth
+    );
+}
+
+
+static void Q2GX_DrawViewWeaponEntities(
+    refdef_t *fd)
+{
+    unsigned int entity_index;
+
+    unsigned int seen = 0u;
+    unsigned int drawn = 0u;
+    unsigned int hidden_hand2 = 0u;
+    unsigned int mirrored_hand1 = 0u;
+    unsigned int depthhack_draws = 0u;
+    unsigned int triangles = 0u;
+    unsigned int vertices = 0u;
+    unsigned int skin_binds = 0u;
+    unsigned int tlut_loads = 0u;
+    unsigned int invalid_frames = 0u;
+    unsigned int invalid_skins = 0u;
+
+    int hand_mode;
+
+    if (!fd)
+        return;
+
+    ++q2gx_viewweapon_frames_window;
+
+    if (!q2gx_viewweapon_hand)
+    {
+        q2gx_viewweapon_hand =
+            ri.Cvar_Get(
+                "hand",
+                "0",
+                CVAR_USERINFO | CVAR_ARCHIVE
+            );
+    }
+
+    hand_mode =
+        q2gx_viewweapon_hand
+        ?
+        (int)q2gx_viewweapon_hand->value
+        :
+        0;
+
+    if (
+        hand_mode < 0
+        ||
+        hand_mode > 2
+    )
+    {
+        hand_mode = 0;
+    }
+
+    if (
+        fd->num_entities > 0
+        &&
+        fd->entities
+    )
+    {
+        for (
+            entity_index = 0u;
+            entity_index < (unsigned int)fd->num_entities;
+            ++entity_index
+        )
+        {
+            entity_t *entity =
+                &fd->entities[entity_index];
+
+            struct model_s *handle;
+            q2gx_alias_model_t *model;
+
+            unsigned int frame_index;
+            unsigned int old_frame_index;
+
+            q2gx_alias_lerp_t lerp;
+            q2gx_alias_transform_t transform;
+            q2gx_alias_skin_t *skin;
+
+            qboolean invalid_skin;
+            qboolean custom_skin_fallback;
+
+            unsigned int triangle_index;
+
+            if (!entity->model)
+                continue;
+
+            if (!(entity->flags & RF_WEAPONMODEL))
+                continue;
+
+            handle = entity->model;
+
+            if (
+                handle->magic != Q2GX_MODEL_HANDLE_MAGIC
+                ||
+                handle->kind != Q2GX_MODEL_KIND_ALIAS_MD2
+            )
+            {
+                continue;
+            }
+
+            model =
+                (q2gx_alias_model_t *)handle;
+
+            ++seen;
+
+            if (hand_mode == 2)
+            {
+                ++hidden_hand2;
+                continue;
+            }
+
+            if (
+                entity->frame < 0
+                ||
+                (unsigned int)entity->frame
+                >=
+                model->num_frames
+            )
+            {
+                ++invalid_frames;
+                frame_index = 0u;
+                old_frame_index = 0u;
+            }
+            else if (
+                entity->oldframe < 0
+                ||
+                (unsigned int)entity->oldframe
+                >=
+                model->num_frames
+            )
+            {
+                ++invalid_frames;
+                frame_index = 0u;
+                old_frame_index = 0u;
+            }
+            else
+            {
+                frame_index =
+                    (unsigned int)entity->frame;
+
+                old_frame_index =
+                    (unsigned int)entity->oldframe;
+            }
+
+            skin =
+                Q2GX_SelectAliasSkin(
+                    model,
+                    entity,
+                    &invalid_skin,
+                    &custom_skin_fallback
+                );
+
+            if (invalid_skin)
+                ++invalid_skins;
+
+            if (!skin)
+                continue;
+
+            Q2GX_InitAliasLerp(
+                model,
+                entity,
+                frame_index,
+                old_frame_index,
+                &lerp
+            );
+
+            Q2GX_InitAliasTransform(
+                entity,
+                &transform
+            );
+
+            Q2GX_SetupAlias3D();
+
+            if (hand_mode == 1)
+            {
+                Q2GX_LoadMirroredViewWeaponProjection(
+                    fd
+                );
+
+                ++mirrored_hand1;
+            }
+
+            if (entity->flags & RF_DEPTHHACK)
+            {
+                Q2GX_SetViewWeaponDepthRange(
+                    fd,
+                    0.0f,
+                    0.3f
+                );
+
+                ++depthhack_draws;
+            }
+
+            GX_LoadTlut(
+                &skin->tlut,
+                GX_TLUT0
+            );
+
+            ++tlut_loads;
+
+            GX_LoadTexObj(
+                &skin->texture,
+                GX_TEXMAP0
+            );
+
+            ++skin_binds;
+
+            GX_Begin(
+                GX_TRIANGLES,
+                GX_VTXFMT0,
+                (u16)(model->num_tris * 3u)
+            );
+
+            for (
+                triangle_index = 0u;
+                triangle_index < model->num_tris;
+                ++triangle_index
+            )
+            {
+                const q2gx_alias_triangle_t *triangle =
+                    &model->triangles[triangle_index];
+
+                unsigned int corner;
+
+                for (
+                    corner = 0u;
+                    corner < 3u;
+                    ++corner
+                )
+                {
+                    unsigned int xyz_index =
+                        triangle->xyz[corner];
+
+                    unsigned int st_index =
+                        triangle->st[corner];
+
+                    const q2gx_alias_st_t *st =
+                        &model->st[st_index];
+
+                    f32 local_x;
+                    f32 local_y;
+                    f32 local_z;
+
+                    f32 world_x;
+                    f32 world_y;
+                    f32 world_z;
+
+                    Q2GX_LerpAliasVertex(
+                        &lerp,
+                        xyz_index,
+                        &local_x,
+                        &local_y,
+                        &local_z
+                    );
+
+                    Q2GX_TransformAliasPoint(
+                        &transform,
+                        local_x,
+                        local_y,
+                        local_z,
+                        &world_x,
+                        &world_y,
+                        &world_z
+                    );
+
+                    GX_Position3f32(
+                        world_x,
+                        world_y,
+                        world_z
+                    );
+
+                    GX_Color4u8(
+                        255u,
+                        255u,
+                        255u,
+                        255u
+                    );
+
+                    GX_TexCoord2f32(
+                        (f32)st->s
+                        /
+                        (f32)model->skin_width,
+                        (f32)st->t
+                        /
+                        (f32)model->skin_height
+                    );
+                }
+            }
+
+            GX_End();
+
+            ++drawn;
+
+            triangles +=
+                model->num_tris;
+
+            vertices +=
+                model->num_tris * 3u;
+
+            if (!q2gx_viewweapon_first_draw_logged)
+            {
+                q2gx_viewweapon_first_draw_logged =
+                    true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX VIEWWEAPON FIRST DRAW: "
+                    "%s "
+                    "frame=%u "
+                    "oldframe=%u "
+                    "backlerp=%.4f "
+                    "tris=%u "
+                    "skin=%s "
+                    "origin=%.3f,%.3f,%.3f "
+                    "angles=%.3f,%.3f,%.3f "
+                    "flags=%d "
+                    "hand=%d "
+                    "depthhack=%u "
+                    "mode=rf_weaponmodel_ci8\n",
+                    model->name,
+                    frame_index,
+                    old_frame_index,
+                    entity->backlerp,
+                    model->num_tris,
+                    skin->name,
+                    entity->origin[0],
+                    entity->origin[1],
+                    entity->origin[2],
+                    entity->angles[0],
+                    entity->angles[1],
+                    entity->angles[2],
+                    entity->flags,
+                    hand_mode,
+                    (entity->flags & RF_DEPTHHACK)
+                    ?
+                    1u
+                    :
+                    0u
+                );
+            }
+
+            /*
+             * Restore exact normal 3D camera/projection/viewport
+             * immediately after the special view-model draw.
+             */
+            Q2GX_SetupWorld3D(
+                fd
+            );
+
+            Q2GX_SetupAlias3D();
+        }
+    }
+
+    q2gx_viewweapon_seen_window +=
+        seen;
+
+    q2gx_viewweapon_drawn_window +=
+        drawn;
+
+    q2gx_viewweapon_hidden_hand2_window +=
+        hidden_hand2;
+
+    q2gx_viewweapon_mirrored_hand1_window +=
+        mirrored_hand1;
+
+    q2gx_viewweapon_depthhack_window +=
+        depthhack_draws;
+
+    q2gx_viewweapon_triangles_window +=
+        triangles;
+
+    q2gx_viewweapon_vertices_window +=
+        vertices;
+
+    q2gx_viewweapon_skin_binds_window +=
+        skin_binds;
+
+    q2gx_viewweapon_tlut_loads_window +=
+        tlut_loads;
+
+    q2gx_viewweapon_invalid_frame_window +=
+        invalid_frames;
+
+    q2gx_viewweapon_invalid_skin_window +=
+        invalid_skins;
+
+    if (q2gx_viewweapon_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX VIEWWEAPON 120: "
+            "frames=%u "
+            "seen_total=%u "
+            "drawn_total=%u "
+            "hidden_hand2_total=%u "
+            "mirrored_hand1_total=%u "
+            "depthhack_draws_total=%u "
+            "triangles_total=%u "
+            "vertices_total=%u "
+            "skin_binds_total=%u "
+            "tlut_loads_total=%u "
+            "invalid_frame_total=%u "
+            "invalid_skin_total=%u "
+            "hand=%d "
+            "mode=rf_weaponmodel_depthhack\n",
+            q2gx_viewweapon_frames_window,
+            q2gx_viewweapon_seen_window,
+            q2gx_viewweapon_drawn_window,
+            q2gx_viewweapon_hidden_hand2_window,
+            q2gx_viewweapon_mirrored_hand1_window,
+            q2gx_viewweapon_depthhack_window,
+            q2gx_viewweapon_triangles_window,
+            q2gx_viewweapon_vertices_window,
+            q2gx_viewweapon_skin_binds_window,
+            q2gx_viewweapon_tlut_loads_window,
+            q2gx_viewweapon_invalid_frame_window,
+            q2gx_viewweapon_invalid_skin_window,
+            hand_mode
+        );
+
+        q2gx_viewweapon_frames_window = 0u;
+        q2gx_viewweapon_seen_window = 0u;
+        q2gx_viewweapon_drawn_window = 0u;
+        q2gx_viewweapon_hidden_hand2_window = 0u;
+        q2gx_viewweapon_mirrored_hand1_window = 0u;
+        q2gx_viewweapon_depthhack_window = 0u;
+        q2gx_viewweapon_triangles_window = 0u;
+        q2gx_viewweapon_vertices_window = 0u;
+        q2gx_viewweapon_skin_binds_window = 0u;
+        q2gx_viewweapon_tlut_loads_window = 0u;
+        q2gx_viewweapon_invalid_frame_window = 0u;
+        q2gx_viewweapon_invalid_skin_window = 0u;
+    }
+}
+
+
 static void Q2GX_PrintAliasRegistrationSummary(void)
 {
     ri.Con_Printf(
@@ -8029,6 +8572,10 @@ Q2GX_DrawBrushEntities(
     );
 
     Q2GX_DrawAliasEntities(
+        fd
+    );
+
+    Q2GX_DrawViewWeaponEntities(
         fd
     );
 
