@@ -121,6 +121,7 @@ static qboolean q2gx_conchars_loaded;
 
 static unsigned int q2gx_drawchar_calls_window;
 static unsigned int q2gx_drawchar_runs_window;
+static unsigned int q2gx_drawchar_quads_window;
 static unsigned int q2gx_drawfill_calls_window;
 
 static qboolean q2gx_drawchar_first_logged;
@@ -180,6 +181,21 @@ struct image_s
 static struct image_s q2gx_pics[
     Q2GX_MAX_PICS
 ];
+
+/*
+ * Q2GC_DRAWCHAR_TEXTURE_ATLAS_V1
+ *
+ * DrawChar now reuses pics/conchars.pcx from the real GX
+ * picture cache.
+ *
+ * The original indexed conchars decoder remains intact for
+ * this correctness milestone, but is no longer consulted by
+ * Q2GX_DrawChar itself.
+ */
+static struct image_s *q2gx_drawchar_atlas;
+
+static qboolean q2gx_drawchar_atlas_logged;
+static qboolean q2gx_drawchar_atlas_failed_logged;
 
 static qboolean q2gx_texture_first_logged;
 static qboolean q2gx_pic_first_draw_logged;
@@ -1219,6 +1235,102 @@ static void Q2GX_DrawTexturedQuad(
 }
 
 
+static void Q2GX_DrawTexturedQuadUV(
+    f32 x,
+    f32 y,
+    f32 width,
+    f32 height,
+    f32 s0,
+    f32 t0,
+    f32 s1,
+    f32 t1,
+    GXTexObj *texture)
+{
+    if (!texture)
+    {
+        return;
+    }
+
+    Q2GX_SetupTextured2D();
+
+    GX_LoadTexObj(
+        texture,
+        GX_TEXMAP0
+    );
+
+    GX_Begin(
+        GX_QUADS,
+        GX_VTXFMT0,
+        4
+    );
+
+    GX_Position2f32(
+        x,
+        y
+    );
+
+    GX_TexCoord2f32(
+        s0,
+        t0
+    );
+
+    GX_Position2f32(
+        x + width,
+        y
+    );
+
+    GX_TexCoord2f32(
+        s1,
+        t0
+    );
+
+    GX_Position2f32(
+        x + width,
+        y + height
+    );
+
+    GX_TexCoord2f32(
+        s1,
+        t1
+    );
+
+    GX_Position2f32(
+        x,
+        y + height
+    );
+
+    GX_TexCoord2f32(
+        s0,
+        t1
+    );
+
+    GX_End();
+
+    ++q2gx_texture_draws_window;
+
+    if (!q2gx_texture_first_logged)
+    {
+        q2gx_texture_first_logged =
+            true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX TEXTURE FIRST: "
+            "textured GX quad submitted\n"
+        );
+    }
+
+    /*
+     * Keep the existing renderer contract:
+     *
+     * every textured helper restores the known-good
+     * untextured DrawFill state before returning.
+     */
+    Q2GX_Setup2D();
+}
+
+
+
 
 static qboolean Q2GX_NormalizePicName(
     const char *name,
@@ -1910,6 +2022,15 @@ static void Q2GX_ClearPicCache(void)
             bytes
         );
     }
+
+    q2gx_drawchar_atlas =
+        NULL;
+
+    q2gx_drawchar_atlas_logged =
+        false;
+
+    q2gx_drawchar_atlas_failed_logged =
+        false;
 }
 
 
@@ -2408,48 +2529,148 @@ static void Q2GX_DrawChar(
     int y,
     int c)
 {
-    int num;
+    int glyph;
 
-    int glyph_x;
-    int glyph_y;
+    int row;
+    int column;
 
-    int py;
+    f32 s0;
+    f32 t0;
+    f32 s1;
+    f32 t1;
 
-    num =
+    glyph =
         c & 255;
 
+    ++q2gx_drawchar_calls_window;
+
     /*
-     * Match stock Quake Draw_Char semantics.
+     * Stock Quake II Draw_Char semantics.
+     *
+     * Both normal and high-bit spaces are blank.
      */
-    if ((num & 127) == 32)
+    if (
+        (glyph & 127) == 32
+    )
     {
         return;
     }
 
+    /*
+     * Stock renderer rejects characters wholly above the
+     * viewport. Other clipping is handled by GX.
+     */
     if (y <= -8)
     {
         return;
     }
 
-    if (!q2gx_conchars_loaded)
+    /*
+     * Reuse the exact PCX -> palette -> RGBA8 -> GXTexObj
+     * cache proven by DrawPic.
+     *
+     * Leading slash means "use this exact virtual path".
+     */
+    if (!q2gx_drawchar_atlas)
     {
-        return;
+        q2gx_drawchar_atlas =
+            Q2GX_FindPic(
+                "/pics/conchars.pcx"
+            );
+
+        if (!q2gx_drawchar_atlas)
+        {
+            if (
+                !q2gx_drawchar_atlas_failed_logged
+            )
+            {
+                q2gx_drawchar_atlas_failed_logged =
+                    true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX DRAWCHAR ATLAS: "
+                    "failed to load pics/conchars.pcx\n"
+                );
+            }
+
+            return;
+        }
+
+        if (
+            q2gx_drawchar_atlas->width != 128 ||
+            q2gx_drawchar_atlas->height != 128
+        )
+        {
+            if (
+                !q2gx_drawchar_atlas_failed_logged
+            )
+            {
+                q2gx_drawchar_atlas_failed_logged =
+                    true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX DRAWCHAR ATLAS: "
+                    "unexpected dimensions %dx%d\n",
+                    q2gx_drawchar_atlas->width,
+                    q2gx_drawchar_atlas->height
+                );
+            }
+
+            q2gx_drawchar_atlas =
+                NULL;
+
+            return;
+        }
+
+        if (!q2gx_drawchar_atlas_logged)
+        {
+            q2gx_drawchar_atlas_logged =
+                true;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX DRAWCHAR ATLAS: "
+                "pics/conchars.pcx "
+                "128x128 cells=16x16 glyph=8x8 "
+                "textured=1\n"
+            );
+        }
     }
 
-    if (x >= 640 ||
-        x + 8 <= 0 ||
-        y >= 480)
-    {
-        return;
-    }
+    row =
+        glyph >> 4;
 
-    glyph_x =
-        (num & 15) * 8;
+    column =
+        glyph & 15;
 
-    glyph_y =
-        (num >> 4) * 8;
+    /*
+     * 128x128 atlas:
+     *
+     *     16 columns
+     *     16 rows
+     *      8x8 texels per glyph
+     *
+     * Therefore one cell is exactly 1/16 of the texture.
+     */
+    s0 =
+        (f32)column /
+        16.0f;
 
-    ++q2gx_drawchar_calls_window;
+    t0 =
+        (f32)row /
+        16.0f;
+
+    s1 =
+        (f32)(column + 1) /
+        16.0f;
+
+    t1 =
+        (f32)(row + 1) /
+        16.0f;
+
+    ++q2gx_drawchar_quads_window;
 
     if (!q2gx_drawchar_first_logged)
     {
@@ -2459,129 +2680,24 @@ static void Q2GX_DrawChar(
         ri.Con_Printf(
             PRINT_ALL,
             "Q2GC REF_GX DRAWCHAR FIRST: "
-            "c=%d x=%d y=%d\n",
-            num,
+            "c=%d x=%d y=%d textured=1\n",
+            glyph,
             x,
             y
         );
     }
 
-    /*
-     * Correctness path:
-     *
-     * 8 glyph scanlines.
-     *
-     * Adjacent same-index visible pixels become one horizontal
-     * GX rectangle.
-     */
-    for (py = 0;
-         py < 8;
-         ++py)
-    {
-        int screen_y;
-        int px;
-
-        screen_y =
-            y + py;
-
-        if (screen_y < 0 ||
-            screen_y >= 480)
-        {
-            continue;
-        }
-
-        px =
-            0;
-
-        while (px < 8)
-        {
-            int run_start;
-            int run_end;
-
-            int palette_index;
-
-            int left;
-            int right;
-
-            palette_index =
-                q2gx_conchars[
-                    (glyph_y + py) *
-                        Q2GX_CONCHARS_WIDTH
-                    +
-                    glyph_x + px
-                ];
-
-            if (
-                palette_index ==
-                q2gx_conchars_transparent
-            )
-            {
-                ++px;
-                continue;
-            }
-
-            run_start =
-                px;
-
-            ++px;
-
-            while (px < 8)
-            {
-                int next_index;
-
-                next_index =
-                    q2gx_conchars[
-                        (glyph_y + py) *
-                            Q2GX_CONCHARS_WIDTH
-                        +
-                        glyph_x + px
-                    ];
-
-                if (
-                    next_index !=
-                    palette_index
-                )
-                {
-                    break;
-                }
-
-                ++px;
-            }
-
-            run_end =
-                px;
-
-            left =
-                x + run_start;
-
-            right =
-                x + run_end;
-
-            if (right <= 0 ||
-                left >= 640)
-            {
-                continue;
-            }
-
-            if (left < 0)
-                left = 0;
-
-            if (right > 640)
-                right = 640;
-
-            Q2GX_DrawSolidRect(
-                (f32)left,
-                (f32)screen_y,
-                (f32)(right - left),
-                1.0f,
-                q2gx_palette[
-                    palette_index
-                ]
-            );
-
-            ++q2gx_drawchar_runs_window;
-        }
-    }
+    Q2GX_DrawTexturedQuadUV(
+        (f32)x,
+        (f32)y,
+        8.0f,
+        8.0f,
+        s0,
+        t0,
+        s1,
+        t1,
+        &q2gx_drawchar_atlas->texture
+    );
 }
 
 
@@ -2758,6 +2874,7 @@ static void Q2GX_EndFrame(void)
             "Q2GC REF_GX 2D 120: "
             "drawchar_calls=%u "
             "drawchar_runs=%u "
+            "drawchar_quads=%u "
             "drawfill_calls=%u "
             "texture_draws=%u "
             "pic_draws=%u "
@@ -2767,6 +2884,7 @@ static void Q2GX_EndFrame(void)
             "pic_misses=%u\n",
             q2gx_drawchar_calls_window,
             q2gx_drawchar_runs_window,
+            q2gx_drawchar_quads_window,
             q2gx_drawfill_calls_window,
             q2gx_texture_draws_window,
             q2gx_pic_draws_window,
@@ -2780,6 +2898,9 @@ static void Q2GX_EndFrame(void)
             0u;
 
         q2gx_drawchar_runs_window =
+            0u;
+
+        q2gx_drawchar_quads_window =
             0u;
 
         q2gx_drawfill_calls_window =
