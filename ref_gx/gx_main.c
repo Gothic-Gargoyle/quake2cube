@@ -248,6 +248,13 @@ typedef struct q2gx_world_vertex_s
     u8 g;
     u8 b;
     u8 a;
+
+    /*
+     * Q2GC_WORLD_TEXCOORDS_V1
+     * Normalized Quake II base-texture coordinates.
+     */
+    f32 s;
+    f32 t;
 } q2gx_world_vertex_t;
 
 
@@ -293,6 +300,22 @@ typedef struct q2gx_world_leaf_s
     unsigned int num_leaffaces;
 } q2gx_world_leaf_t;
 
+/*
+ * Q2GC_WORLD_TEXCOORDS_V1
+ *
+ * WAL pixels remain deliberately out of scope. Width/height
+ * are read only so normalized S/T exactly matches ref_gl.
+ */
+typedef struct q2gx_world_texinfo_s
+{
+    f32 vecs[2][4];
+    unsigned int flags;
+    char texture[33];
+    unsigned int width;
+    unsigned int height;
+} q2gx_world_texinfo_t;
+
+
 typedef struct q2gx_world_face_s
 {
     unsigned int first_vertex;
@@ -305,6 +328,9 @@ typedef struct q2gx_world_face_s
 
     f32 dist;
 
+    unsigned int texinfo_index;
+    unsigned int surface_flags;
+
     qboolean plane_back;
     qboolean pvs_visible_this_frame;
     qboolean visible_this_frame;
@@ -312,6 +338,23 @@ typedef struct q2gx_world_face_s
 
 
 static q2gx_world_face_t *q2gx_world_faces;
+
+static q2gx_world_texinfo_t *q2gx_world_texinfos;
+static unsigned int q2gx_world_texinfo_count;
+
+static qboolean q2gx_world_texcoord_first_draw_logged;
+static unsigned int q2gx_world_texcoord_vertices_window;
+
+#define Q2GX_WORLD_CHECKER_SIZE 64u
+
+static u8 q2gx_world_checker_pixels[
+    Q2GX_WORLD_CHECKER_SIZE *
+    Q2GX_WORLD_CHECKER_SIZE *
+    4u
+] __attribute__((aligned(32)));
+
+static GXTexObj q2gx_world_checker_texobj;
+static qboolean q2gx_world_checker_ready;
 
 static q2gx_world_node_t *q2gx_world_nodes;
 static q2gx_world_leaf_t *q2gx_world_leaves;
@@ -2199,6 +2242,7 @@ static void Q2GX_ClearPicCache(void)
 
 #define Q2GX_BSP_LUMP_PLANES       1
 #define Q2GX_BSP_LUMP_VERTEXES     2
+#define Q2GX_BSP_LUMP_TEXINFO       5
 #define Q2GX_BSP_LUMP_VISIBILITY   3
 #define Q2GX_BSP_LUMP_NODES        4
 #define Q2GX_BSP_LUMP_FACES        6
@@ -2465,6 +2509,260 @@ static qboolean Q2GX_BSPResolveVertex(
 }
 
 
+static void Q2GX_SetupWorld3D(
+    refdef_t *fd);
+
+
+#define Q2GX_SURF_SKY       0x0004u
+#define Q2GX_SURF_WARP      0x0008u
+#define Q2GX_SURF_TRANS33   0x0010u
+#define Q2GX_SURF_TRANS66   0x0020u
+#define Q2GX_SURF_FLOWING   0x0040u
+#define Q2GX_SURF_NODRAW    0x0080u
+
+#define Q2GX_WORLD_TEXCOORD_SPECIAL_MASK \
+    (Q2GX_SURF_SKY | Q2GX_SURF_WARP | Q2GX_SURF_TRANS33 | \
+     Q2GX_SURF_TRANS66 | Q2GX_SURF_FLOWING | Q2GX_SURF_NODRAW)
+
+
+static qboolean Q2GX_ReadWALDimensions(
+    const char *texture,
+    unsigned int *width_out,
+    unsigned int *height_out)
+{
+    char path[MAX_QPATH];
+    size_t texture_length;
+    void *file_buffer;
+    int file_length;
+    const byte *data;
+    uint32_t width;
+    uint32_t height;
+
+    if (!texture || !texture[0] || !width_out || !height_out)
+        return false;
+
+    texture_length = strlen(texture);
+
+    if (texture_length + 14u > sizeof(path))
+        return false;
+
+    memcpy(path, "textures/", 9u);
+    memcpy(path + 9u, texture, texture_length);
+    memcpy(path + 9u + texture_length, ".wal", 5u);
+
+    file_buffer = NULL;
+    file_length = ri.FS_LoadFile(path, &file_buffer);
+
+    if (file_length < 100 || !file_buffer)
+    {
+        if (file_buffer)
+            ri.FS_FreeFile(file_buffer);
+
+        return false;
+    }
+
+    data = (const byte *)file_buffer;
+
+    width = Q2GX_BSPReadLE32(data + 32u);
+    height = Q2GX_BSPReadLE32(data + 36u);
+
+    ri.FS_FreeFile(file_buffer);
+
+    if (width == 0u || height == 0u ||
+        width > 4096u || height > 4096u)
+    {
+        return false;
+    }
+
+    *width_out = (unsigned int)width;
+    *height_out = (unsigned int)height;
+
+    return true;
+}
+
+
+static void Q2GX_InitWorldCheckerTexture(void)
+{
+    unsigned int tile_y;
+    unsigned int tile_x;
+
+    if (q2gx_world_checker_ready)
+        return;
+
+    for (tile_y = 0u;
+         tile_y < Q2GX_WORLD_CHECKER_SIZE / 4u;
+         ++tile_y)
+    {
+        for (tile_x = 0u;
+             tile_x < Q2GX_WORLD_CHECKER_SIZE / 4u;
+             ++tile_x)
+        {
+            unsigned int local_y;
+            unsigned int local_x;
+            unsigned int block_offset;
+
+            block_offset =
+                (tile_y * (Q2GX_WORLD_CHECKER_SIZE / 4u) + tile_x) *
+                64u;
+
+            for (local_y = 0u; local_y < 4u; ++local_y)
+            {
+                for (local_x = 0u; local_x < 4u; ++local_x)
+                {
+                    unsigned int x = tile_x * 4u + local_x;
+                    unsigned int y = tile_y * 4u + local_y;
+                    unsigned int texel = local_y * 4u + local_x;
+                    unsigned int ar_offset =
+                        block_offset + texel * 2u;
+                    unsigned int gb_offset =
+                        block_offset + 32u + texel * 2u;
+
+                    u8 value =
+                        ((((x >> 3) ^ (y >> 3)) & 1u) != 0u)
+                            ? 32u
+                            : 255u;
+
+                    /*
+                     * GX_TF_RGBA8 4x4 tile:
+                     * first 32 bytes A/R, second 32 G/B.
+                     *
+                     * Cell 0,0 is white. Special surfaces
+                     * sample that white cell so GX_MODULATE
+                     * preserves their old flat pastel color.
+                     */
+                    q2gx_world_checker_pixels[ar_offset + 0u] = 255u;
+                    q2gx_world_checker_pixels[ar_offset + 1u] = value;
+                    q2gx_world_checker_pixels[gb_offset + 0u] = value;
+                    q2gx_world_checker_pixels[gb_offset + 1u] = value;
+                }
+            }
+        }
+    }
+
+    DCStoreRange(
+        q2gx_world_checker_pixels,
+        sizeof(q2gx_world_checker_pixels)
+    );
+
+    GX_InitTexObj(
+        &q2gx_world_checker_texobj,
+        q2gx_world_checker_pixels,
+        (u16)Q2GX_WORLD_CHECKER_SIZE,
+        (u16)Q2GX_WORLD_CHECKER_SIZE,
+        GX_TF_RGBA8,
+        GX_REPEAT,
+        GX_REPEAT,
+        GX_FALSE
+    );
+
+    GX_InitTexObjFilterMode(
+        &q2gx_world_checker_texobj,
+        GX_NEAR,
+        GX_NEAR
+    );
+
+    q2gx_world_checker_ready = true;
+}
+
+
+static void Q2GX_ComputeWorldDiagnosticST(
+    const q2gx_world_texinfo_t *texinfo,
+    const f32 position[3],
+    f32 *s_out,
+    f32 *t_out)
+{
+    f32 raw_s;
+    f32 raw_t;
+
+    if (!texinfo || !position || !s_out || !t_out ||
+        texinfo->width == 0u || texinfo->height == 0u)
+    {
+        if (s_out)
+            *s_out = 0.03125f;
+        if (t_out)
+            *t_out = 0.03125f;
+        return;
+    }
+
+    if (texinfo->flags & Q2GX_WORLD_TEXCOORD_SPECIAL_MASK)
+    {
+        *s_out = 0.03125f;
+        *t_out = 0.03125f;
+        return;
+    }
+
+    /*
+     * Exact stock GL_BuildPolygonFromSurface base texture:
+     *
+     * s = (dot(position, vecs[0].xyz) + vecs[0][3]) / width
+     * t = (dot(position, vecs[1].xyz) + vecs[1][3]) / height
+     */
+    raw_s =
+        position[0] * texinfo->vecs[0][0] +
+        position[1] * texinfo->vecs[0][1] +
+        position[2] * texinfo->vecs[0][2] +
+        texinfo->vecs[0][3];
+
+    raw_t =
+        position[0] * texinfo->vecs[1][0] +
+        position[1] * texinfo->vecs[1][1] +
+        position[2] * texinfo->vecs[1][2] +
+        texinfo->vecs[1][3];
+
+    *s_out = raw_s / (f32)texinfo->width;
+    *t_out = raw_t / (f32)texinfo->height;
+}
+
+
+static void Q2GX_SetupTexturedWorld3D(
+    refdef_t *fd)
+{
+    Q2GX_SetupWorld3D(fd);
+    Q2GX_InitWorldCheckerTexture();
+
+    GX_SetVtxDesc(
+        GX_VA_TEX0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_TEX0,
+        GX_TEX_ST,
+        GX_F32,
+        0
+    );
+
+    GX_SetNumTexGens(1);
+
+    GX_SetTexCoordGen(
+        GX_TEXCOORD0,
+        GX_TG_MTX2x4,
+        GX_TG_TEX0,
+        GX_IDENTITY
+    );
+
+    GX_SetNumTevStages(1);
+
+    GX_SetTevOrder(
+        GX_TEVSTAGE0,
+        GX_TEXCOORD0,
+        GX_TEXMAP0,
+        GX_COLOR0A0
+    );
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_MODULATE
+    );
+
+    GX_LoadTexObj(
+        &q2gx_world_checker_texobj,
+        GX_TEXMAP0
+    );
+}
+
+
 static void Q2GX_FreeWorldGeometry(void)
 {
     if (
@@ -2553,12 +2851,32 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_world_pvs_face_refs_window = 0u;
     q2gx_world_area_rejected_face_refs_window = 0u;
     q2gx_world_areabits_frames_window = 0u;
+
+
+    if (q2gx_world_texinfos)
+        free(q2gx_world_texinfos);
+
+    q2gx_world_texinfos = NULL;
+    q2gx_world_texinfo_count = 0u;
+    q2gx_world_texcoord_first_draw_logged = false;
+    q2gx_world_texcoord_vertices_window = 0u;
 }
 
 
 static qboolean Q2GX_LoadWorldGeometry(
     const char *map)
 {
+    const byte *texinfo_data = NULL;
+    unsigned int texinfo_bytes = 0u;
+    unsigned int texinfo_count = 0u;
+
+    q2gx_world_texinfo_t *world_texinfos = NULL;
+
+    unsigned int missing_wal_dimensions = 0u;
+    unsigned int ordinary_face_count = 0u;
+    unsigned int special_face_count = 0u;
+
+
     char path[MAX_QPATH];
     size_t map_length;
     void *file_buffer;
@@ -2721,7 +3039,87 @@ static qboolean Q2GX_LoadWorldGeometry(
         vis_row_bytes = (vis_numclusters + 7u) >> 3;
     }
 
-    triangle_count = 0u;
+
+    if (
+        !Q2GX_BSPGetLump(
+            file_data,
+            file_length,
+            Q2GX_BSP_LUMP_TEXINFO,
+            76u,
+            &texinfo_data,
+            &texinfo_bytes,
+            &texinfo_count
+        )
+        ||
+        texinfo_count == 0u
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX TEXCOORD: invalid texinfo lump in %s\n",
+            path
+        );
+
+        goto fail;
+    }
+
+    if (texinfo_count > SIZE_MAX / sizeof(*world_texinfos))
+        goto fail;
+
+    world_texinfos =
+        calloc(
+            texinfo_count,
+            sizeof(*world_texinfos)
+        );
+
+    if (!world_texinfos)
+        goto fail;
+
+    for (index = 0u; index < texinfo_count; ++index)
+    {
+        const byte *disk_texinfo =
+            texinfo_data + index * 76u;
+
+        unsigned int component;
+
+        q2gx_world_texinfo_t *texinfo =
+            &world_texinfos[index];
+
+        for (component = 0u; component < 4u; ++component)
+        {
+            texinfo->vecs[0][component] =
+                Q2GX_BSPReadLEFloat(
+                    disk_texinfo + component * 4u
+                );
+
+            texinfo->vecs[1][component] =
+                Q2GX_BSPReadLEFloat(
+                    disk_texinfo + 16u + component * 4u
+                );
+        }
+
+        texinfo->flags =
+            Q2GX_BSPReadLE32(
+                disk_texinfo + 32u
+            );
+
+        memcpy(
+            texinfo->texture,
+            disk_texinfo + 40u,
+            32u
+        );
+
+        texinfo->texture[32] = '\0';
+
+        /*
+         * Width/height are lazy-resolved only if a BSP face
+         * actually references this texinfo.
+         */
+        texinfo->width = 0u;
+        texinfo->height = 0u;
+    }
+
+triangle_count = 0u;
     for (face_index = 0u; face_index < face_count; ++face_index)
     {
         const byte *face = face_data + face_index * 20u;
@@ -3002,6 +3400,78 @@ static qboolean Q2GX_LoadWorldGeometry(
         unsigned int numedges = (unsigned int)((int16_t)Q2GX_BSPReadLE16(face + 8));
         const byte *plane = plane_data + (unsigned int)planenum * 20u;
         q2gx_world_face_t *world_face = &world_faces[face_index];
+
+        world_face->texinfo_index =
+            (unsigned int)
+            Q2GX_BSPReadLE16(
+                face + 10u
+            );
+
+        if (world_face->texinfo_index >= texinfo_count)
+        {
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX TEXCOORD: "
+                "face %u invalid texinfo %u\n",
+                face_index,
+                world_face->texinfo_index
+            );
+
+            goto fail;
+        }
+
+        if (
+            world_texinfos[
+                world_face->texinfo_index
+            ].width == 0u
+            ||
+            world_texinfos[
+                world_face->texinfo_index
+            ].height == 0u
+        )
+        {
+            q2gx_world_texinfo_t *face_texinfo =
+                &world_texinfos[
+                    world_face->texinfo_index
+                ];
+
+            if (
+                !Q2GX_ReadWALDimensions(
+                    face_texinfo->texture,
+                    &face_texinfo->width,
+                    &face_texinfo->height
+                )
+            )
+            {
+                /*
+                 * Stock missing-image fallback is tiny.
+                 * base1 is expected to hit this ZERO times.
+                 */
+                face_texinfo->width = 8u;
+                face_texinfo->height = 8u;
+
+                ++missing_wal_dimensions;
+            }
+        }
+
+        world_face->surface_flags =
+            world_texinfos[
+                world_face->texinfo_index
+            ].flags;
+
+        if (
+            world_face->surface_flags
+            &
+            Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+        )
+        {
+            ++special_face_count;
+        }
+        else
+        {
+            ++ordinary_face_count;
+        }
+
         unsigned int triangle;
         f32 fan_origin[3];
         u8 red, green, blue;
@@ -3062,8 +3532,38 @@ static qboolean Q2GX_LoadWorldGeometry(
             } while (0)
 
             Q2GX_STORE_WORLD_VERTEX(&out[0], fan_origin);
+
+            Q2GX_ComputeWorldDiagnosticST(
+                &world_texinfos[
+                    world_face->texinfo_index
+                ],
+                fan_origin,
+                &out[0].s,
+                &out[0].t
+            );
+
             Q2GX_STORE_WORLD_VERTEX(&out[1], p1);
+
+            Q2GX_ComputeWorldDiagnosticST(
+                &world_texinfos[
+                    world_face->texinfo_index
+                ],
+                p1,
+                &out[1].s,
+                &out[1].t
+            );
+
             Q2GX_STORE_WORLD_VERTEX(&out[2], p2);
+
+            Q2GX_ComputeWorldDiagnosticST(
+                &world_texinfos[
+                    world_face->texinfo_index
+                ],
+                p2,
+                &out[2].s,
+                &out[2].t
+            );
+
 #undef Q2GX_STORE_WORLD_VERTEX
             output_index += 3u;
         }
@@ -3080,6 +3580,10 @@ static qboolean Q2GX_LoadWorldGeometry(
 
     q2gx_world_vertices = world_vertices;
     q2gx_world_faces = world_faces;
+
+    q2gx_world_texinfos = world_texinfos;
+    q2gx_world_texinfo_count = texinfo_count;
+
     q2gx_world_nodes = world_nodes;
     q2gx_world_leaves = world_leaves;
     q2gx_world_leaffaces = world_leaffaces;
@@ -3132,9 +3636,36 @@ static qboolean Q2GX_LoadWorldGeometry(
     world_pvs_row2 = NULL;
 
     ri.FS_FreeFile(file_buffer);
-    return true;
+
+    world_texinfos = NULL;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX TEXCOORD LOAD: "
+        "%s "
+        "texinfos=%u "
+        "ordinary_faces=%u "
+        "special_faces=%u "
+        "missing_wal_dims=%u "
+        "checker=64x64 "
+        "mode=diagnostic_checker\n",
+        q2gx_world_name,
+        q2gx_world_texinfo_count,
+        ordinary_face_count,
+        special_face_count,
+        missing_wal_dimensions
+    );
+
+return true;
 
 fail:
+
+    if (world_texinfos)
+    {
+        free(world_texinfos);
+        world_texinfos = NULL;
+    }
+
     if (world_vertices) free(world_vertices);
     if (world_faces) free(world_faces);
     if (world_nodes) free(world_nodes);
@@ -3798,9 +4329,33 @@ static void Q2GX_DrawFlatWorld(
         return;
     }
 
-    Q2GX_SetupWorld3D(fd);
+    Q2GX_SetupTexturedWorld3D(
+        fd
+    );
 
-    remaining_vertices = submitted_vertices;
+
+    if (!q2gx_world_texcoord_first_draw_logged)
+    {
+        q2gx_world_texcoord_first_draw_logged = true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX TEXCOORD FIRST DRAW: "
+            "submitted_faces=%u "
+            "submitted_triangles=%u "
+            "submitted_vertices=%u "
+            "texinfos=%u "
+            "checker=64x64 "
+            "wrap=repeat "
+            "mode=diagnostic_checker\n",
+            submitted_faces,
+            submitted_triangles,
+            submitted_vertices,
+            q2gx_world_texinfo_count
+        );
+    }
+
+remaining_vertices = submitted_vertices;
     stream_face = 0u;
     face_vertex_offset = 0u;
 
@@ -3848,6 +4403,12 @@ static void Q2GX_DrawFlatWorld(
 
                 GX_Position3f32(vertex->x, vertex->y, vertex->z);
                 GX_Color4u8(vertex->r, vertex->g, vertex->b, vertex->a);
+
+                GX_TexCoord2f32(
+                    vertex->s,
+                    vertex->t
+                );
+
             }
 
             emitted += take;
@@ -3881,6 +4442,10 @@ static void Q2GX_DrawFlatWorld(
     q2gx_world_submitted_faces_window += submitted_faces;
     q2gx_world_submitted_triangles_window += submitted_triangles;
     q2gx_world_submitted_vertices_window += submitted_vertices;
+
+    q2gx_world_texcoord_vertices_window +=
+        submitted_vertices;
+
 
     q2gx_world_pvs_visible_leaves_window +=
         q2gx_world_pvs_visible_leaves_frame;
@@ -3972,9 +4537,26 @@ static void Q2GX_DrawFlatWorld(
             q2gx_world_areabits_frames_window
         );
 
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX TEXCOORD 120: "
+            "frames=%u "
+            "streamed_vertices_total=%u "
+            "texinfos=%u "
+            "checker=64x64 "
+            "wrap=repeat "
+            "mode=diagnostic_checker\n",
+            q2gx_world_frames_window,
+            q2gx_world_texcoord_vertices_window,
+            q2gx_world_texinfo_count
+        );
+
 q2gx_world_frames_window = 0u;
         q2gx_world_pvs_faces_window = 0u;
         q2gx_world_pvs_rejected_faces_window = 0u;
+
+        q2gx_world_texcoord_vertices_window = 0u;
+
 
         q2gx_world_pvs_visible_leaves_window = 0u;
         q2gx_world_area_rejected_leaves_window = 0u;
