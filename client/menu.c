@@ -2185,28 +2185,72 @@ static menuaction_s		s_loadgame_actions[MAX_SAVEGAMES];
 char		m_savestrings[MAX_SAVEGAMES][32];
 qboolean	m_savevalid[MAX_SAVEGAMES];
 
+
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+int Q2_SaveMenuSlotComment(
+    int slot,
+    char comment[32]);
+#endif
+
 void Create_Savestrings (void)
 {
-	int		i;
-	FILE	*f;
-	char	name[MAX_OSPATH];
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+    int i;
 
-	for (i=0 ; i<MAX_SAVEGAMES ; i++)
-	{
-		Com_sprintf (name, sizeof(name), "%s/save/save%i/server.ssv", FS_Gamedir(), i);
-		f = fopen (name, "rb");
-		if (!f)
-		{
-			strcpy (m_savestrings[i], "<EMPTY>");
-			m_savevalid[i] = false;
-		}
-		else
-		{
-			FS_Read (m_savestrings[i], sizeof(m_savestrings[i]), f);
-			fclose (f);
-			m_savevalid[i] = true;
-		}
-	}
+
+    /*
+     * Q2GC_SAVE_MENU_INDEX_V1
+     *
+     * Presentation only.
+     *
+     * This function performs ZERO file or CARD operations.  It reads the
+     * tiny slot-index cache populated once when the save VFS starts.
+     */
+    for (i = 0;
+         i < MAX_SAVEGAMES;
+         ++i)
+    {
+        if (Q2_SaveMenuSlotComment(
+                i,
+                m_savestrings[i]))
+        {
+            m_savevalid[i] =
+                true;
+        }
+        else
+        {
+            strcpy(
+                m_savestrings[i],
+                "<EMPTY>"
+            );
+
+            m_savevalid[i] =
+                false;
+        }
+    }
+#else
+    int     i;
+    FILE    *f;
+    char    name[MAX_OSPATH];
+
+
+    for (i=0 ; i<MAX_SAVEGAMES ; i++)
+    {
+        Com_sprintf (name, sizeof(name), "%s/save/save%i/server.ssv", FS_Gamedir(), i);
+        f = fopen (name, "rb");
+        if (!f)
+        {
+            strcpy (m_savestrings[i], "<EMPTY>");
+            m_savevalid[i] = false;
+        }
+        else
+        {
+            FS_Read (m_savestrings[i], sizeof(m_savestrings[i]), f);
+            fclose (f);
+            m_savevalid[i] = true;
+        }
+    }
+#endif
 }
 
 void LoadGameCallback( void *self )

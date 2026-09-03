@@ -46,6 +46,7 @@ CFILES := \
 	port_platform_gamecube.c \
 	port_soft_gamecube.c \
 	q2_save_stdio.c \
+	q2_save_symbols_gamecube.c \
 
 CPPFILES :=
 sFILES   :=
@@ -124,9 +125,35 @@ ifneq ($(BUILD),$(notdir $(CURDIR)))
 
 Q2_DISC_STAGE := q2-disc-stage
 
+Q2_SAVE_SYMBOL_TARGET := q2-save-symbol-map
+
+Q2_SAVE_SYMBOL_GENERATOR := \
+	$(PROJECT_DIR)/tools/gen_q2_save_symbol_map.py
+
+Q2_SAVE_SYMBOL_MAP := \
+	$(PROJECT_DIR)/$(BUILD)/q2save.sym
+
+Q2_SAVE_SYMBOL_REPORT := \
+	$(PROJECT_DIR)/$(BUILD)/q2save-symbols.tsv
+
+
+.PHONY: $(Q2_SAVE_SYMBOL_TARGET)
+
+$(Q2_SAVE_SYMBOL_TARGET): $(BUILD)
+	@echo "Generating stable Quake II save symbol map"
+	@python3 \
+		"$(Q2_SAVE_SYMBOL_GENERATOR)" \
+		--root "$(PROJECT_DIR)" \
+		--build "$(PROJECT_DIR)/$(BUILD)" \
+		--elf "$(PROJECT_DIR)/$(TARGET).elf" \
+		--output "$(Q2_SAVE_SYMBOL_MAP)" \
+		--report "$(Q2_SAVE_SYMBOL_REPORT)" \
+		--nm "$(DEVKITPPC)/bin/powerpc-eabi-nm"
+
+
 .PHONY: $(Q2_DISC_STAGE)
 
-$(Q2_DISC_STAGE):
+$(Q2_DISC_STAGE): $(Q2_SAVE_SYMBOL_TARGET)
 	@test -f "$(PROJECT_DIR)/baseq2/pak0.pak" || \
 		( echo "ERROR: missing baseq2/pak0.pak."; false )
 
@@ -138,6 +165,12 @@ $(Q2_DISC_STAGE):
 	@cp -a \
 		"$(PROJECT_DIR)/baseq2" \
 		"$(PROJECT_DIR)/$(BUILD)/disc/baseq2"
+
+	@cp \
+		"$(Q2_SAVE_SYMBOL_MAP)" \
+		"$(PROJECT_DIR)/$(BUILD)/disc/q2save.sym"
+
+	@echo "Adding stable save symbol map"
 
 endif
 

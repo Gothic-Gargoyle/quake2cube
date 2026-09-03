@@ -24,6 +24,238 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 mmove_t mmove_reloc;
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+
+#include <stdint.h>
+
+#include "q2_save_symbols_gamecube.h"
+
+
+/*
+ * Q2CS_STABLE_SAVE_ABI_V1
+ *
+ * GameCube saves use stable symbolic IDs rather than offsets
+ * from InitGame/mmove_reloc.
+ */
+
+#define Q2CS_VERSION 1u
+
+#define Q2CS_KIND_GAME  1u
+#define Q2CS_KIND_LEVEL 2u
+
+#define Q2CS_HEADER_SIZE 20u
+
+
+static void Q2CS_StoreBE32(
+    unsigned char *output,
+    uint32_t value)
+{
+    output[0] =
+        (unsigned char)(
+            value >> 24
+        );
+
+    output[1] =
+        (unsigned char)(
+            value >> 16
+        );
+
+    output[2] =
+        (unsigned char)(
+            value >> 8
+        );
+
+    output[3] =
+        (unsigned char)value;
+}
+
+
+static uint32_t Q2CS_LoadBE32(
+    const unsigned char *input)
+{
+    return
+        ((uint32_t)input[0] << 24) |
+        ((uint32_t)input[1] << 16) |
+        ((uint32_t)input[2] << 8) |
+        ((uint32_t)input[3]);
+}
+
+
+static void Q2CS_WriteHeader(
+    FILE *file,
+    uint32_t kind,
+    uint32_t primary_size,
+    uint32_t secondary_size)
+{
+    unsigned char header[
+        Q2CS_HEADER_SIZE
+    ];
+
+
+    memcpy(
+        header,
+        "Q2CS",
+        4
+    );
+
+    Q2CS_StoreBE32(
+        header + 4,
+        Q2CS_VERSION
+    );
+
+    Q2CS_StoreBE32(
+        header + 8,
+        kind
+    );
+
+    Q2CS_StoreBE32(
+        header + 12,
+        primary_size
+    );
+
+    Q2CS_StoreBE32(
+        header + 16,
+        secondary_size
+    );
+
+
+    if (
+        fwrite(
+            header,
+            1,
+            sizeof(header),
+            file
+        )
+        != sizeof(header)
+    )
+    {
+        gi.error(
+            "Q2CS: failed to write save header"
+        );
+    }
+}
+
+
+static void Q2CS_ReadHeader(
+    FILE *file,
+    uint32_t expected_kind,
+    uint32_t expected_primary_size,
+    uint32_t expected_secondary_size)
+{
+    unsigned char header[
+        Q2CS_HEADER_SIZE
+    ];
+
+    uint32_t version;
+
+    uint32_t kind;
+
+    uint32_t primary_size;
+
+    uint32_t secondary_size;
+
+
+    if (
+        fread(
+            header,
+            1,
+            sizeof(header),
+            file
+        )
+        != sizeof(header)
+    )
+    {
+        gi.error(
+            "Q2CS: truncated save header"
+        );
+    }
+
+
+    if (
+        memcmp(
+            header,
+            "Q2CS",
+            4
+        ) != 0
+    )
+    {
+        gi.error(
+            "Q2CS: unsupported pre-Q2CS save"
+        );
+    }
+
+
+    version =
+        Q2CS_LoadBE32(
+            header + 4
+        );
+
+    kind =
+        Q2CS_LoadBE32(
+            header + 8
+        );
+
+    primary_size =
+        Q2CS_LoadBE32(
+            header + 12
+        );
+
+    secondary_size =
+        Q2CS_LoadBE32(
+            header + 16
+        );
+
+
+    if (version != Q2CS_VERSION)
+    {
+        gi.error(
+            "Q2CS: unsupported save version %u",
+            (unsigned int)version
+        );
+    }
+
+
+    if (kind != expected_kind)
+    {
+        gi.error(
+            "Q2CS: wrong save record kind"
+        );
+    }
+
+
+    if (
+        primary_size !=
+            expected_primary_size ||
+        secondary_size !=
+            expected_secondary_size
+    )
+    {
+        gi.error(
+            "Q2CS: incompatible save structure "
+            "(%u/%u expected %u/%u)",
+            (unsigned int)primary_size,
+            (unsigned int)secondary_size,
+            (unsigned int)expected_primary_size,
+            (unsigned int)expected_secondary_size
+        );
+    }
+}
+
+
+static void Q2CS_BeginSymbols(void)
+{
+    if (!Q2_SaveSymbolsBegin())
+    {
+        gi.error(
+            "Q2CS: could not load dvd:/q2save.sym"
+        );
+    }
+}
+
+
+#endif
+
+
 field_t fields[] = {
 	{"classname", FOFS(classname), F_LSTRING},
 	{"model", FOFS(model), F_LSTRING},
@@ -272,23 +504,83 @@ void WriteField1 (FILE *f, field_t *field, byte *base)
 		*(int *)p = index;
 		break;
 
-	//relative to code segment
+	// stable symbolic function identity
 	case F_FUNCTION:
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	{
+		uint32_t stable_id;
+		void *address;
+
+		address = *(byte **)p;
+
+		if (!address)
+		{
+			stable_id = 0;
+		}
+		else
+		{
+			stable_id =
+				Q2_SaveFunctionToId (
+					address);
+
+			if (!stable_id)
+			{
+				gi.error (
+					"Q2CS: unregistered function in %s",
+					field->name);
+			}
+		}
+
+		*(uint32_t *)p = stable_id;
+		break;
+	}
+#else
 		if (*(byte **)p == NULL)
 			index = 0;
 		else
 			index = *(byte **)p - ((byte *)InitGame);
 		*(int *)p = index;
 		break;
+#endif
 
-	//relative to data segment
+	// stable symbolic mmove identity
 	case F_MMOVE:
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	{
+		uint32_t stable_id;
+		void *address;
+
+		address = *(byte **)p;
+
+		if (!address)
+		{
+			stable_id = 0;
+		}
+		else
+		{
+			stable_id =
+				Q2_SaveMMoveToId (
+					address);
+
+			if (!stable_id)
+			{
+				gi.error (
+					"Q2CS: unregistered mmove in %s",
+					field->name);
+			}
+		}
+
+		*(uint32_t *)p = stable_id;
+		break;
+	}
+#else
 		if (*(byte **)p == NULL)
 			index = 0;
 		else
 			index = *(byte **)p - (byte *)&mmove_reloc;
 		*(int *)p = index;
 		break;
+#endif
 
 	default:
 		gi.error ("WriteEdict: unknown field type");
@@ -368,23 +660,85 @@ void ReadField (FILE *f, field_t *field, byte *base)
 			*(gitem_t **)p = &itemlist[index];
 		break;
 
-	//relative to code segment
+	// stable symbolic function identity
 	case F_FUNCTION:
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	{
+		uint32_t stable_id;
+		void *address;
+
+		stable_id =
+			*(uint32_t *)p;
+
+		if (!stable_id)
+		{
+			*(byte **)p = NULL;
+			break;
+		}
+
+		address =
+			Q2_SaveFunctionFromId (
+				stable_id);
+
+		if (!address)
+		{
+			gi.error (
+				"Q2CS: unknown function ID 0x%08x in %s",
+				(unsigned int)stable_id,
+				field->name);
+		}
+
+		*(byte **)p = address;
+		break;
+	}
+#else
 		index = *(int *)p;
 		if ( index == 0 )
 			*(byte **)p = NULL;
 		else
 			*(byte **)p = ((byte *)InitGame) + index;
 		break;
+#endif
 
-	//relative to data segment
+	// stable symbolic mmove identity
 	case F_MMOVE:
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	{
+		uint32_t stable_id;
+		void *address;
+
+		stable_id =
+			*(uint32_t *)p;
+
+		if (!stable_id)
+		{
+			*(byte **)p = NULL;
+			break;
+		}
+
+		address =
+			Q2_SaveMMoveFromId (
+				stable_id);
+
+		if (!address)
+		{
+			gi.error (
+				"Q2CS: unknown mmove ID 0x%08x in %s",
+				(unsigned int)stable_id,
+				field->name);
+		}
+
+		*(byte **)p = address;
+		break;
+	}
+#else
 		index = *(int *)p;
 		if (index == 0)
 			*(byte **)p = NULL;
 		else
 			*(byte **)p = (byte *)&mmove_reloc + index;
 		break;
+#endif
 
 	default:
 		gi.error ("ReadEdict: unknown field type");
@@ -470,9 +824,19 @@ void WriteGame (char *filename, qboolean autosave)
 	if (!f)
 		gi.error ("Couldn't open %s", filename);
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2CS_WriteHeader (
+		f,
+		Q2CS_KIND_GAME,
+		sizeof(game),
+		sizeof(gclient_t));
+
+	Q2CS_BeginSymbols ();
+#else
 	memset (str, 0, sizeof(str));
 	strcpy (str, __DATE__);
 	fwrite (str, sizeof(str), 1, f);
+#endif
 
 	game.autosaved = autosave;
 	fwrite (&game, sizeof(game), 1, f);
@@ -481,6 +845,9 @@ void WriteGame (char *filename, qboolean autosave)
 	for (i=0 ; i<game.maxclients ; i++)
 		WriteClient (f, &game.clients[i]);
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2_SaveSymbolsEnd ();
+#endif
 	fclose (f);
 }
 
@@ -496,12 +863,22 @@ void ReadGame (char *filename)
 	if (!f)
 		gi.error ("Couldn't open %s", filename);
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2CS_ReadHeader (
+		f,
+		Q2CS_KIND_GAME,
+		sizeof(game),
+		sizeof(gclient_t));
+
+	Q2CS_BeginSymbols ();
+#else
 	fread (str, sizeof(str), 1, f);
 	if (strcmp (str, __DATE__))
 	{
 		fclose (f);
 		gi.error ("Savegame from an older version.\n");
 	}
+#endif
 
 	g_edicts =  gi.TagMalloc (game.maxentities * sizeof(g_edicts[0]), TAG_GAME);
 	globals.edicts = g_edicts;
@@ -511,6 +888,9 @@ void ReadGame (char *filename)
 	for (i=0 ; i<game.maxclients ; i++)
 		ReadClient (f, &game.clients[i]);
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2_SaveSymbolsEnd ();
+#endif
 	fclose (f);
 }
 
@@ -636,6 +1016,15 @@ void WriteLevel (char *filename)
 	if (!f)
 		gi.error ("Couldn't open %s", filename);
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2CS_WriteHeader (
+		f,
+		Q2CS_KIND_LEVEL,
+		sizeof(edict_t),
+		sizeof(level_locals_t));
+
+	Q2CS_BeginSymbols ();
+#else
 	// write out edict size for checking
 	i = sizeof(edict_t);
 	fwrite (&i, sizeof(i), 1, f);
@@ -643,6 +1032,7 @@ void WriteLevel (char *filename)
 	// write out a function pointer for checking
 	base = (void *)InitGame;
 	fwrite (&base, sizeof(base), 1, f);
+#endif
 
 	// write out level_locals_t
 	WriteLevelLocals (f);
@@ -659,6 +1049,9 @@ void WriteLevel (char *filename)
 	i = -1;
 	fwrite (&i, sizeof(i), 1, f);
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2_SaveSymbolsEnd ();
+#endif
 	fclose (f);
 }
 
@@ -699,6 +1092,15 @@ void ReadLevel (char *filename)
 	memset (g_edicts, 0, game.maxentities*sizeof(g_edicts[0]));
 	globals.num_edicts = maxclients->value+1;
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2CS_ReadHeader (
+		f,
+		Q2CS_KIND_LEVEL,
+		sizeof(edict_t),
+		sizeof(level_locals_t));
+
+	Q2CS_BeginSymbols ();
+#else
 	// check edict size
 	fread (&i, sizeof(i), 1, f);
 	if (i != sizeof(edict_t))
@@ -717,6 +1119,7 @@ void ReadLevel (char *filename)
 	}
 #else
 	gi.dprintf("Function offsets %d\n", ((byte *)base) - ((byte *)InitGame));
+#endif
 #endif
 
 	// load the level locals
@@ -743,6 +1146,9 @@ void ReadLevel (char *filename)
 		gi.linkentity (ent);
 	}
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2_SaveSymbolsEnd ();
+#endif
 	fclose (f);
 
 	// mark all clients as unconnected

@@ -94,6 +94,36 @@
 #define Q2_SAVE_STORED_HEADER_SIZE   20u
 
 
+/*
+ * Q2GC_SAVE_MENU_INDEX_V1
+ *
+ * Tiny persistent directory used only for Save/Load menu presentation.
+ *
+ * It deliberately does NOT contain gameplay state.  Full save bundles
+ * remain the authoritative savegame data.
+ *
+ * Format:
+ *
+ *   u32  magic       "Q2SI"
+ *   u32  version     1
+ *   u32  valid mask
+ *   byte comments[4][32]
+ *
+ * The comments are copied verbatim from the first 32 bytes of each
+ * committed server.ssv.
+ */
+#define Q2_SAVE_SLOT_COUNT              4u
+#define Q2_SAVE_COMMENT_SIZE            32u
+
+#define Q2_SAVE_SLOT_INDEX_MAGIC        0x51325349u /* Q2SI */
+#define Q2_SAVE_SLOT_INDEX_VERSION      1u
+#define Q2_SAVE_SLOT_INDEX_HEADER_SIZE  12u
+
+#define Q2_SAVE_SLOT_INDEX_SIZE \
+    (Q2_SAVE_SLOT_INDEX_HEADER_SIZE + \
+     Q2_SAVE_SLOT_COUNT * Q2_SAVE_COMMENT_SIZE)
+
+
 typedef struct q2_save_file_s
 {
     char name[Q2_SAVE_NAME_MAX];
@@ -158,6 +188,12 @@ static const unsigned char persistScope[] =
 };
 
 
+
+static const unsigned char slotIndexKey[] =
+    "slot-index-v1";
+
+
+
 static int vfsInitialized;
 static int cardAttempted;
 static int cardReady;
@@ -212,6 +248,22 @@ static unsigned char
 static int batchActive;
 static int batchDirectory = -1;
 static int batchDirty;
+
+
+/*
+ * Always-resident menu metadata.
+ *
+ * Unlike saveDirectories[save0..save3], this is intentionally tiny and
+ * remains resident for the lifetime of the process.
+ */
+static uint32_t slotIndexValidMask;
+
+static unsigned char
+    slotIndexComments[
+        Q2_SAVE_SLOT_COUNT
+    ][
+        Q2_SAVE_COMMENT_SIZE
+    ];
 
 
 /* ------------------------------------------------------------------------- */
@@ -1287,6 +1339,322 @@ static int decodeDirectory(
 
 
 /* ------------------------------------------------------------------------- */
+/* Save/Load menu metadata index                                             */
+/* ------------------------------------------------------------------------- */
+
+
+static void clearSlotIndexCache(void)
+{
+    slotIndexValidMask =
+        0;
+
+    memset(
+        slotIndexComments,
+        0,
+        sizeof(slotIndexComments)
+    );
+}
+
+
+static int persistSlotIndex(void)
+{
+    unsigned char encoded[
+        Q2_SAVE_SLOT_INDEX_SIZE
+    ];
+
+    unsigned int slot;
+
+    CH_PersistResult result;
+
+
+    if (!cardReady)
+        return 0;
+
+
+    memset(
+        encoded,
+        0,
+        sizeof(encoded)
+    );
+
+
+    writeBe32(
+        encoded + 0,
+        Q2_SAVE_SLOT_INDEX_MAGIC
+    );
+
+    writeBe32(
+        encoded + 4,
+        Q2_SAVE_SLOT_INDEX_VERSION
+    );
+
+    writeBe32(
+        encoded + 8,
+        slotIndexValidMask
+    );
+
+
+    for (slot = 0;
+         slot < Q2_SAVE_SLOT_COUNT;
+         ++slot)
+    {
+        memcpy(
+            encoded +
+                Q2_SAVE_SLOT_INDEX_HEADER_SIZE +
+                slot * Q2_SAVE_COMMENT_SIZE,
+            slotIndexComments[slot],
+            Q2_SAVE_COMMENT_SIZE
+        );
+    }
+
+
+    result =
+        CH_PersistPut(
+            &txBackend,
+            sectorBuffer,
+            sectorBufferSize,
+            persistScope,
+            sizeof(persistScope),
+            slotIndexKey,
+            sizeof(slotIndexKey) - 1u,
+            encoded,
+            sizeof(encoded)
+        );
+
+
+    if (result !=
+        CH_PERSIST_RESULT_OK)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE MENU: PUT slot-index failed: %d\n",
+            (int)result
+        );
+
+        return 0;
+    }
+
+
+    fprintf(
+        stderr,
+        "Q2GC SAVE MENU: PUT slot-index OK "
+        "mask=0x%02lx bytes=%lu\n",
+        (unsigned long)slotIndexValidMask,
+        (unsigned long)sizeof(encoded)
+    );
+
+
+    return 1;
+}
+
+
+static void loadSlotIndex(void)
+{
+    unsigned char encoded[
+        Q2_SAVE_SLOT_INDEX_SIZE
+    ];
+
+    size_t encodedSize =
+        0;
+
+    unsigned int slot;
+
+    CH_PersistResult result;
+
+
+    clearSlotIndexCache();
+
+
+    if (!cardReady)
+        return;
+
+
+    result =
+        CH_PersistGet(
+            &txBackend,
+            sectorBuffer,
+            sectorBufferSize,
+            persistScope,
+            sizeof(persistScope),
+            slotIndexKey,
+            sizeof(slotIndexKey) - 1u,
+            encoded,
+            sizeof(encoded),
+            &encodedSize
+        );
+
+
+    if (result ==
+        CH_PERSIST_RESULT_NOT_FOUND)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE MENU: slot-index empty\n"
+        );
+
+        return;
+    }
+
+
+    if (result !=
+        CH_PERSIST_RESULT_OK)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE MENU: GET slot-index failed: %d\n",
+            (int)result
+        );
+
+        return;
+    }
+
+
+    if (encodedSize !=
+            Q2_SAVE_SLOT_INDEX_SIZE ||
+        readBe32(encoded + 0) !=
+            Q2_SAVE_SLOT_INDEX_MAGIC ||
+        readBe32(encoded + 4) !=
+            Q2_SAVE_SLOT_INDEX_VERSION)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE MENU: slot-index invalid "
+            "bytes=%lu\n",
+            (unsigned long)encodedSize
+        );
+
+        return;
+    }
+
+
+    slotIndexValidMask =
+        readBe32(
+            encoded + 8
+        ) &
+        (
+            (1u << Q2_SAVE_SLOT_COUNT) -
+            1u
+        );
+
+
+    for (slot = 0;
+         slot < Q2_SAVE_SLOT_COUNT;
+         ++slot)
+    {
+        memcpy(
+            slotIndexComments[slot],
+            encoded +
+                Q2_SAVE_SLOT_INDEX_HEADER_SIZE +
+                slot * Q2_SAVE_COMMENT_SIZE,
+            Q2_SAVE_COMMENT_SIZE
+        );
+
+        /*
+         * Vanilla writes a NUL-padded 32-byte comment.
+         * Keep the menu robust if a damaged index does not.
+         */
+        slotIndexComments[slot][
+            Q2_SAVE_COMMENT_SIZE - 1u
+        ] =
+            '\0';
+    }
+
+
+    fprintf(
+        stderr,
+        "Q2GC SAVE MENU: GET slot-index OK "
+        "mask=0x%02lx bytes=%lu\n",
+        (unsigned long)slotIndexValidMask,
+        (unsigned long)encodedSize
+    );
+}
+
+
+static int updateSlotIndexFromDirectory(
+    int index)
+{
+    int slot;
+
+    uint32_t bit;
+
+    q2_save_file_t *serverFile;
+
+
+    if (index <
+            Q2_SAVE_PERSIST_FIRST ||
+        index >
+            Q2_SAVE_PERSIST_LAST)
+    {
+        return 0;
+    }
+
+
+    slot =
+        index -
+        Q2_SAVE_PERSIST_FIRST;
+
+    bit =
+        1u <<
+        (unsigned int)slot;
+
+
+    serverFile =
+        findFile(
+            &saveDirectories[index],
+            "server.ssv"
+        );
+
+
+    if (serverFile &&
+        serverFile->data &&
+        serverFile->size >=
+            Q2_SAVE_COMMENT_SIZE)
+    {
+        memcpy(
+            slotIndexComments[slot],
+            serverFile->data,
+            Q2_SAVE_COMMENT_SIZE
+        );
+
+        slotIndexComments[slot][
+            Q2_SAVE_COMMENT_SIZE - 1u
+        ] =
+            '\0';
+
+        slotIndexValidMask |=
+            bit;
+    }
+    else
+    {
+        memset(
+            slotIndexComments[slot],
+            0,
+            Q2_SAVE_COMMENT_SIZE
+        );
+
+        slotIndexValidMask &=
+            ~bit;
+    }
+
+
+    fprintf(
+        stderr,
+        "Q2GC SAVE MENU: cache slot=%d "
+        "valid=%d comment=\"%s\"\n",
+        slot,
+        (slotIndexValidMask & bit)
+            ? 1
+            : 0,
+        slotIndexComments[slot]
+    );
+
+
+    return
+        persistSlotIndex();
+}
+
+
+/* ------------------------------------------------------------------------- */
 /* persistent slots                                                          */
 /* ------------------------------------------------------------------------- */
 
@@ -1550,6 +1918,28 @@ static int persistDirectory(
         (unsigned long)bundleSize,
         (unsigned long)storedSize
     );
+
+
+    /*
+     * The full save bundle is authoritative.
+     *
+     * Only after that transaction succeeds do we publish its tiny menu
+     * comment.  A power loss between these two operations can therefore
+     * leave stale menu metadata, but can never advertise an uncommitted
+     * save as valid.
+     */
+    if (!updateSlotIndexFromDirectory(
+            index))
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE MENU: slot-index update "
+            "after %s failed\n",
+            saveDirectoryNames[index]
+        );
+
+        return 0;
+    }
 
 
     return 1;
@@ -2056,9 +2446,6 @@ static void ensureSavePathDirectoryLoaded(
 
 static void initializeVfs(void)
 {
-    int i;
-
-
     if (vfsInitialized)
         return;
 
@@ -2074,6 +2461,14 @@ static void initializeVfs(void)
         0,
         sizeof(saveStreams)
     );
+
+    memset(
+        persistentDirectoryLoaded,
+        0,
+        sizeof(persistentDirectoryLoaded)
+    );
+
+    clearSlotIndexCache();
 
 
     vfsInitialized =
@@ -2096,25 +2491,78 @@ static void initializeVfs(void)
     }
 
 
-    for (i =
-            Q2_SAVE_PERSIST_FIRST;
-         i <=
-            Q2_SAVE_PERSIST_LAST;
-         ++i)
-    {
-        (void)(
-            i
-        );
-    }
+    /*
+     * The only startup persistence read.
+     *
+     * This is 140 bytes and is retained for menu presentation.  Full
+     * save0..save3 bundles remain lazy.
+     */
+    loadSlotIndex();
+
 
     fprintf(
         stderr,
         "Q2GC SAVE: persistent slots lazy; "
-        "nothing expanded at startup\n"
+        "menu index resident\n"
     );
-
 }
 
+
+
+/* ------------------------------------------------------------------------- */
+/* Save/Load menu presentation                                               */
+/* ------------------------------------------------------------------------- */
+
+
+int Q2_SaveMenuSlotComment(
+    int slot,
+    char comment[32])
+{
+    uint32_t bit;
+
+
+    if (!comment)
+        return 0;
+
+
+    memset(
+        comment,
+        0,
+        Q2_SAVE_COMMENT_SIZE
+    );
+
+
+    if (slot < 0 ||
+        slot >=
+            (int)Q2_SAVE_SLOT_COUNT)
+    {
+        return 0;
+    }
+
+
+    bit =
+        1u <<
+        (unsigned int)slot;
+
+
+    if (!(slotIndexValidMask & bit))
+        return 0;
+
+
+    memcpy(
+        comment,
+        slotIndexComments[slot],
+        Q2_SAVE_COMMENT_SIZE
+    );
+
+    comment[
+        Q2_SAVE_COMMENT_SIZE - 1u
+    ] =
+        '\0';
+
+
+    return 1;
+}
 
 
 /* ------------------------------------------------------------------------- */
