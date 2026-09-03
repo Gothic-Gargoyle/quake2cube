@@ -338,6 +338,7 @@ typedef struct q2gx_world_texinfo_s
 #define Q2GX_MODEL_HANDLE_MAGIC 0x51324758u
 #define Q2GX_MODEL_KIND_WORLD 1u
 #define Q2GX_MODEL_KIND_INLINE_BSP 2u
+#define Q2GX_MODEL_KIND_ALIAS_MD2 3u
 #define Q2GX_BRUSH_BACKFACE_EPSILON 0.01f
 
 struct model_s
@@ -362,6 +363,95 @@ typedef struct q2gx_brush_model_s
 
     qboolean registered;
 } q2gx_brush_model_t;
+
+/* Q2GC_ALIAS_MODELS_V1 */
+#define Q2GX_ALIAS_MAX_SKINS 32u
+#define Q2GX_ALIAS_MAX_XYZ 2048u
+#define Q2GX_ALIAS_MAX_ST 4096u
+#define Q2GX_ALIAS_MAX_FRAMES 2048u
+#define Q2GX_ALIAS_MAX_TRIANGLES 21845u
+
+typedef struct q2gx_alias_skin_s
+{
+    char name[128];
+    unsigned int width;
+    unsigned int height;
+
+    void *storage;
+    unsigned int storage_bytes;
+    GXTexObj texture;
+
+    void *palette_storage;
+    unsigned int palette_bytes;
+    GXTlutObj tlut;
+
+    struct q2gx_alias_skin_s *next;
+} q2gx_alias_skin_t;
+
+typedef struct q2gx_alias_st_s
+{
+    int16_t s;
+    int16_t t;
+} q2gx_alias_st_t;
+
+typedef struct q2gx_alias_triangle_s
+{
+    uint16_t xyz[3];
+    uint16_t st[3];
+} q2gx_alias_triangle_t;
+
+typedef struct q2gx_alias_frame_s
+{
+    f32 scale[3];
+    f32 translate[3];
+    byte *verts;
+} q2gx_alias_frame_t;
+
+typedef struct q2gx_alias_model_s
+{
+    struct model_s handle;
+    char name[128];
+
+    unsigned int skin_width;
+    unsigned int skin_height;
+    unsigned int num_skins;
+    unsigned int num_xyz;
+    unsigned int num_st;
+    unsigned int num_tris;
+    unsigned int num_frames;
+
+    q2gx_alias_skin_t **skins;
+    q2gx_alias_st_t *st;
+    q2gx_alias_triangle_t *triangles;
+    q2gx_alias_frame_t *frames;
+    byte *frame_vertices;
+
+    unsigned int source_bytes;
+    unsigned int frame_storage_bytes;
+    qboolean first_draw_logged;
+
+    struct q2gx_alias_model_s *next;
+} q2gx_alias_model_t;
+
+typedef struct q2gx_alias_transform_s
+{
+    f32 origin[3];
+    f32 sin_roll, cos_roll;
+    f32 sin_pitch, cos_pitch;
+    f32 sin_yaw, cos_yaw;
+} q2gx_alias_transform_t;
+
+typedef struct q2gx_alias_lerp_s
+{
+    const q2gx_alias_frame_t *frame;
+    const q2gx_alias_frame_t *old_frame;
+    f32 move[3];
+    f32 frontv[3];
+    f32 backv[3];
+    f32 frontlerp;
+    f32 backlerp;
+} q2gx_alias_lerp_t;
+
 
 
 typedef struct q2gx_world_wal_texture_s
@@ -479,6 +569,31 @@ static unsigned int q2gx_brush_textured_faces_window;
 static unsigned int q2gx_brush_fallback_faces_window;
 static unsigned int q2gx_brush_wal_binds_window;
 static unsigned int q2gx_brush_vertices_window;
+
+static q2gx_alias_model_t *q2gx_alias_models;
+static q2gx_alias_skin_t *q2gx_alias_skins;
+static unsigned int q2gx_alias_model_serial;
+
+static unsigned int q2gx_alias_registered_models;
+static unsigned int q2gx_alias_registered_skins;
+static unsigned int q2gx_alias_source_bytes;
+static unsigned int q2gx_alias_skin_bytes;
+static unsigned int q2gx_alias_tlut_bytes;
+
+static unsigned int q2gx_alias_frames_window;
+static unsigned int q2gx_alias_entities_window;
+static unsigned int q2gx_alias_weapon_skipped_window;
+static unsigned int q2gx_alias_translucent_skipped_window;
+static unsigned int q2gx_alias_beam_skipped_window;
+static unsigned int q2gx_alias_triangles_window;
+static unsigned int q2gx_alias_vertices_window;
+static unsigned int q2gx_alias_skin_binds_window;
+static unsigned int q2gx_alias_tlut_loads_window;
+static unsigned int q2gx_alias_invalid_frame_window;
+static unsigned int q2gx_alias_invalid_skin_window;
+static unsigned int q2gx_alias_custom_skin_fallback_window;
+static unsigned int q2gx_alias_animated_samples_window;
+
 static unsigned int q2gx_world_plane_count;
 
 static size_t q2gx_world_bytes;
@@ -5491,6 +5606,1293 @@ static qboolean Q2GX_WorldFaceIsVisible(
 }
 
 
+
+static uint16_t Q2GX_AliasReadLE16(const byte *data)
+{
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static uint32_t Q2GX_AliasReadLE32(const byte *data)
+{
+    return
+        (uint32_t)data[0]
+        | ((uint32_t)data[1] << 8)
+        | ((uint32_t)data[2] << 16)
+        | ((uint32_t)data[3] << 24);
+}
+
+static f32 Q2GX_AliasReadLEFloat(const byte *data)
+{
+    uint32_t bits = Q2GX_AliasReadLE32(data);
+    f32 value;
+
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static qboolean Q2GX_AliasRangeOK(
+    unsigned int offset,
+    unsigned int count,
+    unsigned int item_size,
+    unsigned int file_bytes)
+{
+    uint64_t end =
+        (uint64_t)offset
+        +
+        (uint64_t)count
+        *
+        (uint64_t)item_size;
+
+    return offset <= file_bytes && end <= file_bytes;
+}
+
+/* Q2GC_ALIAS_MODELS_V1b_CI8
+ *
+ * GX CI8 is stored as 8x4 texel / 32-byte blocks.
+ * Keep the PCX's original 8-bit indices in main memory and let
+ * GX resolve them through a 256-entry RGB565 TLUT.
+ *
+ * A single hardware TLUT slot is deliberately reused. Each alias
+ * entity already binds its skin once, so V1b loads that skin's
+ * palette into GX_TLUT0 immediately before GX_LoadTexObj().
+ */
+static unsigned int Q2GX_AliasTextureStorageBytes(
+    unsigned int width,
+    unsigned int height)
+{
+    unsigned int padded_width = (width + 7u) & ~7u;
+    unsigned int padded_height = (height + 3u) & ~3u;
+
+    return padded_width * padded_height;
+}
+
+static void Q2GX_AliasWriteCI8Texel(
+    byte *storage,
+    unsigned int padded_width,
+    unsigned int x,
+    unsigned int y,
+    byte palette_index)
+{
+    unsigned int tile_x = x >> 3;
+    unsigned int tile_y = y >> 2;
+    unsigned int tiles_per_row = padded_width >> 3;
+    unsigned int tile_index =
+        tile_y * tiles_per_row + tile_x;
+    unsigned int within =
+        (y & 3u) * 8u + (x & 7u);
+    unsigned int base = tile_index * 32u;
+
+    storage[base + within] = palette_index;
+}
+
+static u16 Q2GX_AliasPackRGB565(
+    byte r,
+    byte g,
+    byte b)
+{
+    return
+        (u16)(
+            ((u16)(r >> 3) << 11)
+            | ((u16)(g >> 2) << 5)
+            | (u16)(b >> 3)
+        );
+}
+
+static q2gx_alias_skin_t *Q2GX_FindAliasSkin(const char *name)
+{
+    q2gx_alias_skin_t *skin;
+
+    for (skin = q2gx_alias_skins; skin; skin = skin->next)
+    {
+        if (!strcmp(skin->name, name))
+            return skin;
+    }
+
+    return NULL;
+}
+
+static q2gx_alias_skin_t *Q2GX_LoadAliasSkin(const char *name)
+{
+    q2gx_alias_skin_t *cached;
+    byte *file_data = NULL;
+    int file_length;
+
+    unsigned int xmin, ymin, xmax, ymax;
+    unsigned int width, height, bytes_per_line;
+    unsigned int palette_offset, data_end;
+    unsigned int source_pos, y;
+    unsigned int padded_width, storage_bytes;
+    unsigned int palette_bytes;
+
+    byte *indices = NULL;
+    q2gx_alias_skin_t *skin = NULL;
+
+    if (!name || !name[0])
+        return NULL;
+
+    cached = Q2GX_FindAliasSkin(name);
+    if (cached)
+        return cached;
+
+    file_length =
+        ri.FS_LoadFile(
+            (char *)name,
+            (void **)&file_data
+        );
+
+    if (file_length < 897 || !file_data)
+    {
+        if (file_data)
+            ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    if (
+        file_data[0] != 0x0Au
+        || file_data[1] != 5u
+        || file_data[2] != 1u
+        || file_data[3] != 8u
+        || file_data[65] != 1u
+    )
+    {
+        ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    xmin = Q2GX_AliasReadLE16(file_data + 4u);
+    ymin = Q2GX_AliasReadLE16(file_data + 6u);
+    xmax = Q2GX_AliasReadLE16(file_data + 8u);
+    ymax = Q2GX_AliasReadLE16(file_data + 10u);
+
+    if (xmax < xmin || ymax < ymin)
+    {
+        ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    width = xmax - xmin + 1u;
+    height = ymax - ymin + 1u;
+    bytes_per_line = Q2GX_AliasReadLE16(file_data + 66u);
+
+    if (
+        width == 0u
+        || height == 0u
+        || width > 1024u
+        || height > 1024u
+        || bytes_per_line < width
+    )
+    {
+        ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    palette_offset = (unsigned int)file_length - 768u;
+
+    data_end =
+        (
+            palette_offset > 0u
+            && file_data[palette_offset - 1u] == 0x0Cu
+        )
+        ?
+        palette_offset - 1u
+        :
+        palette_offset;
+
+    if (data_end <= 128u)
+    {
+        ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    indices = malloc(width * height);
+    if (!indices)
+    {
+        ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    source_pos = 128u;
+
+    for (y = 0u; y < height; ++y)
+    {
+        unsigned int x = 0u;
+
+        while (x < bytes_per_line)
+        {
+            unsigned int run = 1u;
+            byte value;
+            byte token;
+
+            if (source_pos >= data_end)
+                goto fail;
+
+            token = file_data[source_pos++];
+
+            if ((token & 0xC0u) == 0xC0u)
+            {
+                run = token & 0x3Fu;
+
+                if (run == 0u || source_pos >= data_end)
+                    goto fail;
+
+                value = file_data[source_pos++];
+            }
+            else
+            {
+                value = token;
+            }
+
+            while (run > 0u && x < bytes_per_line)
+            {
+                if (x < width)
+                    indices[y * width + x] = value;
+
+                ++x;
+                --run;
+            }
+        }
+    }
+
+    skin = calloc(1u, sizeof(*skin));
+    if (!skin)
+        goto fail;
+
+    padded_width = (width + 7u) & ~7u;
+    storage_bytes =
+        Q2GX_AliasTextureStorageBytes(width, height);
+
+    palette_bytes = 256u * sizeof(u16);
+
+    skin->storage = memalign(32, storage_bytes);
+    if (!skin->storage)
+        goto fail;
+
+    skin->palette_storage =
+        memalign(32, palette_bytes);
+
+    if (!skin->palette_storage)
+        goto fail;
+
+    memset(skin->storage, 0, storage_bytes);
+
+    for (y = 0u; y < height; ++y)
+    {
+        unsigned int x;
+
+        for (x = 0u; x < width; ++x)
+        {
+            byte palette_index = indices[y * width + x];
+
+            Q2GX_AliasWriteCI8Texel(
+                (byte *)skin->storage,
+                padded_width,
+                x,
+                y,
+                palette_index
+            );
+        }
+    }
+
+    for (y = 0u; y < 256u; ++y)
+    {
+        const byte *rgb =
+            file_data
+            + palette_offset
+            + y * 3u;
+
+        ((u16 *)skin->palette_storage)[y] =
+            Q2GX_AliasPackRGB565(
+                rgb[0],
+                rgb[1],
+                rgb[2]
+            );
+    }
+
+    DCStoreRange(skin->storage, storage_bytes);
+    DCStoreRange(skin->palette_storage, palette_bytes);
+
+    GX_InitTlutObj(
+        &skin->tlut,
+        skin->palette_storage,
+        GX_TL_RGB565,
+        256u
+    );
+
+    GX_InitTexObjCI(
+        &skin->texture,
+        skin->storage,
+        (u16)width,
+        (u16)height,
+        GX_TF_CI8,
+        GX_CLAMP,
+        GX_CLAMP,
+        GX_FALSE,
+        GX_TLUT0
+    );
+
+    GX_InitTexObjFilterMode(
+        &skin->texture,
+        GX_NEAR,
+        GX_NEAR
+    );
+
+    snprintf(skin->name, sizeof(skin->name), "%s", name);
+    skin->width = width;
+    skin->height = height;
+    skin->storage_bytes = storage_bytes;
+    skin->palette_bytes = palette_bytes;
+
+    skin->next = q2gx_alias_skins;
+    q2gx_alias_skins = skin;
+
+    ++q2gx_alias_registered_skins;
+    q2gx_alias_skin_bytes += storage_bytes;
+    q2gx_alias_tlut_bytes += palette_bytes;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX ALIAS SKIN LOAD: "
+        "%s size=%ux%u ci8_bytes=%u tlut_bytes=%u "
+        "tlut=GX_TLUT0 mode=pcx_ci8_rgb565\n",
+        skin->name,
+        skin->width,
+        skin->height,
+        skin->storage_bytes,
+        skin->palette_bytes
+    );
+
+    free(indices);
+    ri.FS_FreeFile(file_data);
+
+    return skin;
+
+fail:
+    if (skin)
+    {
+        if (skin->storage)
+            free(skin->storage);
+
+        if (skin->palette_storage)
+            free(skin->palette_storage);
+
+        free(skin);
+    }
+
+    if (indices)
+        free(indices);
+
+    if (file_data)
+        ri.FS_FreeFile(file_data);
+
+    return NULL;
+}
+
+static q2gx_alias_model_t *Q2GX_FindAliasModel(const char *name)
+{
+    q2gx_alias_model_t *model;
+
+    for (model = q2gx_alias_models; model; model = model->next)
+    {
+        if (!strcmp(model->name, name))
+            return model;
+    }
+
+    return NULL;
+}
+
+static void Q2GX_FreeUnlinkedAliasModel(q2gx_alias_model_t *model)
+{
+    if (!model)
+        return;
+
+    free(model->skins);
+    free(model->st);
+    free(model->triangles);
+    free(model->frames);
+    free(model->frame_vertices);
+    free(model);
+}
+
+static struct model_s *Q2GX_RegisterAliasModel(const char *name)
+{
+    q2gx_alias_model_t *cached;
+    q2gx_alias_model_t *model = NULL;
+
+    byte *file_data = NULL;
+    int file_length;
+
+    uint32_t ident;
+    int32_t version;
+    int32_t skin_width, skin_height, frame_size;
+    int32_t num_skins, num_xyz, num_st, num_tris, num_frames;
+    int32_t ofs_skins, ofs_st, ofs_tris, ofs_frames, ofs_end;
+
+    unsigned int i;
+    size_t name_length;
+
+    if (!name || !name[0])
+        return NULL;
+
+    name_length = strlen(name);
+
+    if (
+        name_length < 4u
+        || strcmp(name + name_length - 4u, ".md2")
+    )
+    {
+        return NULL;
+    }
+
+    if (name[0] == '#')
+        return NULL;
+
+    cached = Q2GX_FindAliasModel(name);
+    if (cached)
+        return &cached->handle;
+
+    file_length =
+        ri.FS_LoadFile(
+            (char *)name,
+            (void **)&file_data
+        );
+
+    if (file_length < 68 || !file_data)
+    {
+        if (file_data)
+            ri.FS_FreeFile(file_data);
+
+        return NULL;
+    }
+
+    ident = Q2GX_AliasReadLE32(file_data + 0u);
+    version = (int32_t)Q2GX_AliasReadLE32(file_data + 4u);
+    skin_width = (int32_t)Q2GX_AliasReadLE32(file_data + 8u);
+    skin_height = (int32_t)Q2GX_AliasReadLE32(file_data + 12u);
+    frame_size = (int32_t)Q2GX_AliasReadLE32(file_data + 16u);
+    num_skins = (int32_t)Q2GX_AliasReadLE32(file_data + 20u);
+    num_xyz = (int32_t)Q2GX_AliasReadLE32(file_data + 24u);
+    num_st = (int32_t)Q2GX_AliasReadLE32(file_data + 28u);
+    num_tris = (int32_t)Q2GX_AliasReadLE32(file_data + 32u);
+    num_frames = (int32_t)Q2GX_AliasReadLE32(file_data + 40u);
+    ofs_skins = (int32_t)Q2GX_AliasReadLE32(file_data + 44u);
+    ofs_st = (int32_t)Q2GX_AliasReadLE32(file_data + 48u);
+    ofs_tris = (int32_t)Q2GX_AliasReadLE32(file_data + 52u);
+    ofs_frames = (int32_t)Q2GX_AliasReadLE32(file_data + 56u);
+    ofs_end = (int32_t)Q2GX_AliasReadLE32(file_data + 64u);
+
+    if (
+        ident != 0x32504449u
+        || version != 8
+        || skin_width <= 0
+        || skin_height <= 0
+        || skin_width > 1024
+        || skin_height > 1024
+        || frame_size <= 0
+        || num_skins < 0
+        || num_skins > (int32_t)Q2GX_ALIAS_MAX_SKINS
+        || num_xyz <= 0
+        || num_xyz > (int32_t)Q2GX_ALIAS_MAX_XYZ
+        || num_st <= 0
+        || num_st > (int32_t)Q2GX_ALIAS_MAX_ST
+        || num_tris <= 0
+        || num_tris > (int32_t)Q2GX_ALIAS_MAX_TRIANGLES
+        || num_frames <= 0
+        || num_frames > (int32_t)Q2GX_ALIAS_MAX_FRAMES
+        || frame_size < 40 + num_xyz * 4
+        || ofs_skins < 0
+        || ofs_st < 0
+        || ofs_tris < 0
+        || ofs_frames < 0
+        || ofs_end < 68
+        || ofs_end > file_length
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX ALIAS REGISTER: invalid header %s\n",
+            name
+        );
+
+        ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    if (
+        !Q2GX_AliasRangeOK(
+            (unsigned int)ofs_skins,
+            (unsigned int)num_skins,
+            64u,
+            (unsigned int)ofs_end
+        )
+        || !Q2GX_AliasRangeOK(
+            (unsigned int)ofs_st,
+            (unsigned int)num_st,
+            4u,
+            (unsigned int)ofs_end
+        )
+        || !Q2GX_AliasRangeOK(
+            (unsigned int)ofs_tris,
+            (unsigned int)num_tris,
+            12u,
+            (unsigned int)ofs_end
+        )
+        || !Q2GX_AliasRangeOK(
+            (unsigned int)ofs_frames,
+            (unsigned int)num_frames,
+            (unsigned int)frame_size,
+            (unsigned int)ofs_end
+        )
+    )
+    {
+        ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    model = calloc(1u, sizeof(*model));
+    if (!model)
+    {
+        ri.FS_FreeFile(file_data);
+        return NULL;
+    }
+
+    model->handle.magic = Q2GX_MODEL_HANDLE_MAGIC;
+    model->handle.kind = Q2GX_MODEL_KIND_ALIAS_MD2;
+    model->handle.model_index = ++q2gx_alias_model_serial;
+
+    snprintf(model->name, sizeof(model->name), "%s", name);
+
+    model->skin_width = (unsigned int)skin_width;
+    model->skin_height = (unsigned int)skin_height;
+    model->num_skins = (unsigned int)num_skins;
+    model->num_xyz = (unsigned int)num_xyz;
+    model->num_st = (unsigned int)num_st;
+    model->num_tris = (unsigned int)num_tris;
+    model->num_frames = (unsigned int)num_frames;
+    model->source_bytes = (unsigned int)file_length;
+
+    if (model->num_skins > 0u)
+    {
+        model->skins =
+            calloc(
+                model->num_skins,
+                sizeof(*model->skins)
+            );
+
+        if (!model->skins)
+            goto fail;
+    }
+
+    model->st =
+        calloc(model->num_st, sizeof(*model->st));
+
+    model->triangles =
+        calloc(model->num_tris, sizeof(*model->triangles));
+
+    model->frames =
+        calloc(model->num_frames, sizeof(*model->frames));
+
+    model->frame_storage_bytes =
+        model->num_frames * model->num_xyz * 4u;
+
+    model->frame_vertices =
+        malloc(model->frame_storage_bytes);
+
+    if (
+        !model->st
+        || !model->triangles
+        || !model->frames
+        || !model->frame_vertices
+    )
+    {
+        goto fail;
+    }
+
+    for (i = 0u; i < model->num_st; ++i)
+    {
+        const byte *disk_st =
+            file_data + (unsigned int)ofs_st + i * 4u;
+
+        model->st[i].s =
+            (int16_t)Q2GX_AliasReadLE16(disk_st);
+
+        model->st[i].t =
+            (int16_t)Q2GX_AliasReadLE16(disk_st + 2u);
+    }
+
+    for (i = 0u; i < model->num_tris; ++i)
+    {
+        const byte *disk_tri =
+            file_data + (unsigned int)ofs_tris + i * 12u;
+
+        unsigned int corner;
+
+        for (corner = 0u; corner < 3u; ++corner)
+        {
+            uint16_t xyz_index =
+                Q2GX_AliasReadLE16(
+                    disk_tri + corner * 2u
+                );
+
+            uint16_t st_index =
+                Q2GX_AliasReadLE16(
+                    disk_tri + 6u + corner * 2u
+                );
+
+            if (
+                xyz_index >= model->num_xyz
+                || st_index >= model->num_st
+            )
+            {
+                goto fail;
+            }
+
+            model->triangles[i].xyz[corner] = xyz_index;
+            model->triangles[i].st[corner] = st_index;
+        }
+    }
+
+    for (i = 0u; i < model->num_frames; ++i)
+    {
+        const byte *disk_frame =
+            file_data
+            + (unsigned int)ofs_frames
+            + i * (unsigned int)frame_size;
+
+        q2gx_alias_frame_t *frame = &model->frames[i];
+        unsigned int axis;
+
+        for (axis = 0u; axis < 3u; ++axis)
+        {
+            frame->scale[axis] =
+                Q2GX_AliasReadLEFloat(
+                    disk_frame + axis * 4u
+                );
+
+            frame->translate[axis] =
+                Q2GX_AliasReadLEFloat(
+                    disk_frame + 12u + axis * 4u
+                );
+        }
+
+        frame->verts =
+            model->frame_vertices
+            + i * model->num_xyz * 4u;
+
+        memcpy(
+            frame->verts,
+            disk_frame + 40u,
+            model->num_xyz * 4u
+        );
+    }
+
+    for (i = 0u; i < model->num_skins; ++i)
+    {
+        const byte *disk_name =
+            file_data
+            + (unsigned int)ofs_skins
+            + i * 64u;
+
+        char skin_name[65];
+        unsigned int length = 0u;
+
+        while (length < 64u && disk_name[length] != 0u)
+        {
+            skin_name[length] = (char)disk_name[length];
+            ++length;
+        }
+
+        skin_name[length] = '\0';
+
+        if (!skin_name[0])
+            continue;
+
+        model->skins[i] =
+            Q2GX_LoadAliasSkin(skin_name);
+
+        if (!model->skins[i])
+            goto fail;
+    }
+
+    model->next = q2gx_alias_models;
+    q2gx_alias_models = model;
+
+    ++q2gx_alias_registered_models;
+    q2gx_alias_source_bytes += model->source_bytes;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX ALIAS REGISTER: "
+        "%s handle=%u skins=%u xyz=%u st=%u tris=%u "
+        "frames=%u skin_size=%ux%u source_bytes=%u "
+        "frame_bytes=%u mode=md2_alias_handle\n",
+        model->name,
+        model->handle.model_index,
+        model->num_skins,
+        model->num_xyz,
+        model->num_st,
+        model->num_tris,
+        model->num_frames,
+        model->skin_width,
+        model->skin_height,
+        model->source_bytes,
+        model->frame_storage_bytes
+    );
+
+    ri.FS_FreeFile(file_data);
+    return &model->handle;
+
+fail:
+    Q2GX_FreeUnlinkedAliasModel(model);
+    ri.FS_FreeFile(file_data);
+    return NULL;
+}
+
+static void Q2GX_InitAliasTransform(
+    const entity_t *entity,
+    q2gx_alias_transform_t *transform)
+{
+    const f32 deg = 0.01745329251994329577f;
+
+    f32 roll = -entity->angles[2] * deg;
+    f32 pitch = entity->angles[0] * deg;
+    f32 yaw = entity->angles[1] * deg;
+
+    memset(transform, 0, sizeof(*transform));
+
+    transform->origin[0] = entity->origin[0];
+    transform->origin[1] = entity->origin[1];
+    transform->origin[2] = entity->origin[2];
+
+    transform->sin_roll = sinf(roll);
+    transform->cos_roll = cosf(roll);
+    transform->sin_pitch = sinf(pitch);
+    transform->cos_pitch = cosf(pitch);
+    transform->sin_yaw = sinf(yaw);
+    transform->cos_yaw = cosf(yaw);
+}
+
+static void Q2GX_TransformAliasPoint(
+    const q2gx_alias_transform_t *transform,
+    f32 local_x,
+    f32 local_y,
+    f32 local_z,
+    f32 *world_x,
+    f32 *world_y,
+    f32 *world_z)
+{
+    f32 x1 = local_x;
+    f32 y1 =
+        transform->cos_roll * local_y
+        - transform->sin_roll * local_z;
+    f32 z1 =
+        transform->sin_roll * local_y
+        + transform->cos_roll * local_z;
+
+    f32 x2 =
+        transform->cos_pitch * x1
+        + transform->sin_pitch * z1;
+    f32 y2 = y1;
+    f32 z2 =
+        -transform->sin_pitch * x1
+        + transform->cos_pitch * z1;
+
+    *world_x =
+        transform->cos_yaw * x2
+        - transform->sin_yaw * y2
+        + transform->origin[0];
+
+    *world_y =
+        transform->sin_yaw * x2
+        + transform->cos_yaw * y2
+        + transform->origin[1];
+
+    *world_z = z2 + transform->origin[2];
+}
+
+static void Q2GX_InitAliasLerp(
+    const q2gx_alias_model_t *model,
+    const entity_t *entity,
+    unsigned int frame_index,
+    unsigned int old_frame_index,
+    q2gx_alias_lerp_t *lerp)
+{
+    vec3_t delta;
+    vec3_t vectors[3];
+    unsigned int axis;
+
+    memset(lerp, 0, sizeof(*lerp));
+
+    lerp->frame = &model->frames[frame_index];
+    lerp->old_frame = &model->frames[old_frame_index];
+
+    lerp->backlerp = entity->backlerp;
+    lerp->frontlerp = 1.0f - lerp->backlerp;
+
+    VectorSubtract(
+        entity->oldorigin,
+        entity->origin,
+        delta
+    );
+
+    AngleVectors(
+        entity->angles,
+        vectors[0],
+        vectors[1],
+        vectors[2]
+    );
+
+    lerp->move[0] = DotProduct(delta, vectors[0]);
+    lerp->move[1] = -DotProduct(delta, vectors[1]);
+    lerp->move[2] = DotProduct(delta, vectors[2]);
+
+    for (axis = 0u; axis < 3u; ++axis)
+    {
+        lerp->move[axis] += lerp->old_frame->translate[axis];
+
+        lerp->move[axis] =
+            lerp->backlerp * lerp->move[axis]
+            + lerp->frontlerp * lerp->frame->translate[axis];
+
+        lerp->frontv[axis] =
+            lerp->frontlerp * lerp->frame->scale[axis];
+
+        lerp->backv[axis] =
+            lerp->backlerp * lerp->old_frame->scale[axis];
+    }
+}
+
+static void Q2GX_LerpAliasVertex(
+    const q2gx_alias_lerp_t *lerp,
+    unsigned int vertex_index,
+    f32 *x,
+    f32 *y,
+    f32 *z)
+{
+    const byte *new_vertex =
+        lerp->frame->verts + vertex_index * 4u;
+
+    const byte *old_vertex =
+        lerp->old_frame->verts + vertex_index * 4u;
+
+    *x =
+        lerp->move[0]
+        + (f32)old_vertex[0] * lerp->backv[0]
+        + (f32)new_vertex[0] * lerp->frontv[0];
+
+    *y =
+        lerp->move[1]
+        + (f32)old_vertex[1] * lerp->backv[1]
+        + (f32)new_vertex[1] * lerp->frontv[1];
+
+    *z =
+        lerp->move[2]
+        + (f32)old_vertex[2] * lerp->backv[2]
+        + (f32)new_vertex[2] * lerp->frontv[2];
+}
+
+static q2gx_alias_skin_t *Q2GX_SelectAliasSkin(
+    const q2gx_alias_model_t *model,
+    const entity_t *entity,
+    qboolean *invalid_skin,
+    qboolean *custom_skin_fallback)
+{
+    int skin_index;
+
+    *invalid_skin = false;
+    *custom_skin_fallback = false;
+
+    if (model->num_skins == 0u || !model->skins)
+    {
+        *invalid_skin = true;
+        return NULL;
+    }
+
+    if (entity->skin)
+    {
+        *custom_skin_fallback = true;
+        skin_index = 0;
+    }
+    else
+    {
+        skin_index = entity->skinnum;
+    }
+
+    if (
+        skin_index < 0
+        || (unsigned int)skin_index >= model->num_skins
+        || !model->skins[(unsigned int)skin_index]
+    )
+    {
+        *invalid_skin = true;
+        skin_index = 0;
+    }
+
+    return model->skins[(unsigned int)skin_index];
+}
+
+static void Q2GX_SetupAlias3D(void)
+{
+    GX_SetNumTexGens(1);
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_REPLACE
+    );
+
+    GX_SetBlendMode(
+        GX_BM_NONE,
+        GX_BL_ONE,
+        GX_BL_ZERO,
+        GX_LO_CLEAR
+    );
+
+    GX_SetZMode(
+        GX_TRUE,
+        GX_LEQUAL,
+        GX_TRUE
+    );
+
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetCullMode(GX_CULL_NONE);
+}
+
+static void Q2GX_DrawAliasEntities(refdef_t *fd)
+{
+    unsigned int entity_index;
+
+    unsigned int entities_drawn = 0u;
+    unsigned int weapon_skipped = 0u;
+    unsigned int translucent_skipped = 0u;
+    unsigned int beam_skipped = 0u;
+    unsigned int triangles_drawn = 0u;
+    unsigned int vertices_drawn = 0u;
+    unsigned int skin_binds = 0u;
+    unsigned int tlut_loads = 0u;
+    unsigned int invalid_frames = 0u;
+    unsigned int invalid_skins = 0u;
+    unsigned int custom_skin_fallbacks = 0u;
+    unsigned int animated_samples = 0u;
+
+    if (!fd)
+        return;
+
+    ++q2gx_alias_frames_window;
+
+    if (fd->num_entities > 0 && fd->entities)
+    {
+        for (
+            entity_index = 0u;
+            entity_index < (unsigned int)fd->num_entities;
+            ++entity_index
+        )
+        {
+            entity_t *entity = &fd->entities[entity_index];
+            struct model_s *handle;
+            q2gx_alias_model_t *model;
+
+            unsigned int frame_index;
+            unsigned int old_frame_index;
+
+            q2gx_alias_lerp_t lerp;
+            q2gx_alias_transform_t transform;
+            q2gx_alias_skin_t *skin;
+
+            qboolean invalid_skin;
+            qboolean custom_skin_fallback;
+            unsigned int triangle_index;
+
+            if (!entity->model)
+                continue;
+
+            handle = entity->model;
+
+            if (
+                handle->magic != Q2GX_MODEL_HANDLE_MAGIC
+                || handle->kind != Q2GX_MODEL_KIND_ALIAS_MD2
+            )
+            {
+                continue;
+            }
+
+            model = (q2gx_alias_model_t *)handle;
+
+            if (entity->flags & RF_WEAPONMODEL)
+            {
+                ++weapon_skipped;
+                continue;
+            }
+
+            if (entity->flags & RF_BEAM)
+            {
+                ++beam_skipped;
+                continue;
+            }
+
+            if (entity->flags & RF_TRANSLUCENT)
+            {
+                ++translucent_skipped;
+                continue;
+            }
+
+            if (
+                entity->frame < 0
+                || (unsigned int)entity->frame >= model->num_frames
+            )
+            {
+                ++invalid_frames;
+                frame_index = 0u;
+                old_frame_index = 0u;
+            }
+            else if (
+                entity->oldframe < 0
+                || (unsigned int)entity->oldframe >= model->num_frames
+            )
+            {
+                ++invalid_frames;
+                frame_index = 0u;
+                old_frame_index = 0u;
+            }
+            else
+            {
+                frame_index = (unsigned int)entity->frame;
+                old_frame_index = (unsigned int)entity->oldframe;
+            }
+
+            skin =
+                Q2GX_SelectAliasSkin(
+                    model,
+                    entity,
+                    &invalid_skin,
+                    &custom_skin_fallback
+                );
+
+            if (invalid_skin)
+                ++invalid_skins;
+
+            if (custom_skin_fallback)
+                ++custom_skin_fallbacks;
+
+            if (!skin)
+                continue;
+
+            if (
+                frame_index != old_frame_index
+                || (
+                    entity->backlerp > 0.0f
+                    && entity->backlerp < 1.0f
+                )
+            )
+            {
+                ++animated_samples;
+            }
+
+            Q2GX_InitAliasLerp(
+                model,
+                entity,
+                frame_index,
+                old_frame_index,
+                &lerp
+            );
+
+            Q2GX_InitAliasTransform(
+                entity,
+                &transform
+            );
+
+            Q2GX_SetupAlias3D();
+
+            GX_LoadTlut(
+                &skin->tlut,
+                GX_TLUT0
+            );
+
+            ++tlut_loads;
+
+            GX_LoadTexObj(
+                &skin->texture,
+                GX_TEXMAP0
+            );
+
+            ++skin_binds;
+
+            GX_Begin(
+                GX_TRIANGLES,
+                GX_VTXFMT0,
+                (u16)(model->num_tris * 3u)
+            );
+
+            for (
+                triangle_index = 0u;
+                triangle_index < model->num_tris;
+                ++triangle_index
+            )
+            {
+                const q2gx_alias_triangle_t *triangle =
+                    &model->triangles[triangle_index];
+
+                unsigned int corner;
+
+                for (corner = 0u; corner < 3u; ++corner)
+                {
+                    unsigned int xyz_index =
+                        triangle->xyz[corner];
+
+                    unsigned int st_index =
+                        triangle->st[corner];
+
+                    const q2gx_alias_st_t *st =
+                        &model->st[st_index];
+
+                    f32 local_x, local_y, local_z;
+                    f32 world_x, world_y, world_z;
+
+                    Q2GX_LerpAliasVertex(
+                        &lerp,
+                        xyz_index,
+                        &local_x,
+                        &local_y,
+                        &local_z
+                    );
+
+                    Q2GX_TransformAliasPoint(
+                        &transform,
+                        local_x,
+                        local_y,
+                        local_z,
+                        &world_x,
+                        &world_y,
+                        &world_z
+                    );
+
+                    GX_Position3f32(
+                        world_x,
+                        world_y,
+                        world_z
+                    );
+
+                    GX_Color4u8(
+                        255u,
+                        255u,
+                        255u,
+                        255u
+                    );
+
+                    GX_TexCoord2f32(
+                        (f32)st->s / (f32)model->skin_width,
+                        (f32)st->t / (f32)model->skin_height
+                    );
+                }
+            }
+
+            GX_End();
+
+            ++entities_drawn;
+            triangles_drawn += model->num_tris;
+            vertices_drawn += model->num_tris * 3u;
+
+            if (!model->first_draw_logged)
+            {
+                model->first_draw_logged = true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX ALIAS MODEL FIRST DRAW: "
+                    "%s frame=%u oldframe=%u backlerp=%.4f "
+                    "tris=%u skin=%s origin=%.3f,%.3f,%.3f "
+                    "angles=%.3f,%.3f,%.3f flags=%d "
+                    "mode=md2_interpolated_rgba8\n",
+                    model->name,
+                    frame_index,
+                    old_frame_index,
+                    entity->backlerp,
+                    model->num_tris,
+                    skin->name,
+                    entity->origin[0],
+                    entity->origin[1],
+                    entity->origin[2],
+                    entity->angles[0],
+                    entity->angles[1],
+                    entity->angles[2],
+                    entity->flags
+                );
+            }
+        }
+    }
+
+    q2gx_alias_entities_window += entities_drawn;
+    q2gx_alias_weapon_skipped_window += weapon_skipped;
+    q2gx_alias_translucent_skipped_window += translucent_skipped;
+    q2gx_alias_beam_skipped_window += beam_skipped;
+    q2gx_alias_triangles_window += triangles_drawn;
+    q2gx_alias_vertices_window += vertices_drawn;
+    q2gx_alias_skin_binds_window += skin_binds;
+    q2gx_alias_tlut_loads_window += tlut_loads;
+    q2gx_alias_invalid_frame_window += invalid_frames;
+    q2gx_alias_invalid_skin_window += invalid_skins;
+    q2gx_alias_custom_skin_fallback_window += custom_skin_fallbacks;
+    q2gx_alias_animated_samples_window += animated_samples;
+
+    if (q2gx_alias_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX ALIAS 120: "
+            "frames=%u entities_total=%u weapon_skipped_total=%u "
+            "translucent_skipped_total=%u beam_skipped_total=%u "
+            "triangles_total=%u vertices_total=%u skin_binds_total=%u "
+            "tlut_loads_total=%u invalid_frame_total=%u invalid_skin_total=%u "
+            "custom_skin_fallback_total=%u animated_samples_total=%u "
+            "registered_models=%u registered_skins=%u "
+            "mode=md2_world_entities\n",
+            q2gx_alias_frames_window,
+            q2gx_alias_entities_window,
+            q2gx_alias_weapon_skipped_window,
+            q2gx_alias_translucent_skipped_window,
+            q2gx_alias_beam_skipped_window,
+            q2gx_alias_triangles_window,
+            q2gx_alias_vertices_window,
+            q2gx_alias_skin_binds_window,
+            q2gx_alias_tlut_loads_window,
+            q2gx_alias_invalid_frame_window,
+            q2gx_alias_invalid_skin_window,
+            q2gx_alias_custom_skin_fallback_window,
+            q2gx_alias_animated_samples_window,
+            q2gx_alias_registered_models,
+            q2gx_alias_registered_skins
+        );
+
+        q2gx_alias_frames_window = 0u;
+        q2gx_alias_entities_window = 0u;
+        q2gx_alias_weapon_skipped_window = 0u;
+        q2gx_alias_translucent_skipped_window = 0u;
+        q2gx_alias_beam_skipped_window = 0u;
+        q2gx_alias_triangles_window = 0u;
+        q2gx_alias_vertices_window = 0u;
+        q2gx_alias_skin_binds_window = 0u;
+        q2gx_alias_tlut_loads_window = 0u;
+        q2gx_alias_invalid_frame_window = 0u;
+        q2gx_alias_invalid_skin_window = 0u;
+        q2gx_alias_custom_skin_fallback_window = 0u;
+        q2gx_alias_animated_samples_window = 0u;
+    }
+}
+
+static void Q2GX_PrintAliasRegistrationSummary(void)
+{
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX ALIAS REGISTRATION: "
+        "models=%u skins=%u md2_source_bytes=%u "
+        "skin_ci8_bytes=%u tlut_bytes=%u "
+        "mode=md2_alias_cache_ci8\n",
+        q2gx_alias_registered_models,
+        q2gx_alias_registered_skins,
+        q2gx_alias_source_bytes,
+        q2gx_alias_skin_bytes,
+        q2gx_alias_tlut_bytes
+    );
+}
+
 typedef struct q2gx_brush_transform_s
 {
     f32 origin[3];
@@ -6626,6 +8028,10 @@ Q2GX_DrawBrushEntities(
         fd
     );
 
+    Q2GX_DrawAliasEntities(
+        fd
+    );
+
     ++q2gx_world_frames_window;
     q2gx_world_pvs_faces_window += pvs_faces;
     q2gx_world_pvs_rejected_faces_window += pvs_rejected_faces;
@@ -7172,7 +8578,12 @@ static struct model_s *Q2GX_RegisterModel(
         return NULL;
 
     if (name[0] != '*')
-        return NULL;
+    {
+        return
+            Q2GX_RegisterAliasModel(
+                name
+            );
+    }
 
     model_index =
         strtol(
@@ -7281,6 +8692,7 @@ static void Q2GX_SetSky(
 
 static void Q2GX_EndRegistration(void)
 {
+    Q2GX_PrintAliasRegistrationSummary();
 }
 
 
