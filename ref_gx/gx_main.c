@@ -21,6 +21,7 @@
 #include <gccore.h>
 
 #include <malloc.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -339,6 +340,15 @@ typedef struct q2gx_world_wal_texture_s
     unsigned int texture_bytes;
 
     GXTexObj texture;
+
+    /*
+     * Q2GC_WORLD_TEXTURE_BATCHING_V1
+     *
+     * Static ordinary BSP faces using this exact WAL.
+     * Built once during world registration.
+     */
+    unsigned int *face_indices;
+    unsigned int face_count;
 } q2gx_world_wal_texture_t;
 
 
@@ -377,6 +387,10 @@ static unsigned int q2gx_world_wal_textured_faces_window;
 static unsigned int q2gx_world_wal_animated_flat_faces_window;
 static unsigned int q2gx_world_wal_special_flat_faces_window;
 static unsigned int q2gx_world_wal_texture_binds_window;
+
+static unsigned int q2gx_world_wal_visible_textures_window;
+static unsigned int q2gx_world_wal_batch_draw_calls_window;
+static unsigned int q2gx_world_wal_batch_vertices_window;
 
 static qboolean q2gx_world_texcoord_first_draw_logged;
 static unsigned int q2gx_world_texcoord_vertices_window;
@@ -2818,6 +2832,19 @@ static void Q2GX_FreeWorldWALTextureArray(
 
     for (index = 0u; index < count; ++index)
     {
+        if (textures[index].face_indices)
+        {
+            free(
+                textures[index].face_indices
+            );
+
+            textures[index].face_indices =
+                NULL;
+
+            textures[index].face_count =
+                0u;
+        }
+
         if (textures[index].allocation)
         {
             free(textures[index].allocation);
@@ -3163,12 +3190,29 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_world_wal_animated_flat_faces_window = 0u;
     q2gx_world_wal_special_flat_faces_window = 0u;
     q2gx_world_wal_texture_binds_window = 0u;
+
+    q2gx_world_wal_visible_textures_window =
+        0u;
+
+    q2gx_world_wal_batch_draw_calls_window =
+        0u;
+
+    q2gx_world_wal_batch_vertices_window =
+        0u;
+
 }
 
 
 static qboolean Q2GX_LoadWorldGeometry(
     const char *map)
 {
+    unsigned int *wal_face_fill_counts = NULL;
+
+    unsigned int wal_batched_face_count = 0u;
+    unsigned int wal_max_batch_faces = 0u;
+    unsigned int wal_max_batch_vertices = 0u;
+
+
     q2gx_world_wal_texture_t *world_wal_textures = NULL;
     unsigned int world_wal_texture_count = 0u;
     unsigned int world_wal_texture_bytes = 0u;
@@ -3996,7 +4040,316 @@ triangle_count = 0u;
     if (output_index != gx_vertex_count)
         goto fail;
 
-    q2gx_world_vertices = world_vertices;
+
+    /*
+     * Q2GC_WORLD_TEXTURE_BATCHING_V1
+     *
+     * Build exact static ordinary face lists once.
+     * No visibility semantics are changed here.
+     */
+    if (world_wal_texture_count > 0u)
+    {
+        unsigned int texture_index;
+
+        for (
+            texture_index = 0u;
+            texture_index < world_wal_texture_count;
+            ++texture_index
+        )
+        {
+            world_wal_textures[
+                texture_index
+            ].face_count = 0u;
+        }
+
+        for (
+            face_index = 0u;
+            face_index < face_count;
+            ++face_index
+        )
+        {
+            q2gx_world_face_t *batch_face =
+                &world_faces[
+                    face_index
+                ];
+
+            q2gx_world_texinfo_t *batch_texinfo =
+                &world_texinfos[
+                    batch_face->texinfo_index
+                ];
+
+            unsigned int cache_index;
+
+            if (
+                batch_face->surface_flags
+                &
+                Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+            )
+            {
+                continue;
+            }
+
+            if (batch_texinfo->next_texinfo >= 0)
+                continue;
+
+            if (
+                batch_texinfo->wal_cache_index < 0
+                ||
+                (unsigned int)
+                batch_texinfo->wal_cache_index
+                >=
+                world_wal_texture_count
+            )
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BATCH: "
+                    "static face %u invalid cache=%d\n",
+                    face_index,
+                    batch_texinfo->wal_cache_index
+                );
+
+                goto fail;
+            }
+
+            cache_index =
+                (unsigned int)
+                batch_texinfo->wal_cache_index;
+
+            ++world_wal_textures[
+                cache_index
+            ].face_count;
+
+            ++wal_batched_face_count;
+        }
+
+        for (
+            texture_index = 0u;
+            texture_index < world_wal_texture_count;
+            ++texture_index
+        )
+        {
+            q2gx_world_wal_texture_t *batch_texture =
+                &world_wal_textures[
+                    texture_index
+                ];
+
+            if (batch_texture->face_count == 0u)
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BATCH: "
+                    "cache %u (%s) owns zero faces\n",
+                    texture_index,
+                    batch_texture->name
+                );
+
+                goto fail;
+            }
+
+            if (
+                batch_texture->face_count
+                >
+                SIZE_MAX
+                /
+                sizeof(
+                    *batch_texture->face_indices
+                )
+            )
+            {
+                goto fail;
+            }
+
+            batch_texture->face_indices =
+                malloc(
+                    batch_texture->face_count
+                    *
+                    sizeof(
+                        *batch_texture->face_indices
+                    )
+                );
+
+            if (!batch_texture->face_indices)
+                goto fail;
+        }
+
+        wal_face_fill_counts =
+            calloc(
+                world_wal_texture_count,
+                sizeof(
+                    *wal_face_fill_counts
+                )
+            );
+
+        if (!wal_face_fill_counts)
+            goto fail;
+
+        for (
+            face_index = 0u;
+            face_index < face_count;
+            ++face_index
+        )
+        {
+            q2gx_world_face_t *batch_face =
+                &world_faces[
+                    face_index
+                ];
+
+            q2gx_world_texinfo_t *batch_texinfo =
+                &world_texinfos[
+                    batch_face->texinfo_index
+                ];
+
+            unsigned int cache_index;
+            unsigned int fill_index;
+
+            if (
+                batch_face->surface_flags
+                &
+                Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+            )
+            {
+                continue;
+            }
+
+            if (batch_texinfo->next_texinfo >= 0)
+                continue;
+
+            cache_index =
+                (unsigned int)
+                batch_texinfo->wal_cache_index;
+
+            fill_index =
+                wal_face_fill_counts[
+                    cache_index
+                ]++;
+
+            if (
+                fill_index
+                >=
+                world_wal_textures[
+                    cache_index
+                ].face_count
+            )
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BATCH: "
+                    "face-list overflow cache=%u\n",
+                    cache_index
+                );
+
+                goto fail;
+            }
+
+            world_wal_textures[
+                cache_index
+            ].face_indices[
+                fill_index
+            ] =
+                face_index;
+        }
+
+        for (
+            texture_index = 0u;
+            texture_index < world_wal_texture_count;
+            ++texture_index
+        )
+        {
+            q2gx_world_wal_texture_t *batch_texture =
+                &world_wal_textures[
+                    texture_index
+                ];
+
+            unsigned int list_index;
+            unsigned int full_vertices = 0u;
+
+            if (
+                wal_face_fill_counts[
+                    texture_index
+                ]
+                !=
+                batch_texture->face_count
+            )
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BATCH: "
+                    "face-list fill mismatch cache=%u "
+                    "expected=%u actual=%u\n",
+                    texture_index,
+                    batch_texture->face_count,
+                    wal_face_fill_counts[
+                        texture_index
+                    ]
+                );
+
+                goto fail;
+            }
+
+            for (
+                list_index = 0u;
+                list_index < batch_texture->face_count;
+                ++list_index
+            )
+            {
+                unsigned int referenced_face =
+                    batch_texture->face_indices[
+                        list_index
+                    ];
+
+                if (referenced_face >= face_count)
+                    goto fail;
+
+                if (
+                    UINT_MAX
+                    -
+                    full_vertices
+                    <
+                    world_faces[
+                        referenced_face
+                    ].vertex_count
+                )
+                {
+                    goto fail;
+                }
+
+                full_vertices +=
+                    world_faces[
+                        referenced_face
+                    ].vertex_count;
+            }
+
+            if (
+                batch_texture->face_count
+                >
+                wal_max_batch_faces
+            )
+            {
+                wal_max_batch_faces =
+                    batch_texture->face_count;
+            }
+
+            if (
+                full_vertices
+                >
+                wal_max_batch_vertices
+            )
+            {
+                wal_max_batch_vertices =
+                    full_vertices;
+            }
+        }
+
+        free(
+            wal_face_fill_counts
+        );
+
+        wal_face_fill_counts =
+            NULL;
+    }
+
+q2gx_world_vertices = world_vertices;
     q2gx_world_faces = world_faces;
 
     q2gx_world_texinfos = world_texinfos;
@@ -4105,9 +4458,37 @@ triangle_count = 0u;
         wal_special_flat_face_count
     );
 
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX BATCH LOAD: "
+        "%s "
+        "cached_textures=%u "
+        "batched_faces=%u "
+        "max_batch_faces=%u "
+        "max_batch_vertices=%u "
+        "mode=precomputed_wal_face_lists\n",
+        q2gx_world_name,
+        q2gx_world_wal_texture_count,
+        wal_batched_face_count,
+        wal_max_batch_faces,
+        wal_max_batch_vertices
+    );
+
 return true;
 
 fail:
+
+    if (wal_face_fill_counts)
+    {
+        free(
+            wal_face_fill_counts
+        );
+
+        wal_face_fill_counts =
+            NULL;
+    }
+
 
     Q2GX_FreeWorldWALTextureArray(
         world_wal_textures,
@@ -4811,10 +5192,284 @@ int leaf_index = -1;
 
 {
         unsigned int wal_textured_faces = 0u;
+        unsigned int wal_textured_vertices = 0u;
+
         unsigned int wal_animated_flat_faces = 0u;
         unsigned int wal_special_flat_faces = 0u;
-        unsigned int wal_texture_binds = 0u;
 
+        unsigned int wal_visible_textures = 0u;
+        unsigned int wal_texture_binds = 0u;
+        unsigned int wal_batch_draw_calls = 0u;
+
+        unsigned int texture_index;
+
+        /*
+         * Q2GC_WORLD_TEXTURE_BATCHING_V1
+         *
+         * Static opaque WAL pass:
+         * one precomputed face list per unique WAL.
+         */
+        for (
+            texture_index = 0u;
+            texture_index < q2gx_world_wal_texture_count;
+            ++texture_index
+        )
+        {
+            q2gx_world_wal_texture_t *batch_texture =
+                &q2gx_world_wal_textures[
+                    texture_index
+                ];
+
+            unsigned int visible_vertices = 0u;
+            unsigned int visible_faces = 0u;
+            unsigned int list_index;
+
+            for (
+                list_index = 0u;
+                list_index < batch_texture->face_count;
+                ++list_index
+            )
+            {
+                unsigned int referenced_face =
+                    batch_texture->face_indices[
+                        list_index
+                    ];
+
+                q2gx_world_face_t *face;
+
+                if (
+                    referenced_face
+                    >=
+                    q2gx_world_face_count
+                )
+                {
+                    ri.Con_Printf(
+                        PRINT_ALL,
+                        "Q2GC REF_GX BATCH: "
+                        "runtime face index overflow "
+                        "cache=%u face=%u\n",
+                        texture_index,
+                        referenced_face
+                    );
+
+                    return;
+                }
+
+                face =
+                    &q2gx_world_faces[
+                        referenced_face
+                    ];
+
+                if (!face->visible_this_frame)
+                    continue;
+
+                if (
+                    UINT_MAX
+                    -
+                    visible_vertices
+                    <
+                    face->vertex_count
+                )
+                {
+                    ri.Con_Printf(
+                        PRINT_ALL,
+                        "Q2GC REF_GX BATCH: "
+                        "visible vertex overflow "
+                        "cache=%u\n",
+                        texture_index
+                    );
+
+                    return;
+                }
+
+                visible_vertices +=
+                    face->vertex_count;
+
+                ++visible_faces;
+            }
+
+            if (visible_faces == 0u)
+                continue;
+
+            Q2GX_BindWorldWALTexture(
+                batch_texture
+            );
+
+            ++wal_visible_textures;
+            ++wal_texture_binds;
+
+            wal_textured_faces +=
+                visible_faces;
+
+            wal_textured_vertices +=
+                visible_vertices;
+
+            /*
+             * Generic chunking retained for other maps.
+             * The base1 quarry proved every full WAL batch is
+             * <= 4881 vertices, so base1 uses one draw per
+             * visible texture.
+             */
+            list_index = 0u;
+
+            while (
+                list_index
+                <
+                batch_texture->face_count
+            )
+            {
+                unsigned int chunk_start =
+                    list_index;
+
+                unsigned int chunk_end =
+                    list_index;
+
+                unsigned int chunk_vertices =
+                    0u;
+
+                unsigned int emit_index;
+
+                while (
+                    chunk_end
+                    <
+                    batch_texture->face_count
+                )
+                {
+                    unsigned int referenced_face =
+                        batch_texture->face_indices[
+                            chunk_end
+                        ];
+
+                    q2gx_world_face_t *face =
+                        &q2gx_world_faces[
+                            referenced_face
+                        ];
+
+                    if (!face->visible_this_frame)
+                    {
+                        ++chunk_end;
+                        continue;
+                    }
+
+                    if (
+                        face->vertex_count
+                        >
+                        65532u
+                    )
+                    {
+                        ri.Con_Printf(
+                            PRINT_ALL,
+                            "Q2GC REF_GX BATCH: "
+                            "single face too large "
+                            "face=%u vertices=%u\n",
+                            referenced_face,
+                            face->vertex_count
+                        );
+
+                        return;
+                    }
+
+                    if (
+                        chunk_vertices > 0u
+                        &&
+                        chunk_vertices
+                        +
+                        face->vertex_count
+                        >
+                        65532u
+                    )
+                    {
+                        break;
+                    }
+
+                    chunk_vertices +=
+                        face->vertex_count;
+
+                    ++chunk_end;
+                }
+
+                if (chunk_vertices == 0u)
+                {
+                    list_index =
+                        chunk_end;
+
+                    continue;
+                }
+
+                GX_Begin(
+                    GX_TRIANGLES,
+                    GX_VTXFMT0,
+                    (u16)
+                    chunk_vertices
+                );
+
+                for (
+                    emit_index = chunk_start;
+                    emit_index < chunk_end;
+                    ++emit_index
+                )
+                {
+                    unsigned int referenced_face =
+                        batch_texture->face_indices[
+                            emit_index
+                        ];
+
+                    q2gx_world_face_t *face =
+                        &q2gx_world_faces[
+                            referenced_face
+                        ];
+
+                    unsigned int vertex_index;
+
+                    if (!face->visible_this_frame)
+                        continue;
+
+                    for (
+                        vertex_index = 0u;
+                        vertex_index < face->vertex_count;
+                        ++vertex_index
+                    )
+                    {
+                        const q2gx_world_vertex_t *vertex =
+                            &q2gx_world_vertices[
+                                face->first_vertex
+                                +
+                                vertex_index
+                            ];
+
+                        GX_Position3f32(
+                            vertex->x,
+                            vertex->y,
+                            vertex->z
+                        );
+
+                        GX_Color4u8(
+                            vertex->r,
+                            vertex->g,
+                            vertex->b,
+                            vertex->a
+                        );
+
+                        GX_TexCoord2f32(
+                            vertex->s,
+                            vertex->t
+                        );
+                    }
+                }
+
+                GX_End();
+
+                ++wal_batch_draw_calls;
+
+                list_index =
+                    chunk_end;
+            }
+        }
+
+        /*
+         * Keep animated/special fallback faces separate and in
+         * original BSP face order.
+         */
         for (
             face_index = 0u;
             face_index < q2gx_world_face_count;
@@ -4827,10 +5482,7 @@ int leaf_index = -1;
                 ];
 
             q2gx_world_texinfo_t *texinfo;
-
             unsigned int vertex_index;
-
-            qboolean use_wal;
 
             if (!face->visible_this_frame)
                 continue;
@@ -4840,7 +5492,7 @@ int leaf_index = -1;
                     face->texinfo_index
                 ];
 
-            use_wal =
+            if (
                 !(
                     face->surface_flags
                     &
@@ -4848,47 +5500,32 @@ int leaf_index = -1;
                 )
                 &&
                 texinfo->next_texinfo < 0
-                &&
-                texinfo->wal_cache_index >= 0
-                &&
-                (unsigned int)texinfo->wal_cache_index <
-                    q2gx_world_wal_texture_count;
-
-            if (use_wal)
+            )
             {
-                Q2GX_BindWorldWALTexture(
-                    &q2gx_world_wal_textures[
-                        (unsigned int)texinfo->wal_cache_index
-                    ]
-                );
+                continue;
+            }
 
-                ++wal_textured_faces;
-                ++wal_texture_binds;
+            Q2GX_BindWorldFlatFallback();
+
+            if (
+                face->surface_flags
+                &
+                Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+            )
+            {
+                ++wal_special_flat_faces;
             }
             else
             {
-                Q2GX_BindWorldFlatFallback();
-
-                if (
-                    face->surface_flags
-                    &
-                    Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
-                )
-                {
-                    ++wal_special_flat_faces;
-                }
-                else
-                {
-                    ++wal_animated_flat_faces;
-                }
+                ++wal_animated_flat_faces;
             }
 
             if (face->vertex_count > 65535u)
             {
                 ri.Con_Printf(
                     PRINT_ALL,
-                    "Q2GC REF_GX WAL: "
-                    "face %u too large vertices=%u\n",
+                    "Q2GC REF_GX BATCH: "
+                    "fallback face %u too large vertices=%u\n",
                     face_index,
                     face->vertex_count
                 );
@@ -4899,7 +5536,8 @@ int leaf_index = -1;
             GX_Begin(
                 GX_TRIANGLES,
                 GX_VTXFMT0,
-                (u16)face->vertex_count
+                (u16)
+                face->vertex_count
             );
 
             for (
@@ -4949,7 +5587,7 @@ int leaf_index = -1;
         {
             ri.Con_Printf(
                 PRINT_ALL,
-                "Q2GC REF_GX WAL: draw accounting mismatch "
+                "Q2GC REF_GX BATCH: draw accounting mismatch "
                 "textured=%u animated=%u special=%u submitted=%u\n",
                 wal_textured_faces,
                 wal_animated_flat_faces,
@@ -4960,9 +5598,43 @@ int leaf_index = -1;
             return;
         }
 
+        if (
+            wal_texture_binds
+            !=
+            wal_visible_textures
+        )
+        {
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX BATCH: "
+                "bind/visible-texture mismatch "
+                "binds=%u visible=%u\n",
+                wal_texture_binds,
+                wal_visible_textures
+            );
+
+            return;
+        }
+
+        if (
+            wal_batch_draw_calls
+            <
+            wal_visible_textures
+        )
+        {
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX BATCH: "
+                "draw calls below visible textures\n"
+            );
+
+            return;
+        }
+
         if (!q2gx_world_wal_first_draw_logged)
         {
-            q2gx_world_wal_first_draw_logged = true;
+            q2gx_world_wal_first_draw_logged =
+                true;
 
             ri.Con_Printf(
                 PRINT_ALL,
@@ -4981,6 +5653,24 @@ int leaf_index = -1;
                 q2gx_world_wal_texture_count,
                 q2gx_world_wal_texture_bytes
             );
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX BATCH FIRST DRAW: "
+                "textured_faces=%u "
+                "textured_vertices=%u "
+                "visible_textures=%u "
+                "draw_calls=%u "
+                "texture_binds=%u "
+                "cached_textures=%u "
+                "mode=wal_texture_batches\n",
+                wal_textured_faces,
+                wal_textured_vertices,
+                wal_visible_textures,
+                wal_batch_draw_calls,
+                wal_texture_binds,
+                q2gx_world_wal_texture_count
+            );
         }
 
         q2gx_world_wal_textured_faces_window +=
@@ -4994,6 +5684,15 @@ int leaf_index = -1;
 
         q2gx_world_wal_texture_binds_window +=
             wal_texture_binds;
+
+        q2gx_world_wal_visible_textures_window +=
+            wal_visible_textures;
+
+        q2gx_world_wal_batch_draw_calls_window +=
+            wal_batch_draw_calls;
+
+        q2gx_world_wal_batch_vertices_window +=
+            wal_textured_vertices;
     }
 
 ++q2gx_world_frames_window;
@@ -5098,7 +5797,27 @@ int leaf_index = -1;
             q2gx_world_areabits_frames_window
         );
 
-                ri.Con_Printf(
+                        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BATCH 120: "
+            "frames=%u "
+            "textured_faces_total=%u "
+            "textured_vertices_total=%u "
+            "visible_textures_total=%u "
+            "draw_calls_total=%u "
+            "texture_binds_total=%u "
+            "cached_textures=%u "
+            "mode=wal_texture_batches\n",
+            q2gx_world_frames_window,
+            q2gx_world_wal_textured_faces_window,
+            q2gx_world_wal_batch_vertices_window,
+            q2gx_world_wal_visible_textures_window,
+            q2gx_world_wal_batch_draw_calls_window,
+            q2gx_world_wal_texture_binds_window,
+            q2gx_world_wal_texture_count
+        );
+
+ri.Con_Printf(
             PRINT_ALL,
             "Q2GC REF_GX WAL 120: "
             "frames=%u "
@@ -5142,6 +5861,11 @@ q2gx_world_frames_window = 0u;
         q2gx_world_wal_animated_flat_faces_window = 0u;
         q2gx_world_wal_special_flat_faces_window = 0u;
         q2gx_world_wal_texture_binds_window = 0u;
+
+        q2gx_world_wal_visible_textures_window = 0u;
+        q2gx_world_wal_batch_draw_calls_window = 0u;
+        q2gx_world_wal_batch_vertices_window = 0u;
+
 
 
 
