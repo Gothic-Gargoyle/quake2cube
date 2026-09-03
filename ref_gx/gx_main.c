@@ -251,13 +251,44 @@ typedef struct q2gx_world_vertex_s
 } q2gx_world_vertex_t;
 
 
+/*
+ * Q2GC_BSP_BACKFACE_REJECTION_V1
+ *
+ * Preserve the BSP plane and face.side semantics required by
+ * Quake II's world-facing rule.
+ *
+ * visible_this_frame is transient scratch state used so the
+ * first pass can count the exact GX primitive size and the
+ * second pass can stream only accepted faces.
+ */
+typedef struct q2gx_world_face_s
+{
+    unsigned int first_vertex;
+    unsigned int vertex_count;
+    unsigned int triangle_count;
+
+    f32 normal[
+        3
+    ];
+
+    f32 dist;
+
+    qboolean plane_back;
+    qboolean visible_this_frame;
+} q2gx_world_face_t;
+
+
+static q2gx_world_face_t *q2gx_world_faces;
+
 static q2gx_world_vertex_t *q2gx_world_vertices;
 
 static unsigned int q2gx_world_vertex_count;
 static unsigned int q2gx_world_triangle_count;
 static unsigned int q2gx_world_face_count;
+static unsigned int q2gx_world_plane_count;
 
 static size_t q2gx_world_bytes;
+static size_t q2gx_world_face_bytes;
 
 static char q2gx_world_name[
     MAX_QPATH
@@ -266,6 +297,11 @@ static char q2gx_world_name[
 static qboolean q2gx_world_first_draw_logged;
 
 static unsigned int q2gx_world_frames_window;
+
+static unsigned int q2gx_world_submitted_faces_window;
+static unsigned int q2gx_world_rejected_faces_window;
+static unsigned int q2gx_world_submitted_triangles_window;
+static unsigned int q2gx_world_submitted_vertices_window;
 
 
 static void Q2GX_FreeResources(void)
@@ -2096,6 +2132,7 @@ static void Q2GX_ClearPicCache(void)
 #define Q2GX_BSP_VERSION          38
 #define Q2GX_BSP_HEADER_LUMPS     19
 
+#define Q2GX_BSP_LUMP_PLANES       1
 #define Q2GX_BSP_LUMP_VERTEXES     2
 #define Q2GX_BSP_LUMP_FACES        6
 #define Q2GX_BSP_LUMP_EDGES       11
@@ -2361,29 +2398,49 @@ static qboolean Q2GX_BSPResolveVertex(
 
 static void Q2GX_FreeWorldGeometry(void)
 {
-    if (q2gx_world_vertices)
+    if (
+        q2gx_world_vertices ||
+        q2gx_world_faces
+    )
     {
         ri.Con_Printf(
             PRINT_ALL,
             "Q2GC REF_GX WORLD FREE: "
-            "%s faces=%u triangles=%u "
-            "vertices=%u bytes=%u\n",
+            "%s planes=%u faces=%u triangles=%u "
+            "vertices=%u vertex_bytes=%u "
+            "face_bytes=%u\n",
             q2gx_world_name[0]
                 ? q2gx_world_name
                 : "(unnamed)",
+            q2gx_world_plane_count,
             q2gx_world_face_count,
             q2gx_world_triangle_count,
             q2gx_world_vertex_count,
             (unsigned int)
-                q2gx_world_bytes
+                q2gx_world_bytes,
+            (unsigned int)
+                q2gx_world_face_bytes
         );
+    }
 
+    if (q2gx_world_vertices)
+    {
         free(
             q2gx_world_vertices
         );
     }
 
+    if (q2gx_world_faces)
+    {
+        free(
+            q2gx_world_faces
+        );
+    }
+
     q2gx_world_vertices =
+        NULL;
+
+    q2gx_world_faces =
         NULL;
 
     q2gx_world_vertex_count =
@@ -2395,7 +2452,13 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_world_face_count =
         0u;
 
+    q2gx_world_plane_count =
+        0u;
+
     q2gx_world_bytes =
+        0u;
+
+    q2gx_world_face_bytes =
         0u;
 
     q2gx_world_name[0] =
@@ -2405,6 +2468,18 @@ static void Q2GX_FreeWorldGeometry(void)
         false;
 
     q2gx_world_frames_window =
+        0u;
+
+    q2gx_world_submitted_faces_window =
+        0u;
+
+    q2gx_world_rejected_faces_window =
+        0u;
+
+    q2gx_world_submitted_triangles_window =
+        0u;
+
+    q2gx_world_submitted_vertices_window =
         0u;
 }
 
@@ -2424,16 +2499,19 @@ static qboolean Q2GX_LoadWorldGeometry(
     int file_length_int;
     unsigned int file_length;
 
+    const byte *plane_data;
     const byte *vertex_data;
     const byte *face_data;
     const byte *edge_data;
     const byte *surfedge_data;
 
+    unsigned int plane_bytes;
     unsigned int vertex_bytes;
     unsigned int face_bytes;
     unsigned int edge_bytes;
     unsigned int surfedge_bytes;
 
+    unsigned int plane_count;
     unsigned int vertex_count;
     unsigned int face_count;
     unsigned int edge_count;
@@ -2443,11 +2521,19 @@ static qboolean Q2GX_LoadWorldGeometry(
     unsigned int gx_vertex_count;
 
     size_t allocation_bytes;
+    size_t face_allocation_bytes;
 
     q2gx_world_vertex_t *world_vertices;
+    q2gx_world_face_t *world_faces;
 
     unsigned int face_index;
     unsigned int output_index;
+
+    world_vertices =
+        NULL;
+
+    world_faces =
+        NULL;
 
     Q2GX_FreeWorldGeometry();
 
@@ -2468,9 +2554,6 @@ static qboolean Q2GX_LoadWorldGeometry(
     map_length =
         strlen(map);
 
-    /*
-     * "maps/" + map + ".bsp" + NUL
-     */
     if (
         map_length + 10u >
         sizeof(path)
@@ -2604,6 +2687,16 @@ static qboolean Q2GX_LoadWorldGeometry(
         !Q2GX_BSPGetLump(
             file_data,
             file_length,
+            Q2GX_BSP_LUMP_PLANES,
+            20u,
+            &plane_data,
+            &plane_bytes,
+            &plane_count
+        )
+        ||
+        !Q2GX_BSPGetLump(
+            file_data,
+            file_length,
             Q2GX_BSP_LUMP_VERTEXES,
             12u,
             &vertex_data,
@@ -2653,6 +2746,7 @@ static qboolean Q2GX_LoadWorldGeometry(
     }
 
     if (
+        plane_count == 0u ||
         vertex_count == 0u ||
         face_count == 0u ||
         edge_count == 0u ||
@@ -2681,6 +2775,9 @@ static qboolean Q2GX_LoadWorldGeometry(
     {
         const byte *face;
 
+        uint16_t planenum;
+        int16_t side;
+
         int32_t firstedge_signed;
         int16_t numedges_signed;
 
@@ -2698,6 +2795,17 @@ static qboolean Q2GX_LoadWorldGeometry(
             +
             face_index * 20u;
 
+        planenum =
+            Q2GX_BSPReadLE16(
+                face + 0
+            );
+
+        side =
+            (int16_t)
+            Q2GX_BSPReadLE16(
+                face + 2
+            );
+
         firstedge_signed =
             (int32_t)
             Q2GX_BSPReadLE32(
@@ -2711,6 +2819,11 @@ static qboolean Q2GX_LoadWorldGeometry(
             );
 
         if (
+            planenum >= plane_count ||
+            (
+                side != 0 &&
+                side != 1
+            ) ||
             firstedge_signed < 0 ||
             numedges_signed < 3
         )
@@ -2719,8 +2832,11 @@ static qboolean Q2GX_LoadWorldGeometry(
                 PRINT_ALL,
                 "Q2GC REF_GX WORLD: "
                 "invalid face %u "
+                "planenum=%u side=%d "
                 "firstedge=%d numedges=%d\n",
                 face_index,
+                (unsigned int)planenum,
+                (int)side,
                 (int)firstedge_signed,
                 (int)numedges_signed
             );
@@ -2835,10 +2951,24 @@ static qboolean Q2GX_LoadWorldGeometry(
         goto fail;
     }
 
+    if (
+        face_count >
+        SIZE_MAX /
+        sizeof(*world_faces)
+    )
+    {
+        goto fail;
+    }
+
     allocation_bytes =
         (size_t)gx_vertex_count
         *
         sizeof(*world_vertices);
+
+    face_allocation_bytes =
+        (size_t)face_count
+        *
+        sizeof(*world_faces);
 
     world_vertices =
         memalign(
@@ -2861,20 +2991,53 @@ static qboolean Q2GX_LoadWorldGeometry(
         goto fail;
     }
 
+    world_faces =
+        memalign(
+            32,
+            face_allocation_bytes
+        );
+
+    if (!world_faces)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX WORLD: "
+            "face metadata allocation failed "
+            "%s bytes=%u\n",
+            path,
+            (unsigned int)
+                face_allocation_bytes
+        );
+
+        goto fail;
+    }
+
+    memset(
+        world_faces,
+        0,
+        face_allocation_bytes
+    );
+
     output_index =
         0u;
 
     /*
      * Build pass.
      *
-     * BSP faces are convex polygons, so simple triangle-fan
-     * decomposition is valid.
+     * Preserve exactly the V1 triangle list, while attaching
+     * each contiguous face range to its BSP plane/side.
      */
     for (face_index = 0u;
          face_index < face_count;
          ++face_index)
     {
         const byte *face;
+        const byte *plane;
+
+        q2gx_world_face_t *world_face;
+
+        uint16_t planenum;
+        int16_t side;
 
         unsigned int firstedge;
         unsigned int numedges;
@@ -2894,6 +3057,17 @@ static qboolean Q2GX_LoadWorldGeometry(
             +
             face_index * 20u;
 
+        planenum =
+            Q2GX_BSPReadLE16(
+                face + 0
+            );
+
+        side =
+            (int16_t)
+            Q2GX_BSPReadLE16(
+                face + 2
+            );
+
         firstedge =
             (unsigned int)
             (
@@ -2912,6 +3086,57 @@ static qboolean Q2GX_LoadWorldGeometry(
                 )
             );
 
+        plane =
+            plane_data
+            +
+            (unsigned int)planenum * 20u;
+
+        world_face =
+            &world_faces[
+                face_index
+            ];
+
+        world_face->first_vertex =
+            output_index;
+
+        world_face->triangle_count =
+            numedges
+            -
+            2u;
+
+        world_face->vertex_count =
+            world_face->triangle_count
+            *
+            3u;
+
+        world_face->normal[0] =
+            Q2GX_BSPReadLEFloat(
+                plane + 0
+            );
+
+        world_face->normal[1] =
+            Q2GX_BSPReadLEFloat(
+                plane + 4
+            );
+
+        world_face->normal[2] =
+            Q2GX_BSPReadLEFloat(
+                plane + 8
+            );
+
+        world_face->dist =
+            Q2GX_BSPReadLEFloat(
+                plane + 12
+            );
+
+        world_face->plane_back =
+            side
+                ? true
+                : false;
+
+        world_face->visible_this_frame =
+            false;
+
         if (
             !Q2GX_BSPResolveVertex(
                 vertex_data,
@@ -2926,19 +3151,9 @@ static qboolean Q2GX_LoadWorldGeometry(
             )
         )
         {
-            free(
-                world_vertices
-            );
-
             goto fail;
         }
 
-        /*
-         * Deterministic per-face debug color.
-         *
-         * Keep all channels away from near-black so walls
-         * remain legible against each other.
-         */
         red =
             (u8)
             (
@@ -3015,10 +3230,6 @@ static qboolean Q2GX_LoadWorldGeometry(
                 )
             )
             {
-                free(
-                    world_vertices
-                );
-
                 goto fail;
             }
 
@@ -3027,10 +3238,6 @@ static qboolean Q2GX_LoadWorldGeometry(
                 gx_vertex_count
             )
             {
-                free(
-                    world_vertices
-                );
-
                 goto fail;
             }
 
@@ -3071,6 +3278,24 @@ static qboolean Q2GX_LoadWorldGeometry(
             output_index +=
                 3u;
         }
+
+        if (
+            output_index
+            -
+            world_face->first_vertex
+            !=
+            world_face->vertex_count
+        )
+        {
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX WORLD: "
+                "face %u vertex range mismatch\n",
+                face_index
+            );
+
+            goto fail;
+        }
     }
 
     if (
@@ -3078,15 +3303,14 @@ static qboolean Q2GX_LoadWorldGeometry(
         gx_vertex_count
     )
     {
-        free(
-            world_vertices
-        );
-
         goto fail;
     }
 
     q2gx_world_vertices =
         world_vertices;
+
+    q2gx_world_faces =
+        world_faces;
 
     q2gx_world_vertex_count =
         gx_vertex_count;
@@ -3097,8 +3321,14 @@ static qboolean Q2GX_LoadWorldGeometry(
     q2gx_world_face_count =
         face_count;
 
+    q2gx_world_plane_count =
+        plane_count;
+
     q2gx_world_bytes =
         allocation_bytes;
+
+    q2gx_world_face_bytes =
+        face_allocation_bytes;
 
     memcpy(
         q2gx_world_name,
@@ -3109,15 +3339,18 @@ static qboolean Q2GX_LoadWorldGeometry(
     ri.Con_Printf(
         PRINT_ALL,
         "Q2GC REF_GX WORLD LOAD: "
-        "%s faces=%u triangles=%u "
-        "vertices=%u bytes=%u "
-        "all_faces=1\n",
+        "%s planes=%u faces=%u triangles=%u "
+        "vertices=%u vertex_bytes=%u "
+        "face_bytes=%u backface_metadata=1\n",
         q2gx_world_name,
+        q2gx_world_plane_count,
         q2gx_world_face_count,
         q2gx_world_triangle_count,
         q2gx_world_vertex_count,
         (unsigned int)
-            q2gx_world_bytes
+            q2gx_world_bytes,
+        (unsigned int)
+            q2gx_world_face_bytes
     );
 
     ri.FS_FreeFile(
@@ -3128,6 +3361,20 @@ static qboolean Q2GX_LoadWorldGeometry(
 
 
 fail:
+
+    if (world_vertices)
+    {
+        free(
+            world_vertices
+        );
+    }
+
+    if (world_faces)
+    {
+        free(
+            world_faces
+        );
+    }
 
     ri.FS_FreeFile(
         file_buffer
@@ -3346,15 +3593,83 @@ static void Q2GX_SetupWorld3D(
 }
 
 
+static qboolean Q2GX_WorldFaceIsVisible(
+    q2gx_world_face_t *face,
+    const refdef_t *fd)
+{
+    f32 dot;
+
+    if (
+        !face ||
+        !fd
+    )
+    {
+        return false;
+    }
+
+    dot =
+        fd->vieworg[0]
+        *
+        face->normal[0]
+        +
+        fd->vieworg[1]
+        *
+        face->normal[1]
+        +
+        fd->vieworg[2]
+        *
+        face->normal[2]
+        -
+        face->dist;
+
+    /*
+     * Exact R_RecursiveWorldNode world-facing rule:
+     *
+     *     dot >= 0
+     *         sidebit = 0
+     *
+     *     dot < 0
+     *         sidebit = SURF_PLANEBACK
+     *
+     * draw only if the surface's plane-back bit equals
+     * sidebit.
+     *
+     * No epsilon here: stock ref_gl world traversal also
+     * does not use BACKFACE_EPSILON for this test.
+     */
+    if (dot >= 0.0f)
+    {
+        return
+            !face->plane_back;
+    }
+
+    return
+        face->plane_back;
+}
+
+
 static void Q2GX_DrawFlatWorld(
     refdef_t *fd)
 {
-    unsigned int base;
+    unsigned int face_index;
+
+    unsigned int submitted_faces;
+    unsigned int rejected_faces;
+
+    unsigned int submitted_triangles;
+    unsigned int submitted_vertices;
+
+    unsigned int remaining_vertices;
+
+    unsigned int stream_face;
+    unsigned int face_vertex_offset;
 
     if (
         !fd ||
         !q2gx_world_vertices ||
-        q2gx_world_vertex_count == 0u
+        !q2gx_world_faces ||
+        q2gx_world_vertex_count == 0u ||
+        q2gx_world_face_count == 0u
     )
     {
         return;
@@ -3369,36 +3684,124 @@ static void Q2GX_DrawFlatWorld(
         return;
     }
 
+    submitted_faces =
+        0u;
+
+    rejected_faces =
+        0u;
+
+    submitted_triangles =
+        0u;
+
+    submitted_vertices =
+        0u;
+
+    /*
+     * Pass 1:
+     *
+     * evaluate exactly one BSP plane-side test per face,
+     * retain visibility for the streaming pass, and determine
+     * the exact GX primitive vertex count.
+     */
+    for (face_index = 0u;
+         face_index < q2gx_world_face_count;
+         ++face_index)
+    {
+        q2gx_world_face_t *face;
+
+        face =
+            &q2gx_world_faces[
+                face_index
+            ];
+
+        face->visible_this_frame =
+            Q2GX_WorldFaceIsVisible(
+                face,
+                fd
+            );
+
+        if (
+            face->visible_this_frame
+        )
+        {
+            ++submitted_faces;
+
+            submitted_triangles +=
+                face->triangle_count;
+
+            submitted_vertices +=
+                face->vertex_count;
+        }
+        else
+        {
+            ++rejected_faces;
+        }
+    }
+
+    if (
+        submitted_faces
+        +
+        rejected_faces
+        !=
+        q2gx_world_face_count
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BACKFACE: "
+            "face accounting mismatch\n"
+        );
+
+        return;
+    }
+
+    if (
+        submitted_vertices
+        !=
+        submitted_triangles * 3u
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BACKFACE: "
+            "triangle accounting mismatch\n"
+        );
+
+        return;
+    }
+
     Q2GX_SetupWorld3D(
         fd
     );
 
     /*
-     * GX_Begin takes a 16-bit vertex count.
+     * Pass 2:
      *
-     * Keep chunks triangle-aligned and generic even though
-     * base1's 65,301 vertices happen to fit in one call.
+     * stream accepted face ranges into triangle-aligned
+     * GX_Begin chunks.
+     *
+     * We keep GX_CULL_NONE deliberately; the CPU test is the
+     * only new rejection mechanism in this milestone.
      */
-    base =
+    remaining_vertices =
+        submitted_vertices;
+
+    stream_face =
+        0u;
+
+    face_vertex_offset =
         0u;
 
     while (
-        base <
-        q2gx_world_vertex_count
+        remaining_vertices >
+        0u
     )
     {
-        unsigned int remaining;
         unsigned int chunk;
-
-        unsigned int index;
-
-        remaining =
-            q2gx_world_vertex_count
-            -
-            base;
+        unsigned int emitted;
 
         chunk =
-            remaining;
+            remaining_vertices;
 
         if (
             chunk >
@@ -3425,38 +3828,150 @@ static void Q2GX_DrawFlatWorld(
             (u16)chunk
         );
 
-        for (index = 0u;
-             index < chunk;
-             ++index)
-        {
-            const q2gx_world_vertex_t *vertex;
+        emitted =
+            0u;
 
-            vertex =
-                &q2gx_world_vertices[
-                    base + index
+        while (
+            emitted <
+            chunk
+        )
+        {
+            q2gx_world_face_t *face;
+
+            unsigned int available;
+            unsigned int take;
+            unsigned int index;
+
+            while (
+                stream_face <
+                q2gx_world_face_count
+                &&
+                !q2gx_world_faces[
+                    stream_face
+                ].visible_this_frame
+            )
+            {
+                ++stream_face;
+
+                face_vertex_offset =
+                    0u;
+            }
+
+            if (
+                stream_face >=
+                q2gx_world_face_count
+            )
+            {
+                break;
+            }
+
+            face =
+                &q2gx_world_faces[
+                    stream_face
                 ];
 
-            GX_Position3f32(
-                vertex->x,
-                vertex->y,
-                vertex->z
-            );
+            available =
+                face->vertex_count
+                -
+                face_vertex_offset;
 
-            GX_Color4u8(
-                vertex->r,
-                vertex->g,
-                vertex->b,
-                vertex->a
-            );
+            take =
+                chunk
+                -
+                emitted;
+
+            if (
+                take >
+                available
+            )
+            {
+                take =
+                    available;
+            }
+
+            for (index = 0u;
+                 index < take;
+                 ++index)
+            {
+                const q2gx_world_vertex_t *vertex;
+
+                vertex =
+                    &q2gx_world_vertices[
+                        face->first_vertex
+                        +
+                        face_vertex_offset
+                        +
+                        index
+                    ];
+
+                GX_Position3f32(
+                    vertex->x,
+                    vertex->y,
+                    vertex->z
+                );
+
+                GX_Color4u8(
+                    vertex->r,
+                    vertex->g,
+                    vertex->b,
+                    vertex->a
+                );
+            }
+
+            emitted +=
+                take;
+
+            face_vertex_offset +=
+                take;
+
+            if (
+                face_vertex_offset ==
+                face->vertex_count
+            )
+            {
+                ++stream_face;
+
+                face_vertex_offset =
+                    0u;
+            }
         }
 
         GX_End();
 
-        base +=
+        if (
+            emitted !=
+            chunk
+        )
+        {
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX BACKFACE: "
+                "stream accounting mismatch "
+                "emitted=%u chunk=%u\n",
+                emitted,
+                chunk
+            );
+
+            break;
+        }
+
+        remaining_vertices -=
             chunk;
     }
 
     ++q2gx_world_frames_window;
+
+    q2gx_world_submitted_faces_window +=
+        submitted_faces;
+
+    q2gx_world_rejected_faces_window +=
+        rejected_faces;
+
+    q2gx_world_submitted_triangles_window +=
+        submitted_triangles;
+
+    q2gx_world_submitted_vertices_window +=
+        submitted_vertices;
 
     if (
         !q2gx_world_first_draw_logged
@@ -3467,22 +3982,24 @@ static void Q2GX_DrawFlatWorld(
 
         ri.Con_Printf(
             PRINT_ALL,
-            "Q2GC REF_GX WORLD FIRST DRAW: "
+            "Q2GC REF_GX BACKFACE FIRST DRAW: "
             "%s "
             "vieworg=%.1f,%.1f,%.1f "
-            "angles=%.1f,%.1f,%.1f "
-            "fov=%.1f "
-            "triangles=%u vertices=%u\n",
+            "total_faces=%u "
+            "submitted_faces=%u "
+            "rejected_faces=%u "
+            "submitted_triangles=%u "
+            "submitted_vertices=%u "
+            "mode=cpu_plane_side\n",
             q2gx_world_name,
             fd->vieworg[0],
             fd->vieworg[1],
             fd->vieworg[2],
-            fd->viewangles[0],
-            fd->viewangles[1],
-            fd->viewangles[2],
-            fd->fov_y,
-            q2gx_world_triangle_count,
-            q2gx_world_vertex_count
+            q2gx_world_face_count,
+            submitted_faces,
+            rejected_faces,
+            submitted_triangles,
+            submitted_vertices
         );
     }
 
@@ -3493,26 +4010,43 @@ static void Q2GX_DrawFlatWorld(
     {
         ri.Con_Printf(
             PRINT_ALL,
-            "Q2GC REF_GX WORLD 120: "
+            "Q2GC REF_GX BACKFACE 120: "
             "frames=%u "
-            "faces=%u "
-            "triangles_per_frame=%u "
-            "vertices_per_frame=%u "
-            "all_faces=1\n",
+            "total_faces=%u "
+            "submitted_faces_total=%u "
+            "rejected_faces_total=%u "
+            "submitted_triangles_total=%u "
+            "submitted_vertices_total=%u "
+            "mode=cpu_plane_side\n",
             q2gx_world_frames_window,
             q2gx_world_face_count,
-            q2gx_world_triangle_count,
-            q2gx_world_vertex_count
+            q2gx_world_submitted_faces_window,
+            q2gx_world_rejected_faces_window,
+            q2gx_world_submitted_triangles_window,
+            q2gx_world_submitted_vertices_window
         );
 
         q2gx_world_frames_window =
+            0u;
+
+        q2gx_world_submitted_faces_window =
+            0u;
+
+        q2gx_world_rejected_faces_window =
+            0u;
+
+        q2gx_world_submitted_triangles_window =
+            0u;
+
+        q2gx_world_submitted_vertices_window =
             0u;
     }
 
     /*
      * HUD/menu rendering follows RenderFrame.
      *
-     * Restore the already-proven native GX 2D state.
+     * Preserve the proven 3D -> 2D transition and the V1c
+     * end-of-frame color/Z clear contract.
      */
     Q2GX_Setup2D();
 }
