@@ -21,6 +21,7 @@
 #include <gccore.h>
 
 #include <malloc.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -123,6 +124,46 @@ static unsigned int q2gx_drawchar_runs_window;
 static unsigned int q2gx_drawfill_calls_window;
 
 static qboolean q2gx_drawchar_first_logged;
+
+
+/*
+ * Q2GC_NATIVE_TEXTURE_PIPELINE_V1
+ *
+ * First generic native GX texture path.
+ *
+ *     linear CPU RGBA
+ *       -> GX_TF_RGBA8 tiled storage
+ *       -> cache writeback
+ *       -> GXTexObj
+ *       -> GX_LoadTexObj
+ *       -> direct ST coordinates
+ *       -> TEV sample
+ *       -> source-alpha blend
+ *       -> EFB
+ *
+ * Quake image registration is deliberately outside this
+ * milestone.
+ */
+#define Q2GX_TEXTURE_TEST_WIDTH  64
+#define Q2GX_TEXTURE_TEST_HEIGHT 64
+
+#define Q2GX_TEXTURE_TEST_BYTES \
+    ( \
+        Q2GX_TEXTURE_TEST_WIDTH * \
+        Q2GX_TEXTURE_TEST_HEIGHT * \
+        4 \
+    )
+
+static u8 q2gx_texture_test_data[
+    Q2GX_TEXTURE_TEST_BYTES
+] __attribute__((aligned(32)));
+
+static GXTexObj q2gx_texture_test_obj;
+
+static qboolean q2gx_texture_test_ready;
+static qboolean q2gx_texture_first_logged;
+
+static unsigned int q2gx_texture_draws_window;
 
 
 static void Q2GX_FreeResources(void)
@@ -876,6 +917,412 @@ static void Q2GX_DrawSolidRect(
 }
 
 
+
+static void Q2GX_WriteRGBA8Texel(
+    u8 *destination,
+    unsigned int width,
+    unsigned int x,
+    unsigned int y,
+    u8 red,
+    u8 green,
+    u8 blue,
+    u8 alpha)
+{
+    unsigned int tiles_per_row;
+    unsigned int tile_x;
+    unsigned int tile_y;
+    unsigned int block_offset;
+    unsigned int pixel_offset;
+
+    /*
+     * GX_TF_RGBA8:
+     *
+     * 4x4 texels = 64-byte tile
+     *
+     * bytes  0..31:
+     *     A,R
+     *
+     * bytes 32..63:
+     *     G,B
+     */
+    tiles_per_row =
+        width >> 2;
+
+    tile_x =
+        x >> 2;
+
+    tile_y =
+        y >> 2;
+
+    block_offset =
+        (
+            tile_y *
+                tiles_per_row
+            +
+            tile_x
+        )
+        *
+        64u;
+
+    pixel_offset =
+        (
+            (
+                (y & 3u) *
+                    4u
+            )
+            +
+            (x & 3u)
+        )
+        *
+        2u;
+
+    destination[
+        block_offset +
+        pixel_offset +
+        0u
+    ] =
+        alpha;
+
+    destination[
+        block_offset +
+        pixel_offset +
+        1u
+    ] =
+        red;
+
+    destination[
+        block_offset +
+        32u +
+        pixel_offset +
+        0u
+    ] =
+        green;
+
+    destination[
+        block_offset +
+        32u +
+        pixel_offset +
+        1u
+    ] =
+        blue;
+}
+
+
+static qboolean Q2GX_InitTextureSelfTest(void)
+{
+    unsigned int x;
+    unsigned int y;
+
+    if (
+        ((uintptr_t)q2gx_texture_test_data & 31u)
+        != 0u
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX TEXTURE: "
+            "texture storage not 32-byte aligned\n"
+        );
+
+        return false;
+    }
+
+    for (y = 0;
+         y < Q2GX_TEXTURE_TEST_HEIGHT;
+         ++y)
+    {
+        for (x = 0;
+             x < Q2GX_TEXTURE_TEST_WIDTH;
+             ++x)
+        {
+            u8 red;
+            u8 green;
+            u8 blue;
+            u8 alpha;
+
+            if (y < 32u)
+            {
+                if (x < 32u)
+                {
+                    red = 255u;
+                    green = 0u;
+                    blue = 0u;
+                    alpha = 255u;
+                }
+                else
+                {
+                    red = 0u;
+                    green = 255u;
+                    blue = 0u;
+                    alpha = 255u;
+                }
+            }
+            else if (x < 32u)
+            {
+                red = 0u;
+                green = 0u;
+                blue = 255u;
+                alpha = 255u;
+            }
+            else
+            {
+                /*
+                 * Bottom-right:
+                 *
+                 * yellow / alpha-zero checker.
+                 */
+                if (
+                    (
+                        (x >> 3)
+                        ^
+                        (y >> 3)
+                    )
+                    &
+                    1u
+                )
+                {
+                    red = 255u;
+                    green = 255u;
+                    blue = 0u;
+                    alpha = 255u;
+                }
+                else
+                {
+                    red = 255u;
+                    green = 255u;
+                    blue = 255u;
+                    alpha = 0u;
+                }
+            }
+
+            Q2GX_WriteRGBA8Texel(
+                q2gx_texture_test_data,
+                Q2GX_TEXTURE_TEST_WIDTH,
+                x,
+                y,
+                red,
+                green,
+                blue,
+                alpha
+            );
+        }
+    }
+
+    DCStoreRange(
+        q2gx_texture_test_data,
+        sizeof(q2gx_texture_test_data)
+    );
+
+    GX_InitTexObj(
+        &q2gx_texture_test_obj,
+        q2gx_texture_test_data,
+        Q2GX_TEXTURE_TEST_WIDTH,
+        Q2GX_TEXTURE_TEST_HEIGHT,
+        GX_TF_RGBA8,
+        GX_CLAMP,
+        GX_CLAMP,
+        GX_FALSE
+    );
+
+    q2gx_texture_test_ready =
+        true;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX TEXTURE: "
+        "RGBA8 64x64 tiled selftest ready "
+        "bytes=%u aligned=1\n",
+        (unsigned int)
+            sizeof(q2gx_texture_test_data)
+    );
+
+    return true;
+}
+
+
+static void Q2GX_SetupTextured2D(void)
+{
+    GX_LoadProjectionMtx(
+        q2gx_2d_projection,
+        GX_ORTHOGRAPHIC
+    );
+
+    GX_LoadPosMtxImm(
+        q2gx_2d_model,
+        GX_PNMTX0
+    );
+
+    GX_SetCurrentMtx(
+        GX_PNMTX0
+    );
+
+    GX_ClearVtxDesc();
+
+    GX_SetVtxDesc(
+        GX_VA_POS,
+        GX_DIRECT
+    );
+
+    GX_SetVtxDesc(
+        GX_VA_TEX0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_POS,
+        GX_POS_XY,
+        GX_F32,
+        0
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_TEX0,
+        GX_TEX_ST,
+        GX_F32,
+        0
+    );
+
+    GX_SetNumChans(
+        0
+    );
+
+    GX_SetNumTexGens(
+        1
+    );
+
+    GX_SetTexCoordGen(
+        GX_TEXCOORD0,
+        GX_TG_MTX2x4,
+        GX_TG_TEX0,
+        GX_IDENTITY
+    );
+
+    GX_SetNumTevStages(
+        1
+    );
+
+    GX_SetTevOrder(
+        GX_TEVSTAGE0,
+        GX_TEXCOORD0,
+        GX_TEXMAP0,
+        GX_COLORNULL
+    );
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_REPLACE
+    );
+
+    GX_SetCullMode(
+        GX_CULL_NONE
+    );
+
+    GX_SetZMode(
+        GX_FALSE,
+        GX_ALWAYS,
+        GX_FALSE
+    );
+
+    GX_SetBlendMode(
+        GX_BM_BLEND,
+        GX_BL_SRCALPHA,
+        GX_BL_INVSRCALPHA,
+        GX_LO_CLEAR
+    );
+}
+
+
+static void Q2GX_DrawTexturedQuad(
+    f32 x,
+    f32 y,
+    f32 width,
+    f32 height,
+    GXTexObj *texture)
+{
+    if (!texture)
+    {
+        return;
+    }
+
+    Q2GX_SetupTextured2D();
+
+    GX_LoadTexObj(
+        texture,
+        GX_TEXMAP0
+    );
+
+    GX_Begin(
+        GX_QUADS,
+        GX_VTXFMT0,
+        4
+    );
+
+    GX_Position2f32(
+        x,
+        y
+    );
+
+    GX_TexCoord2f32(
+        0.0f,
+        0.0f
+    );
+
+    GX_Position2f32(
+        x + width,
+        y
+    );
+
+    GX_TexCoord2f32(
+        1.0f,
+        0.0f
+    );
+
+    GX_Position2f32(
+        x + width,
+        y + height
+    );
+
+    GX_TexCoord2f32(
+        1.0f,
+        1.0f
+    );
+
+    GX_Position2f32(
+        x,
+        y + height
+    );
+
+    GX_TexCoord2f32(
+        0.0f,
+        1.0f
+    );
+
+    GX_End();
+
+    ++q2gx_texture_draws_window;
+
+    if (!q2gx_texture_first_logged)
+    {
+        q2gx_texture_first_logged =
+            true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX TEXTURE FIRST: "
+            "textured GX quad submitted\n"
+        );
+    }
+
+    /*
+     * Restore known-good color-only state for DrawFill and
+     * brute-force DrawChar.
+     */
+    Q2GX_Setup2D();
+}
+
+
 static qboolean Q2GX_Init(
     void *hinstance,
     void *wndproc)
@@ -1093,6 +1540,13 @@ static qboolean Q2GX_Init(
 
 
     Q2GX_Setup2D();
+
+    if (!Q2GX_InitTextureSelfTest())
+    {
+        Q2GX_FreeResources();
+
+        return (qboolean)-1;
+    }
 
     ri.Con_Printf(
         PRINT_ALL,
@@ -1572,7 +2026,23 @@ static void Q2GX_BeginFrame(
         1.0f
     );
 
+
+    /*
+     * Q2GC_TEXTURE_PIPELINE_SELFTEST
+     *
+     * Scale synthetic 64x64 texture to 256x256.
+     */
+    if (q2gx_texture_test_ready)
+    {
+        Q2GX_DrawTexturedQuad(
+            192.0f,
+            112.0f,
+            256.0f,
+            256.0f,
+            &q2gx_texture_test_obj
+        );
     }
+}
 
 
 static void Q2GX_EndFrame(void)
@@ -1610,10 +2080,12 @@ static void Q2GX_EndFrame(void)
             "Q2GC REF_GX 2D 120: "
             "drawchar_calls=%u "
             "drawchar_runs=%u "
-            "drawfill_calls=%u\n",
+            "drawfill_calls=%u "
+            "texture_draws=%u\n",
             q2gx_drawchar_calls_window,
             q2gx_drawchar_runs_window,
-            q2gx_drawfill_calls_window
+            q2gx_drawfill_calls_window,
+            q2gx_texture_draws_window
         );
 
         q2gx_drawchar_calls_window =
@@ -1623,6 +2095,9 @@ static void Q2GX_EndFrame(void)
             0u;
 
         q2gx_drawfill_calls_window =
+            0u;
+
+        q2gx_texture_draws_window =
             0u;
 
         q2gx_frame_count =
