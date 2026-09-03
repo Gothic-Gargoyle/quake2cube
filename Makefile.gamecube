@@ -22,7 +22,7 @@ SOURCES := \
 	$(PROJECT_DIR)/qcommon \
 	$(PROJECT_DIR)/server \
 	$(PROJECT_DIR)/game \
-	$(PROJECT_DIR)/ref_soft \
+	$(PROJECT_DIR)/ref_gx \
 	$(PROJECT_DIR)/other \
 	$(PROJECT_DIR)/null \
 	$(PROJECT_DIR)/net \
@@ -34,7 +34,7 @@ CFILES := \
 	$(notdir $(wildcard $(PROJECT_DIR)/qcommon/*.c)) \
 	$(filter-out sv_null.c,$(notdir $(wildcard $(PROJECT_DIR)/server/*.c))) \
 	$(notdir $(wildcard $(PROJECT_DIR)/game/*.c)) \
-	$(notdir $(wildcard $(PROJECT_DIR)/ref_soft/*.c)) \
+	$(notdir $(wildcard $(PROJECT_DIR)/ref_gx/*.c)) \
 	q_hunk.c \
 	vid_menu.c \
 	vid_lib.c \
@@ -114,8 +114,7 @@ CH_CFILES := \
 	ch_persist.c \
 	ch_tx.c \
 	ch_tx_format.c \
-	ch_tx_memcard_backend.c \
-	ch_video_gamecube.c
+	ch_tx_memcard_backend.c
 
 include $(CARRY_ROOT)/make/gamecube.mk
 # ------------------------------------------------------------------
