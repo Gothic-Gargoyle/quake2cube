@@ -1473,6 +1473,18 @@ void Qcommon_Init (int argc, char **argv)
 	SV_Init ();
 	CL_Init ();
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	/*
+	 * Q2GC_CONFIG_Q2CF_V2
+	 *
+	 * default.cfg, gamecube.cfg, config.cfg and normal client
+	 * initialization have all run.
+	 *
+	 * Apply the tiny structured Memory Card override LAST.
+	 */
+	Q2_ConfigApplyPersisted ();
+#endif
+
 	// add + commands from command line
 	if (!Cbuf_AddLateCommands ())
 	{	// if the user didn't give any commands, run default action

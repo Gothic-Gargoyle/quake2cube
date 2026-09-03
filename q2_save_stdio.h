@@ -47,4 +47,31 @@ void Q2_SaveFindClose(void);
 
 #endif
 
+
+
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+
+/*
+ * Raw persistence plumbing for Q2CF.
+ *
+ * q2_save_stdio.c owns the CARD/transaction backend.
+ * q2_config_gamecube.c owns engine policy and serialization.
+ */
+int Q2_ConfigStorageGet(
+    void *buffer,
+    size_t capacity,
+    size_t *size);
+
+int Q2_ConfigStoragePut(
+    const void *buffer,
+    size_t size);
+
+
+void Q2_ConfigApplyPersisted(void);
+
+void Q2_ConfigSaveIfChanged(void);
+
+#endif
+
+
 #endif

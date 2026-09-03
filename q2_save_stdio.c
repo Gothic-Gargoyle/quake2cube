@@ -194,6 +194,19 @@ static const unsigned char slotIndexKey[] =
 
 
 
+/*
+ * Q2CF uses its own namespace.
+ *
+ * The abandoned config-v1 experiment is intentionally never read.
+ */
+static const unsigned char configPersistScope[] =
+    "quake2cube-config-v2";
+
+static const unsigned char configPersistKey[] =
+    "config";
+
+
+
 static int vfsInitialized;
 static int cardAttempted;
 static int cardReady;
@@ -2559,6 +2572,167 @@ int Q2_SaveMenuSlotComment(
         Q2_SAVE_COMMENT_SIZE - 1u
     ] =
         '\0';
+
+
+    return 1;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* Q2CF GameCube preference storage                                          */
+/* ------------------------------------------------------------------------- */
+
+
+int Q2_ConfigStorageGet(
+    void *buffer,
+    size_t capacity,
+    size_t *size)
+{
+    CH_PersistResult result;
+
+
+    if (size)
+        *size = 0;
+
+
+    if (!buffer ||
+        capacity == 0)
+    {
+        return -1;
+    }
+
+
+    initializeVfs();
+
+
+    if (!cardReady)
+    {
+        fprintf(
+            stderr,
+            "Q2GC CONFIG STORE: CARD unavailable\n"
+        );
+
+        return -1;
+    }
+
+
+    result =
+        CH_PersistGet(
+            &txBackend,
+            sectorBuffer,
+            sectorBufferSize,
+            configPersistScope,
+            sizeof(configPersistScope) - 1u,
+            configPersistKey,
+            sizeof(configPersistKey) - 1u,
+            buffer,
+            capacity,
+            size
+        );
+
+
+    if (result ==
+        CH_PERSIST_RESULT_NOT_FOUND)
+    {
+        fprintf(
+            stderr,
+            "Q2GC CONFIG STORE: config-v2 empty\n"
+        );
+
+        return 0;
+    }
+
+
+    if (result !=
+        CH_PERSIST_RESULT_OK)
+    {
+        fprintf(
+            stderr,
+            "Q2GC CONFIG STORE: GET config-v2 failed: %d\n",
+            (int)result
+        );
+
+        return -1;
+    }
+
+
+    fprintf(
+        stderr,
+        "Q2GC CONFIG STORE: GET config-v2 OK "
+        "bytes=%lu\n",
+        (unsigned long)(
+            size
+                ? *size
+                : 0u
+        )
+    );
+
+
+    return 1;
+}
+
+
+int Q2_ConfigStoragePut(
+    const void *buffer,
+    size_t size)
+{
+    CH_PersistResult result;
+
+
+    if (!buffer ||
+        size == 0)
+    {
+        return 0;
+    }
+
+
+    initializeVfs();
+
+
+    if (!cardReady)
+    {
+        fprintf(
+            stderr,
+            "Q2GC CONFIG STORE: CARD unavailable\n"
+        );
+
+        return 0;
+    }
+
+
+    result =
+        CH_PersistPut(
+            &txBackend,
+            sectorBuffer,
+            sectorBufferSize,
+            configPersistScope,
+            sizeof(configPersistScope) - 1u,
+            configPersistKey,
+            sizeof(configPersistKey) - 1u,
+            buffer,
+            size
+        );
+
+
+    if (result !=
+        CH_PERSIST_RESULT_OK)
+    {
+        fprintf(
+            stderr,
+            "Q2GC CONFIG STORE: PUT config-v2 failed: %d\n",
+            (int)result
+        );
+
+        return 0;
+    }
+
+
+    fprintf(
+        stderr,
+        "Q2GC CONFIG STORE: PUT config-v2 OK "
+        "bytes=%lu\n",
+        (unsigned long)size
+    );
 
 
     return 1;

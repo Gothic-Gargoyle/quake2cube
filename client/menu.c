@@ -740,6 +740,111 @@ static void M_FindKeysForCommand (char *command, int *twokeys)
 	}
 }
 
+
+#ifdef HW_DOL
+/*
+ * Q2GC_GAMECUBE_FIRST_BINDING_DISPLAY
+ *
+ * Quake II's Customize Controls UI only has room for two bindings
+ * per action.
+ *
+ * The DVD config can already consume both slots with keyboard/mouse
+ * bindings before a persisted GameCube physical binding is reached
+ * by the stock ascending key-number scan.
+ *
+ * This helper changes DISPLAY PRIORITY ONLY:
+ *
+ *   1. physical GameCube controls
+ *   2. every other Quake key
+ *
+ * Actual keybindings are not modified.
+ */
+static qboolean M_IsGameCubePhysicalKey( int key )
+{
+	switch ( key )
+	{
+	case K_JOY1:
+	case K_JOY2:
+	case K_JOY3:
+	case K_JOY4:
+
+	case K_AUX1:
+	case K_AUX2:
+	case K_AUX3:
+
+	case K_GC_DPAD_UP:
+	case K_GC_DPAD_DOWN:
+	case K_GC_DPAD_LEFT:
+	case K_GC_DPAD_RIGHT:
+
+	case K_GC_STICK_UP:
+	case K_GC_STICK_DOWN:
+	case K_GC_STICK_LEFT:
+	case K_GC_STICK_RIGHT:
+
+	case K_GC_CSTICK_UP:
+	case K_GC_CSTICK_DOWN:
+	case K_GC_CSTICK_LEFT:
+	case K_GC_CSTICK_RIGHT:
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+
+static void M_FindKeysForCommandGameCubeFirst(
+	char *command,
+	int *twokeys )
+{
+	int pass;
+	int count;
+	int j;
+	int l;
+	char *b;
+
+	twokeys[0] = twokeys[1] = -1;
+
+	l = strlen( command );
+	count = 0;
+
+	/*
+	 * Pass 0: GameCube physical controls.
+	 * Pass 1: everything else.
+	 */
+	for ( pass = 0; pass < 2; pass++ )
+	{
+		for ( j = 0; j < 256; j++ )
+		{
+			qboolean gamecube =
+				M_IsGameCubePhysicalKey( j );
+
+			if ( pass == 0 && !gamecube )
+				continue;
+
+			if ( pass == 1 && gamecube )
+				continue;
+
+			b = keybindings[j];
+
+			if ( !b )
+				continue;
+
+			if ( !strncmp( b, command, l ) )
+			{
+				twokeys[count] = j;
+				count++;
+
+				if ( count == 2 )
+					return;
+			}
+		}
+	}
+}
+#endif
+
+
 static void KeyCursorDrawFunc( menuframework_s *menu )
 {
 
@@ -760,7 +865,15 @@ static void DrawKeyBindingFunc( void *self )
 	int keys[2];
 	menuaction_s *a = ( menuaction_s * ) self;
 
-	M_FindKeysForCommand( bindnames[a->generic.localdata[0]][0], keys);
+#ifdef HW_DOL
+	M_FindKeysForCommandGameCubeFirst(
+		bindnames[a->generic.localdata[0]][0],
+		keys );
+#else
+	M_FindKeysForCommand(
+		bindnames[a->generic.localdata[0]][0],
+		keys );
+#endif
 		
 	if (keys[0] == -1)
 	{
@@ -1110,6 +1223,14 @@ static const char *Keys_MenuKey( int key )
 		return menu_out_sound;
 	}
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	if (key == K_ESCAPE ||
+	    key == K_JOY2)
+	{
+		Q2_ConfigSaveIfChanged();
+	}
+#endif
+
 	switch ( key )
 	{
 	case K_JOY1:		/* GameCube A = change binding */
@@ -1246,6 +1367,17 @@ static void ControlsSetMenuItemValues( void )
 static void ControlsResetDefaultsFunc( void *unused )
 {
 	Cbuf_AddText ("exec default.cfg\n");
+
+#ifdef HW_DOL
+	/*
+	 * The stock reset only reloads default.cfg.
+	 *
+	 * On GameCube that would erase the controller preset until reboot,
+	 * so immediately layer the immutable platform baseline back on top.
+	 */
+	Cbuf_AddText ("exec gamecube.cfg\n");
+#endif
+
 	Cbuf_Execute();
 
 	ControlsSetMenuItemValues();
@@ -1515,6 +1647,14 @@ void Options_MenuDraw (void)
 
 const char *Options_MenuKey( int key )
 {
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	if (key == K_ESCAPE ||
+	    key == K_JOY2)
+	{
+		Q2_ConfigSaveIfChanged();
+	}
+#endif
+
 	return Default_MenuKey( &s_options_menu, key );
 }
 

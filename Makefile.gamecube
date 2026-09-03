@@ -46,6 +46,7 @@ CFILES := \
 	port_platform_gamecube.c \
 	port_soft_gamecube.c \
 	q2_save_stdio.c \
+	q2_config_gamecube.c \
 	q2_save_symbols_gamecube.c \
 
 CPPFILES :=
