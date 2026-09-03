@@ -65,6 +65,28 @@ static const GXColor q2gx_clear_color =
 };
 
 
+/*
+ * Q2GC_NATIVE_DRAWFILL_V1
+ *
+ * Native GX 2D rendering state.
+ *
+ * Quake II uses a logical 640x480 coordinate system with
+ * (0,0) at the top-left.
+ */
+static Mtx q2gx_2d_model;
+static Mtx44 q2gx_2d_projection;
+
+
+/*
+ * Base Quake II 256-color palette loaded from:
+ *
+ *     pics/colormap.pcx
+ */
+static GXColor q2gx_palette[256];
+
+static qboolean q2gx_palette_loaded;
+
+
 static void Q2GX_FreeResources(void)
 {
     if (q2gx_gx_initialized)
@@ -132,6 +154,312 @@ void R_GC_PurgeRegistrationResources(void)
 }
 
 
+
+static qboolean Q2GX_LoadBasePalette(void)
+{
+    void *file_data;
+    unsigned char *bytes;
+    unsigned char *palette;
+
+    int file_length;
+    int i;
+
+    file_data = NULL;
+
+    file_length =
+        ri.FS_LoadFile(
+            "pics/colormap.pcx",
+            &file_data
+        );
+
+    if (file_length < 769 ||
+        !file_data)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PALETTE: "
+            "load failed bytes=%d\n",
+            file_length
+        );
+
+        if (file_data)
+        {
+            ri.FS_FreeFile(
+                file_data
+            );
+        }
+
+        return false;
+    }
+
+    bytes =
+        (unsigned char *)file_data;
+
+    /*
+     * Standard 8-bit PCX palette:
+     *
+     *     final 769 bytes
+     *
+     *       0x0c
+     *       R G B x 256
+     */
+    if (bytes[file_length - 769] != 0x0c)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PALETTE: "
+            "PCX palette marker missing\n"
+        );
+
+        ri.FS_FreeFile(
+            file_data
+        );
+
+        return false;
+    }
+
+    palette =
+        bytes +
+        file_length -
+        768;
+
+    for (i = 0;
+         i < 256;
+         ++i)
+    {
+        q2gx_palette[i].r =
+            palette[i * 3 + 0];
+
+        q2gx_palette[i].g =
+            palette[i * 3 + 1];
+
+        q2gx_palette[i].b =
+            palette[i * 3 + 2];
+
+        q2gx_palette[i].a =
+            0xff;
+    }
+
+    ri.FS_FreeFile(
+        file_data
+    );
+
+    q2gx_palette_loaded =
+        true;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX PALETTE: "
+        "0=%02x%02x%02x "
+        "64=%02x%02x%02x "
+        "128=%02x%02x%02x "
+        "200=%02x%02x%02x "
+        "255=%02x%02x%02x\n",
+
+        q2gx_palette[0].r,
+        q2gx_palette[0].g,
+        q2gx_palette[0].b,
+
+        q2gx_palette[64].r,
+        q2gx_palette[64].g,
+        q2gx_palette[64].b,
+
+        q2gx_palette[128].r,
+        q2gx_palette[128].g,
+        q2gx_palette[128].b,
+
+        q2gx_palette[200].r,
+        q2gx_palette[200].g,
+        q2gx_palette[200].b,
+
+        q2gx_palette[255].r,
+        q2gx_palette[255].g,
+        q2gx_palette[255].b
+    );
+
+    return true;
+}
+
+
+static void Q2GX_Setup2D(void)
+{
+    /*
+     * top
+     * bottom
+     * left
+     * right
+     * near
+     * far
+     */
+    guOrtho(
+        q2gx_2d_projection,
+        0.0f,
+        480.0f,
+        0.0f,
+        640.0f,
+        0.0f,
+        1.0f
+    );
+
+    guMtxIdentity(
+        q2gx_2d_model
+    );
+
+    GX_LoadProjectionMtx(
+        q2gx_2d_projection,
+        GX_ORTHOGRAPHIC
+    );
+
+    GX_LoadPosMtxImm(
+        q2gx_2d_model,
+        GX_PNMTX0
+    );
+
+    GX_SetCurrentMtx(
+        GX_PNMTX0
+    );
+
+    GX_ClearVtxDesc();
+
+    GX_SetVtxDesc(
+        GX_VA_POS,
+        GX_DIRECT
+    );
+
+    GX_SetVtxDesc(
+        GX_VA_CLR0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_POS,
+        GX_POS_XY,
+        GX_F32,
+        0
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_CLR0,
+        GX_CLR_RGBA,
+        GX_RGBA8,
+        0
+    );
+
+    GX_SetNumChans(
+        1
+    );
+
+    GX_SetNumTexGens(
+        0
+    );
+
+    GX_SetNumTevStages(
+        1
+    );
+
+    /*
+     * No texture:
+     *
+     * pass rasterized vertex color directly through TEV.
+     */
+    GX_SetTevOrder(
+        GX_TEVSTAGE0,
+        GX_TEXCOORDNULL,
+        GX_TEXMAP_NULL,
+        GX_COLOR0A0
+    );
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_PASSCLR
+    );
+
+    GX_SetCullMode(
+        GX_CULL_NONE
+    );
+
+    GX_SetZMode(
+        GX_FALSE,
+        GX_ALWAYS,
+        GX_FALSE
+    );
+
+    GX_SetBlendMode(
+        GX_BM_NONE,
+        GX_BL_ZERO,
+        GX_BL_ZERO,
+        GX_LO_CLEAR
+    );
+}
+
+
+static void Q2GX_DrawSolidRect(
+    f32 x,
+    f32 y,
+    f32 w,
+    f32 h,
+    GXColor color)
+{
+    GX_Begin(
+        GX_QUADS,
+        GX_VTXFMT0,
+        4
+    );
+
+    GX_Position2f32(
+        x,
+        y
+    );
+
+    GX_Color4u8(
+        color.r,
+        color.g,
+        color.b,
+        color.a
+    );
+
+    GX_Position2f32(
+        x + w,
+        y
+    );
+
+    GX_Color4u8(
+        color.r,
+        color.g,
+        color.b,
+        color.a
+    );
+
+    GX_Position2f32(
+        x + w,
+        y + h
+    );
+
+    GX_Color4u8(
+        color.r,
+        color.g,
+        color.b,
+        color.a
+    );
+
+    GX_Position2f32(
+        x,
+        y + h
+    );
+
+    GX_Color4u8(
+        color.r,
+        color.g,
+        color.b,
+        color.a
+    );
+
+    GX_End();
+}
+
+
 static qboolean Q2GX_Init(
     void *hinstance,
     void *wndproc)
@@ -149,6 +477,11 @@ static qboolean Q2GX_Init(
         PRINT_ALL,
         "Q2GC REF_GX: bootstrap V1c init begin\n"
     );
+
+    if (!Q2GX_LoadBasePalette())
+    {
+        return (qboolean)-1;
+    }
 
     VIDEO_Init();
 
@@ -335,6 +668,15 @@ static qboolean Q2GX_Init(
 
     GX_SetColorUpdate(
         GX_TRUE
+    );
+
+
+    Q2GX_Setup2D();
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX DRAWFILL: "
+        "palette-correct GX 2D initialized\n"
     );
 
     /*
@@ -526,11 +868,65 @@ static void Q2GX_DrawFill(
     int h,
     int c)
 {
-    (void)x;
-    (void)y;
-    (void)w;
-    (void)h;
-    (void)c;
+    int right;
+    int bottom;
+
+    if ((unsigned int)c > 255u)
+    {
+        ri.Sys_Error(
+            ERR_FATAL,
+            "Q2GX_DrawFill: bad color"
+        );
+
+        return;
+    }
+
+    if (!q2gx_palette_loaded ||
+        w <= 0 ||
+        h <= 0)
+    {
+        return;
+    }
+
+    right =
+        x + w;
+
+    bottom =
+        y + h;
+
+    if (right <= 0 ||
+        bottom <= 0 ||
+        x >= 640 ||
+        y >= 480)
+    {
+        return;
+    }
+
+    if (x < 0)
+        x = 0;
+
+    if (y < 0)
+        y = 0;
+
+    if (right > 640)
+        right = 640;
+
+    if (bottom > 480)
+        bottom = 480;
+
+    w =
+        right - x;
+
+    h =
+        bottom - y;
+
+    Q2GX_DrawSolidRect(
+        (f32)x,
+        (f32)y,
+        (f32)w,
+        (f32)h,
+        q2gx_palette[c]
+    );
 }
 
 
@@ -581,6 +977,36 @@ static void Q2GX_BeginFrame(
         0.0f,
         1.0f
     );
+
+    /*
+     * Q2GC_DRAWFILL_PALETTE_SELFTEST
+     *
+     * Milestone test intentionally kept in this commit.
+     *
+     * Every Quake II palette index 0..255 is drawn exactly once.
+     */
+    {
+        int row;
+        int column;
+
+        for (row = 0;
+             row < 16;
+             ++row)
+        {
+            for (column = 0;
+                 column < 16;
+                 ++column)
+            {
+                Q2GX_DrawFill(
+                    64 + column * 32,
+                    48 + row * 24,
+                    32,
+                    24,
+                    row * 16 + column
+                );
+            }
+        }
+    }
 }
 
 
