@@ -5,6 +5,7 @@
 #include "qcommon/qcommon.h"
 #include "client/keys.h"
 #include "q2_save_stdio.h"
+#include "q2_rumble_gamecube.h"
 
 
 /*
@@ -36,6 +37,13 @@
 #define Q2CF_FLAG_FREELOOK     (1u << 2)
 #define Q2CF_FLAG_LOOKSPRING   (1u << 3)
 #define Q2CF_FLAG_LOOKSTRAFE   (1u << 4)
+
+/*
+ * Inverted for backward compatibility:
+ * existing Q2CF v2 records have this bit clear and therefore
+ * inherit the GameCube default of rumble enabled.
+ */
+#define Q2CF_FLAG_RUMBLE_DISABLED (1u << 5)
 
 
 static const int q2cfPhysicalKeys[
@@ -318,6 +326,13 @@ static void Q2CF_EncodeCurrent(
     {
         flags |=
             Q2CF_FLAG_LOOKSTRAFE;
+    }
+
+
+    if (!Q2_RumbleGetEnabled())
+    {
+        flags |=
+            Q2CF_FLAG_RUMBLE_DISABLED;
     }
 
 
@@ -623,6 +638,14 @@ static void Q2CF_Apply(
             Q2CF_FLAG_LOOKSTRAFE)
             ? 1.0f
             : 0.0f
+    );
+
+
+    Q2_RumbleSetEnabled(
+        (flags &
+            Q2CF_FLAG_RUMBLE_DISABLED)
+            ? 0
+            : 1
     );
 
 

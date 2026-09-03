@@ -1,3 +1,7 @@
+#ifdef HW_DOL
+#include "q2_rumble_gamecube.h"
+#endif
+
 /*
 Copyright (C) 1997-2001 Id Software, Inc.
 
@@ -58,6 +62,29 @@ to a noise in hopes of seeing the player from there.
 void PlayerNoise(edict_t *who, vec3_t where, int type)
 {
 	edict_t		*noise;
+
+#ifdef HW_DOL
+	/*
+	 * Q2GC_PLAYER_WEAPON_RUMBLE
+	 *
+	 * PlayerNoise(PNOISE_WEAPON) is already the player-specific
+	 * event boundary used by Quake II after a weapon actually
+	 * performs its firing action.
+	 *
+	 * Run before the silencer early-return: a silenced gun should
+	 * still physically recoil in the controller.
+	 */
+	if (type == PNOISE_WEAPON &&
+	    who &&
+	    who->client &&
+	    who->client->pers.weapon)
+	{
+		Q2_RumbleWeaponFire(
+			who->client->pers.weapon->classname
+		);
+	}
+#endif
+
 
 	if (type == PNOISE_WEAPON)
 	{
@@ -830,6 +857,8 @@ void Blaster_Fire (edict_t *ent, vec3_t g_offset, int damage, qboolean hyper, in
 	ent->client->kick_angles[0] = -1;
 
 	fire_blaster (ent, start, forward, damage, 1000, effect, hyper);
+
+
 
 	// send muzzle flash
 	gi.WriteByte (svc_muzzleflash);

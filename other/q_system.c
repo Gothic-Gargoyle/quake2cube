@@ -1,3 +1,7 @@
+#ifdef HW_DOL
+#include "q2_rumble_gamecube.h"
+#endif
+
 
 #include <stdlib.h>
 #include <stdarg.h>
@@ -75,6 +79,11 @@ void Sys_Printf (char *fmt, ...)
 
 void Sys_Quit (void)
 {
+
+#ifdef HW_DOL
+	Q2_RumbleShutdown();
+#endif
+
 	CL_Shutdown ();
 	Qcommon_Shutdown ();
     //fcntl (0, F_SETFL, fcntl (0, F_GETFL, 0) & ~FNDELAY);
@@ -83,6 +92,14 @@ void Sys_Quit (void)
 
 void Sys_Init(void)
 {
+
+#ifdef HW_DOL
+	/*
+	 * Q2GC_RUMBLE_LIFECYCLE
+	 */
+	Q2_RumbleInit();
+#endif
+
 	memset(KeyStates, 0, sizeof(KeyStates));
 
 #if id386
@@ -101,7 +118,11 @@ void Sys_Error (char *error, ...)
 	CL_Shutdown ();
 	Qcommon_Shutdown ();
     
-    va_start (argptr,error);
+    #ifdef HW_DOL
+	Q2_RumbleShutdown();
+#endif
+
+	va_start (argptr,error);
     vsprintf (string,error,argptr);
     va_end (argptr);
 	fprintf(stderr, "Error: %s\n", string);

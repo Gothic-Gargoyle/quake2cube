@@ -1,3 +1,7 @@
+#ifdef HW_DOL
+#include "q2_rumble_gamecube.h"
+#endif
+
 /*
 Copyright (C) 1997-2001 Id Software, Inc.
 
@@ -92,6 +96,20 @@ void P_DamageFeedback (edict_t *player)
 	count = (client->damage_blood + client->damage_armor + client->damage_parmor);
 	if (count == 0)
 		return;		// didn't take any damage
+
+#ifdef HW_DOL
+	/*
+	 * Q2GC_PLAYER_DAMAGE_RUMBLE
+	 *
+	 * Quake II has already accumulated every damage event for
+	 * this player during the server frame. Emit one bounded
+	 * GameCube effect before those counters are consumed/cleared.
+	 */
+	Q2_RumbleDamage(
+		(int)count
+	);
+#endif
+
 
 	// start a pain animation if still in the player model
 	if (client->anim_priority < ANIM_PAIN && player->s.modelindex == 255)

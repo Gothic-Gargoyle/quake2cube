@@ -47,6 +47,7 @@ CFILES := \
 	port_soft_gamecube.c \
 	q2_save_stdio.c \
 	q2_config_gamecube.c \
+	q2_rumble_gamecube.c \
 	q2_save_symbols_gamecube.c \
 
 CPPFILES :=
@@ -107,6 +108,7 @@ CH_CFILES := \
 	ch_input.c \
 	ch_input_physical.c \
 	ch_pad_bus.c \
+	ch_rumble.c \
 	ch_time.c \
 	ch_memcard.c \
 	ch_persist.c \

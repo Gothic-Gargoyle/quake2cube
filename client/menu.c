@@ -1,3 +1,7 @@
+#ifdef HW_DOL
+#include "q2_rumble_gamecube.h"
+#endif
+
 /*
 Copyright (C) 1997-2001 Id Software, Inc.
 
@@ -1287,6 +1291,13 @@ static menulist_s		s_options_lookstrafe_box;
 static menulist_s		s_options_crosshair_box;
 static menuslider_s		s_options_sfxvolume_slider;
 static menulist_s		s_options_joystick_box;
+
+#ifdef HW_DOL
+/*
+ * Q2GC_RUMBLE_OPTIONS_MENU
+ */
+static menulist_s		s_options_rumble_box;
+#endif
 static menulist_s		s_options_cdvolume_box;
 static menulist_s		s_options_quality_list;
 static menulist_s		s_options_compatibility_list;
@@ -1301,6 +1312,20 @@ static void JoystickFunc( void *unused )
 {
 	Cvar_SetValue( "in_joystick", s_options_joystick_box.curvalue );
 }
+
+#ifdef HW_DOL
+static void RumbleFunc( void *unused )
+{
+	(void)unused;
+
+	Q2_RumbleSetEnabled(
+		s_options_rumble_box.curvalue
+			? 1
+			: 0
+	);
+}
+#endif
+
 
 static void CustomizeControlsFunc( void *unused )
 {
@@ -1361,6 +1386,13 @@ static void ControlsSetMenuItemValues( void )
 	Cvar_SetValue( "in_joystick", ClampCvar( 0, 1, in_joystick->value ) );
 	s_options_joystick_box.curvalue		= in_joystick->value;
 
+#ifdef HW_DOL
+	s_options_rumble_box.curvalue =
+		Q2_RumbleGetEnabled()
+			? 1
+			: 0;
+#endif
+
 	s_options_noalttab_box.curvalue			= win_noalttab->value;
 }
 
@@ -1379,6 +1411,14 @@ static void ControlsResetDefaultsFunc( void *unused )
 #endif
 
 	Cbuf_Execute();
+
+#ifdef HW_DOL
+	/*
+	 * Rumble is a structured GameCube preference rather than
+	 * an entry in config.cfg/gamecube.cfg.
+	 */
+	Q2_RumbleSetEnabled(1);
+#endif
 
 	ControlsSetMenuItemValues();
 }
@@ -1601,6 +1641,15 @@ void Options_MenuInit( void )
 	s_options_joystick_box.generic.callback = JoystickFunc;
 	s_options_joystick_box.itemnames = yesno_names;
 
+#ifdef HW_DOL
+	s_options_rumble_box.generic.type = MTYPE_SPINCONTROL;
+	s_options_rumble_box.generic.x = 0;
+	s_options_rumble_box.generic.y = 130;
+	s_options_rumble_box.generic.name = "rumble";
+	s_options_rumble_box.generic.callback = RumbleFunc;
+	s_options_rumble_box.itemnames = yesno_names;
+#endif
+
 	s_options_customize_options_action.generic.type	= MTYPE_ACTION;
 	s_options_customize_options_action.generic.x		= 0;
 	s_options_customize_options_action.generic.y		= 140;
@@ -1633,6 +1682,13 @@ void Options_MenuInit( void )
 	Menu_AddItem( &s_options_menu, ( void * ) &s_options_freelook_box );
 	Menu_AddItem( &s_options_menu, ( void * ) &s_options_crosshair_box );
 	Menu_AddItem( &s_options_menu, ( void * ) &s_options_joystick_box );
+
+#ifdef HW_DOL
+	Menu_AddItem(
+		&s_options_menu,
+		( void * ) &s_options_rumble_box
+	);
+#endif
 	Menu_AddItem( &s_options_menu, ( void * ) &s_options_customize_options_action );
 	Menu_AddItem( &s_options_menu, ( void * ) &s_options_defaults_action );
 	Menu_AddItem( &s_options_menu, ( void * ) &s_options_console_action );
