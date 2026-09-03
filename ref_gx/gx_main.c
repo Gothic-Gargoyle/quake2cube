@@ -87,6 +87,44 @@ static GXColor q2gx_palette[256];
 static qboolean q2gx_palette_loaded;
 
 
+/*
+ * Q2GC_NATIVE_DRAWCHAR_V1C
+ *
+ * First native Quake II character renderer.
+ *
+ * pics/conchars.pcx contributes indexed raster data.
+ *
+ * The embedded PCX RGB palette is deliberately ignored.
+ * Visible indices resolve through q2gx_palette[], which is
+ * already the proven Quake II renderer palette.
+ *
+ * V1c is correctness-first:
+ *
+ *     glyph indexed pixels
+ *       -> horizontal equal-index runs
+ *       -> palette RGB
+ *       -> native GX quads
+ *
+ * A textured font atlas comes later.
+ */
+#define Q2GX_CONCHARS_WIDTH  128
+#define Q2GX_CONCHARS_HEIGHT 128
+
+static byte q2gx_conchars[
+    Q2GX_CONCHARS_WIDTH *
+    Q2GX_CONCHARS_HEIGHT
+];
+
+static int q2gx_conchars_transparent;
+static qboolean q2gx_conchars_loaded;
+
+static unsigned int q2gx_drawchar_calls_window;
+static unsigned int q2gx_drawchar_runs_window;
+static unsigned int q2gx_drawfill_calls_window;
+
+static qboolean q2gx_drawchar_first_logged;
+
+
 static void Q2GX_FreeResources(void)
 {
     if (q2gx_gx_initialized)
@@ -275,6 +313,384 @@ static qboolean Q2GX_LoadBasePalette(void)
         q2gx_palette[255].r,
         q2gx_palette[255].g,
         q2gx_palette[255].b
+    );
+
+    return true;
+}
+
+
+
+static unsigned int Q2GX_ReadLE16(
+    const byte *p)
+{
+    return
+        (unsigned int)p[0]
+        |
+        (
+            (unsigned int)p[1]
+            << 8
+        );
+}
+
+
+static qboolean Q2GX_LoadConchars(void)
+{
+    void *file_data;
+
+    byte *bytes;
+    byte *source;
+    byte *source_end;
+
+    int file_length;
+
+    unsigned int xmin;
+    unsigned int ymin;
+    unsigned int xmax;
+    unsigned int ymax;
+
+    unsigned int width;
+    unsigned int height;
+
+    unsigned int planes;
+    unsigned int bytes_per_line;
+
+    unsigned int x;
+    unsigned int y;
+
+    file_data =
+        NULL;
+
+    file_length =
+        ri.FS_LoadFile(
+            "pics/conchars.pcx",
+            &file_data
+        );
+
+    if (file_length < 128 ||
+        !file_data)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CONCHARS: "
+            "load failed bytes=%d\n",
+            file_length
+        );
+
+        if (file_data)
+        {
+            ri.FS_FreeFile(
+                file_data
+            );
+        }
+
+        return false;
+    }
+
+    bytes =
+        (byte *)file_data;
+
+    /*
+     * PCX:
+     *
+     * manufacturer = 0x0a
+     * encoding     = 1 (RLE)
+     * bits/pixel   = 8
+     */
+    if (bytes[0] != 0x0a ||
+        bytes[2] != 1 ||
+        bytes[3] != 8)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CONCHARS: "
+            "unsupported PCX header\n"
+        );
+
+        ri.FS_FreeFile(
+            file_data
+        );
+
+        return false;
+    }
+
+    xmin =
+        Q2GX_ReadLE16(
+            bytes + 4
+        );
+
+    ymin =
+        Q2GX_ReadLE16(
+            bytes + 6
+        );
+
+    xmax =
+        Q2GX_ReadLE16(
+            bytes + 8
+        );
+
+    ymax =
+        Q2GX_ReadLE16(
+            bytes + 10
+        );
+
+    if (xmax < xmin ||
+        ymax < ymin)
+    {
+        ri.FS_FreeFile(
+            file_data
+        );
+
+        return false;
+    }
+
+    width =
+        xmax - xmin + 1;
+
+    height =
+        ymax - ymin + 1;
+
+    planes =
+        bytes[65];
+
+    bytes_per_line =
+        Q2GX_ReadLE16(
+            bytes + 66
+        );
+
+    if (width != Q2GX_CONCHARS_WIDTH ||
+        height != Q2GX_CONCHARS_HEIGHT ||
+        planes != 1 ||
+        bytes_per_line < width)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CONCHARS: "
+            "unexpected geometry "
+            "%ux%u planes=%u bpl=%u\n",
+            width,
+            height,
+            planes,
+            bytes_per_line
+        );
+
+        ri.FS_FreeFile(
+            file_data
+        );
+
+        return false;
+    }
+
+    /*
+     * Stock asset has a trailing PCX VGA palette.
+     *
+     * We use its marker only to establish where the RLE raster
+     * ends.
+     *
+     * We DO NOT use its RGB values.
+     */
+    if (file_length < 769 ||
+        bytes[file_length - 769] != 0x0c)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CONCHARS: "
+            "trailing VGA palette missing\n"
+        );
+
+        ri.FS_FreeFile(
+            file_data
+        );
+
+        return false;
+    }
+
+    source =
+        bytes + 128;
+
+    source_end =
+        bytes +
+        file_length -
+        769;
+
+    for (y = 0;
+         y < height;
+         ++y)
+    {
+        x =
+            0;
+
+        while (x < bytes_per_line)
+        {
+            unsigned int count;
+            byte value;
+            byte code;
+
+            if (source >= source_end)
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX CONCHARS: "
+                    "truncated RLE stream\n"
+                );
+
+                ri.FS_FreeFile(
+                    file_data
+                );
+
+                return false;
+            }
+
+            code =
+                *source++;
+
+            if ((code & 0xc0) == 0xc0)
+            {
+                count =
+                    code & 0x3f;
+
+                if (count == 0 ||
+                    source >= source_end)
+                {
+                    ri.FS_FreeFile(
+                        file_data
+                    );
+
+                    return false;
+                }
+
+                value =
+                    *source++;
+            }
+            else
+            {
+                count =
+                    1;
+
+                value =
+                    code;
+            }
+
+            if (x + count >
+                bytes_per_line)
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX CONCHARS: "
+                    "RLE run crosses scanline\n"
+                );
+
+                ri.FS_FreeFile(
+                    file_data
+                );
+
+                return false;
+            }
+
+            while (count--)
+            {
+                if (x < width)
+                {
+                    q2gx_conchars[
+                        y *
+                            Q2GX_CONCHARS_WIDTH
+                        +
+                        x
+                    ] =
+                        value;
+                }
+
+                ++x;
+            }
+        }
+    }
+
+    /*
+     * Character 32 is the known blank space glyph.
+     *
+     * 16 glyphs per atlas row:
+     *
+     *     row = 32 >> 4 = 2
+     *     y   = 2 * 8 = 16
+     *
+     * Host-side proof already established this entire 8x8
+     * glyph consists of palette index 255.
+     */
+    q2gx_conchars_transparent =
+        q2gx_conchars[
+            16 *
+            Q2GX_CONCHARS_WIDTH
+        ];
+
+    for (y = 16;
+         y < 24;
+         ++y)
+    {
+        for (x = 0;
+             x < 8;
+             ++x)
+        {
+            if (
+                q2gx_conchars[
+                    y *
+                        Q2GX_CONCHARS_WIDTH
+                    +
+                    x
+                ]
+                !=
+                q2gx_conchars_transparent
+            )
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX CONCHARS: "
+                    "space glyph not uniform\n"
+                );
+
+                ri.FS_FreeFile(
+                    file_data
+                );
+
+                return false;
+            }
+        }
+    }
+
+    /*
+     * Exact stock-data expectation independently proven by the
+     * preceding host parser.
+     */
+    if (q2gx_conchars_transparent != 255)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CONCHARS: "
+            "unexpected transparent index=%d\n",
+            q2gx_conchars_transparent
+        );
+
+        ri.FS_FreeFile(
+            file_data
+        );
+
+        return false;
+    }
+
+    q2gx_conchars_loaded =
+        true;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX CONCHARS: "
+        "128x128 "
+        "bpl=%u "
+        "transparent=%d "
+        "indexed=1\n",
+        bytes_per_line,
+        q2gx_conchars_transparent
+    );
+
+    ri.FS_FreeFile(
+        file_data
     );
 
     return true;
@@ -479,6 +895,11 @@ static qboolean Q2GX_Init(
     );
 
     if (!Q2GX_LoadBasePalette())
+    {
+        return (qboolean)-1;
+    }
+
+    if (!Q2GX_LoadConchars())
     {
         return (qboolean)-1;
     }
@@ -840,9 +1261,180 @@ static void Q2GX_DrawChar(
     int y,
     int c)
 {
-    (void)x;
-    (void)y;
-    (void)c;
+    int num;
+
+    int glyph_x;
+    int glyph_y;
+
+    int py;
+
+    num =
+        c & 255;
+
+    /*
+     * Match stock Quake Draw_Char semantics.
+     */
+    if ((num & 127) == 32)
+    {
+        return;
+    }
+
+    if (y <= -8)
+    {
+        return;
+    }
+
+    if (!q2gx_conchars_loaded)
+    {
+        return;
+    }
+
+    if (x >= 640 ||
+        x + 8 <= 0 ||
+        y >= 480)
+    {
+        return;
+    }
+
+    glyph_x =
+        (num & 15) * 8;
+
+    glyph_y =
+        (num >> 4) * 8;
+
+    ++q2gx_drawchar_calls_window;
+
+    if (!q2gx_drawchar_first_logged)
+    {
+        q2gx_drawchar_first_logged =
+            true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX DRAWCHAR FIRST: "
+            "c=%d x=%d y=%d\n",
+            num,
+            x,
+            y
+        );
+    }
+
+    /*
+     * Correctness path:
+     *
+     * 8 glyph scanlines.
+     *
+     * Adjacent same-index visible pixels become one horizontal
+     * GX rectangle.
+     */
+    for (py = 0;
+         py < 8;
+         ++py)
+    {
+        int screen_y;
+        int px;
+
+        screen_y =
+            y + py;
+
+        if (screen_y < 0 ||
+            screen_y >= 480)
+        {
+            continue;
+        }
+
+        px =
+            0;
+
+        while (px < 8)
+        {
+            int run_start;
+            int run_end;
+
+            int palette_index;
+
+            int left;
+            int right;
+
+            palette_index =
+                q2gx_conchars[
+                    (glyph_y + py) *
+                        Q2GX_CONCHARS_WIDTH
+                    +
+                    glyph_x + px
+                ];
+
+            if (
+                palette_index ==
+                q2gx_conchars_transparent
+            )
+            {
+                ++px;
+                continue;
+            }
+
+            run_start =
+                px;
+
+            ++px;
+
+            while (px < 8)
+            {
+                int next_index;
+
+                next_index =
+                    q2gx_conchars[
+                        (glyph_y + py) *
+                            Q2GX_CONCHARS_WIDTH
+                        +
+                        glyph_x + px
+                    ];
+
+                if (
+                    next_index !=
+                    palette_index
+                )
+                {
+                    break;
+                }
+
+                ++px;
+            }
+
+            run_end =
+                px;
+
+            left =
+                x + run_start;
+
+            right =
+                x + run_end;
+
+            if (right <= 0 ||
+                left >= 640)
+            {
+                continue;
+            }
+
+            if (left < 0)
+                left = 0;
+
+            if (right > 640)
+                right = 640;
+
+            Q2GX_DrawSolidRect(
+                (f32)left,
+                (f32)screen_y,
+                (f32)(right - left),
+                1.0f,
+                q2gx_palette[
+                    palette_index
+                ]
+            );
+
+            ++q2gx_drawchar_runs_window;
+        }
+    }
 }
 
 
@@ -887,6 +1479,8 @@ static void Q2GX_DrawFill(
     {
         return;
     }
+
+    ++q2gx_drawfill_calls_window;
 
     right =
         x + w;
@@ -978,36 +1572,7 @@ static void Q2GX_BeginFrame(
         1.0f
     );
 
-    /*
-     * Q2GC_DRAWFILL_PALETTE_SELFTEST
-     *
-     * Milestone test intentionally kept in this commit.
-     *
-     * Every Quake II palette index 0..255 is drawn exactly once.
-     */
-    {
-        int row;
-        int column;
-
-        for (row = 0;
-             row < 16;
-             ++row)
-        {
-            for (column = 0;
-                 column < 16;
-                 ++column)
-            {
-                Q2GX_DrawFill(
-                    64 + column * 32,
-                    48 + row * 24,
-                    32,
-                    24,
-                    row * 16 + column
-                );
-            }
-        }
     }
-}
 
 
 static void Q2GX_EndFrame(void)
@@ -1040,7 +1605,28 @@ static void Q2GX_EndFrame(void)
             "Q2GC REF_GX FRAME 120: native GX presentation alive\n"
         );
 
-        q2gx_frame_count = 0u;
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX 2D 120: "
+            "drawchar_calls=%u "
+            "drawchar_runs=%u "
+            "drawfill_calls=%u\n",
+            q2gx_drawchar_calls_window,
+            q2gx_drawchar_runs_window,
+            q2gx_drawfill_calls_window
+        );
+
+        q2gx_drawchar_calls_window =
+            0u;
+
+        q2gx_drawchar_runs_window =
+            0u;
+
+        q2gx_drawfill_calls_window =
+            0u;
+
+        q2gx_frame_count =
+            0u;
     }
 }
 
