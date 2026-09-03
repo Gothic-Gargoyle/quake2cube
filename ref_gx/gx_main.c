@@ -144,26 +144,54 @@ static qboolean q2gx_drawchar_first_logged;
  * Quake image registration is deliberately outside this
  * milestone.
  */
-#define Q2GX_TEXTURE_TEST_WIDTH  64
-#define Q2GX_TEXTURE_TEST_HEIGHT 64
+/*
+ * Q2GC_REAL_PICTURE_CACHE_V1
+ *
+ * Native GX cache for:
+ *
+ *     RegisterPic
+ *     DrawGetPicSize
+ *     DrawPic
+ *     DrawStretchPic
+ *
+ * Pictures remain resident until renderer shutdown in V1.
+ *
+ * The stock baseq2 picture set is small enough that an
+ * eviction policy is deliberately deferred until we have
+ * real runtime memory measurements.
+ */
+#define Q2GX_MAX_PICS 256
 
-#define Q2GX_TEXTURE_TEST_BYTES \
-    ( \
-        Q2GX_TEXTURE_TEST_WIDTH * \
-        Q2GX_TEXTURE_TEST_HEIGHT * \
-        4 \
-    )
+struct image_s
+{
+    char name[MAX_QPATH];
 
-static u8 q2gx_texture_test_data[
-    Q2GX_TEXTURE_TEST_BYTES
-] __attribute__((aligned(32)));
+    int width;
+    int height;
 
-static GXTexObj q2gx_texture_test_obj;
+    u32 texture_bytes;
 
-static qboolean q2gx_texture_test_ready;
+    void *texture_data;
+    GXTexObj texture;
+
+    qboolean has_alpha;
+};
+
+static struct image_s q2gx_pics[
+    Q2GX_MAX_PICS
+];
+
 static qboolean q2gx_texture_first_logged;
+static qboolean q2gx_pic_first_draw_logged;
 
 static unsigned int q2gx_texture_draws_window;
+
+static unsigned int q2gx_pic_draws_window;
+static unsigned int q2gx_stretchpic_draws_window;
+
+static unsigned int q2gx_pic_loads_window;
+static unsigned int q2gx_pic_hits_window;
+static unsigned int q2gx_pic_misses_window;
 
 
 static void Q2GX_FreeResources(void)
@@ -946,7 +974,7 @@ static void Q2GX_WriteRGBA8Texel(
      *     G,B
      */
     tiles_per_row =
-        width >> 2;
+        (width + 3u) >> 2;
 
     tile_x =
         x >> 2;
@@ -1005,138 +1033,6 @@ static void Q2GX_WriteRGBA8Texel(
         1u
     ] =
         blue;
-}
-
-
-static qboolean Q2GX_InitTextureSelfTest(void)
-{
-    unsigned int x;
-    unsigned int y;
-
-    if (
-        ((uintptr_t)q2gx_texture_test_data & 31u)
-        != 0u
-    )
-    {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX TEXTURE: "
-            "texture storage not 32-byte aligned\n"
-        );
-
-        return false;
-    }
-
-    for (y = 0;
-         y < Q2GX_TEXTURE_TEST_HEIGHT;
-         ++y)
-    {
-        for (x = 0;
-             x < Q2GX_TEXTURE_TEST_WIDTH;
-             ++x)
-        {
-            u8 red;
-            u8 green;
-            u8 blue;
-            u8 alpha;
-
-            if (y < 32u)
-            {
-                if (x < 32u)
-                {
-                    red = 255u;
-                    green = 0u;
-                    blue = 0u;
-                    alpha = 255u;
-                }
-                else
-                {
-                    red = 0u;
-                    green = 255u;
-                    blue = 0u;
-                    alpha = 255u;
-                }
-            }
-            else if (x < 32u)
-            {
-                red = 0u;
-                green = 0u;
-                blue = 255u;
-                alpha = 255u;
-            }
-            else
-            {
-                /*
-                 * Bottom-right:
-                 *
-                 * yellow / alpha-zero checker.
-                 */
-                if (
-                    (
-                        (x >> 3)
-                        ^
-                        (y >> 3)
-                    )
-                    &
-                    1u
-                )
-                {
-                    red = 255u;
-                    green = 255u;
-                    blue = 0u;
-                    alpha = 255u;
-                }
-                else
-                {
-                    red = 255u;
-                    green = 255u;
-                    blue = 255u;
-                    alpha = 0u;
-                }
-            }
-
-            Q2GX_WriteRGBA8Texel(
-                q2gx_texture_test_data,
-                Q2GX_TEXTURE_TEST_WIDTH,
-                x,
-                y,
-                red,
-                green,
-                blue,
-                alpha
-            );
-        }
-    }
-
-    DCStoreRange(
-        q2gx_texture_test_data,
-        sizeof(q2gx_texture_test_data)
-    );
-
-    GX_InitTexObj(
-        &q2gx_texture_test_obj,
-        q2gx_texture_test_data,
-        Q2GX_TEXTURE_TEST_WIDTH,
-        Q2GX_TEXTURE_TEST_HEIGHT,
-        GX_TF_RGBA8,
-        GX_CLAMP,
-        GX_CLAMP,
-        GX_FALSE
-    );
-
-    q2gx_texture_test_ready =
-        true;
-
-    ri.Con_Printf(
-        PRINT_ALL,
-        "Q2GC REF_GX TEXTURE: "
-        "RGBA8 64x64 tiled selftest ready "
-        "bytes=%u aligned=1\n",
-        (unsigned int)
-            sizeof(q2gx_texture_test_data)
-    );
-
-    return true;
 }
 
 
@@ -1320,6 +1216,700 @@ static void Q2GX_DrawTexturedQuad(
      * brute-force DrawChar.
      */
     Q2GX_Setup2D();
+}
+
+
+
+static qboolean Q2GX_NormalizePicName(
+    const char *name,
+    char normalized[MAX_QPATH])
+{
+    const char *source;
+    size_t length;
+
+    if (!name ||
+        !name[0])
+    {
+        return false;
+    }
+
+    /*
+     * Stock Draw_FindPic contract:
+     *
+     *     "/foo/bar.pcx"
+     *         -> "foo/bar.pcx"
+     *
+     * otherwise:
+     *
+     *     "foo"
+     *         -> "pics/foo.pcx"
+     */
+    if (
+        name[0] == '/' ||
+        name[0] == '\\'
+    )
+    {
+        source =
+            name + 1;
+
+        length =
+            strlen(source);
+
+        if (
+            length == 0 ||
+            length >= MAX_QPATH
+        )
+        {
+            return false;
+        }
+
+        memcpy(
+            normalized,
+            source,
+            length + 1
+        );
+
+        return true;
+    }
+
+    length =
+        strlen(name);
+
+    /*
+     * Five bytes "pics/"
+     * plus four ".pcx"
+     * plus NUL.
+     */
+    if (
+        length + 10u >
+        MAX_QPATH
+    )
+    {
+        return false;
+    }
+
+    memcpy(
+        normalized,
+        "pics/",
+        5
+    );
+
+    memcpy(
+        normalized + 5,
+        name,
+        length
+    );
+
+    memcpy(
+        normalized + 5 + length,
+        ".pcx",
+        5
+    );
+
+    return true;
+}
+
+
+static struct image_s *Q2GX_FindCachedPic(
+    const char *normalized)
+{
+    unsigned int index;
+
+    for (index = 0;
+         index < Q2GX_MAX_PICS;
+         ++index)
+    {
+        if (
+            q2gx_pics[index].name[0] &&
+            strcmp(
+                q2gx_pics[index].name,
+                normalized
+            ) == 0
+        )
+        {
+            return
+                &q2gx_pics[index];
+        }
+    }
+
+    return NULL;
+}
+
+
+static struct image_s *Q2GX_FindFreePicSlot(void)
+{
+    unsigned int index;
+
+    for (index = 0;
+         index < Q2GX_MAX_PICS;
+         ++index)
+    {
+        if (
+            !q2gx_pics[index].name[0] &&
+            !q2gx_pics[index].texture_data
+        )
+        {
+            return
+                &q2gx_pics[index];
+        }
+    }
+
+    return NULL;
+}
+
+
+static qboolean Q2GX_LoadPCXPic(
+    struct image_s *image,
+    char *normalized)
+{
+    void *file_data;
+
+    byte *bytes;
+    byte *source;
+    byte *source_end;
+
+    void *texture_data;
+
+    int file_length;
+
+    unsigned int xmin;
+    unsigned int ymin;
+    unsigned int xmax;
+    unsigned int ymax;
+
+    unsigned int width;
+    unsigned int height;
+
+    unsigned int planes;
+    unsigned int bytes_per_line;
+
+    unsigned int x;
+    unsigned int y;
+
+    u32 texture_bytes;
+
+    qboolean has_alpha;
+
+    file_data =
+        NULL;
+
+    texture_data =
+        NULL;
+
+    if (!image ||
+        !normalized ||
+        !q2gx_palette_loaded)
+    {
+        return false;
+    }
+
+    file_length =
+        ri.FS_LoadFile(
+            normalized,
+            &file_data
+        );
+
+    if (
+        file_length < 128 ||
+        !file_data
+    )
+    {
+        if (file_data)
+        {
+            ri.FS_FreeFile(
+                file_data
+            );
+        }
+
+        return false;
+    }
+
+    bytes =
+        (byte *)file_data;
+
+    if (
+        bytes[0] != 0x0a ||
+        bytes[2] != 1 ||
+        bytes[3] != 8
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PIC: "
+            "unsupported PCX %s\n",
+            normalized
+        );
+
+        goto fail;
+    }
+
+    xmin =
+        Q2GX_ReadLE16(
+            bytes + 4
+        );
+
+    ymin =
+        Q2GX_ReadLE16(
+            bytes + 6
+        );
+
+    xmax =
+        Q2GX_ReadLE16(
+            bytes + 8
+        );
+
+    ymax =
+        Q2GX_ReadLE16(
+            bytes + 10
+        );
+
+    if (
+        xmax < xmin ||
+        ymax < ymin
+    )
+    {
+        goto fail;
+    }
+
+    width =
+        xmax - xmin + 1;
+
+    height =
+        ymax - ymin + 1;
+
+    planes =
+        bytes[65];
+
+    bytes_per_line =
+        Q2GX_ReadLE16(
+            bytes + 66
+        );
+
+    if (
+        width == 0 ||
+        height == 0 ||
+        width > 1024 ||
+        height > 1024 ||
+        planes != 1 ||
+        bytes_per_line < width
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PIC: "
+            "unsupported PCX geometry "
+            "%s %ux%u planes=%u bpl=%u\n",
+            normalized,
+            width,
+            height,
+            planes,
+            bytes_per_line
+        );
+
+        goto fail;
+    }
+
+    /*
+     * Use trailing VGA marker only to locate the end of the
+     * encoded raster.
+     *
+     * The PCX's private RGB palette is deliberately ignored.
+     * Decoded bytes remain Quake palette indices.
+     */
+    if (
+        file_length < 769 ||
+        bytes[file_length - 769] != 0x0c
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PIC: "
+            "missing PCX palette marker %s\n",
+            normalized
+        );
+
+        goto fail;
+    }
+
+    texture_bytes =
+        GX_GetTexBufferSize(
+            (u16)width,
+            (u16)height,
+            GX_TF_RGBA8,
+            GX_FALSE,
+            0
+        );
+
+    if (!texture_bytes)
+    {
+        goto fail;
+    }
+
+    texture_data =
+        memalign(
+            32,
+            texture_bytes
+        );
+
+    if (!texture_data)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PIC: "
+            "MEM1 allocation failed "
+            "%s bytes=%u\n",
+            normalized,
+            (unsigned int)
+                texture_bytes
+        );
+
+        goto fail;
+    }
+
+    /*
+     * Any padded texels outside the real source dimensions
+     * start transparent black.
+     */
+    memset(
+        texture_data,
+        0,
+        texture_bytes
+    );
+
+    source =
+        bytes + 128;
+
+    source_end =
+        bytes +
+        file_length -
+        769;
+
+    has_alpha =
+        false;
+
+    for (y = 0;
+         y < height;
+         ++y)
+    {
+        x =
+            0;
+
+        while (x < bytes_per_line)
+        {
+            unsigned int count;
+            byte value;
+            byte code;
+
+            if (source >= source_end)
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX PIC: "
+                    "truncated PCX %s\n",
+                    normalized
+                );
+
+                goto fail;
+            }
+
+            code =
+                *source++;
+
+            if (
+                (code & 0xc0) == 0xc0
+            )
+            {
+                count =
+                    code & 0x3f;
+
+                if (
+                    count == 0 ||
+                    source >= source_end
+                )
+                {
+                    goto fail;
+                }
+
+                value =
+                    *source++;
+            }
+            else
+            {
+                count =
+                    1;
+
+                value =
+                    code;
+            }
+
+            if (
+                x + count >
+                bytes_per_line
+            )
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX PIC: "
+                    "PCX run crosses scanline "
+                    "%s\n",
+                    normalized
+                );
+
+                goto fail;
+            }
+
+            while (count--)
+            {
+                if (x < width)
+                {
+                    GXColor color;
+                    u8 alpha;
+
+                    color =
+                        q2gx_palette[
+                            value
+                        ];
+
+                    if (value == 255)
+                    {
+                        alpha =
+                            0u;
+
+                        has_alpha =
+                            true;
+                    }
+                    else
+                    {
+                        alpha =
+                            255u;
+                    }
+
+                    Q2GX_WriteRGBA8Texel(
+                        (u8 *)texture_data,
+                        width,
+                        x,
+                        y,
+                        color.r,
+                        color.g,
+                        color.b,
+                        alpha
+                    );
+                }
+
+                ++x;
+            }
+        }
+    }
+
+    DCStoreRange(
+        texture_data,
+        texture_bytes
+    );
+
+    GX_InitTexObj(
+        &image->texture,
+        texture_data,
+        (u16)width,
+        (u16)height,
+        GX_TF_RGBA8,
+        GX_CLAMP,
+        GX_CLAMP,
+        GX_FALSE
+    );
+
+    /*
+     * Exact indexed UI artwork first.
+     *
+     * Nearest also prevents transparent-index RGB from
+     * bleeding into neighboring pixels.
+     */
+    GX_InitTexObjFilterMode(
+        &image->texture,
+        GX_NEAR,
+        GX_NEAR
+    );
+
+    memcpy(
+        image->name,
+        normalized,
+        strlen(normalized) + 1
+    );
+
+    image->width =
+        (int)width;
+
+    image->height =
+        (int)height;
+
+    image->texture_bytes =
+        texture_bytes;
+
+    image->texture_data =
+        texture_data;
+
+    image->has_alpha =
+        has_alpha;
+
+    ++q2gx_pic_loads_window;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX PIC LOAD: "
+        "%s %ux%u bytes=%u alpha=%d\n",
+        normalized,
+        width,
+        height,
+        (unsigned int)
+            texture_bytes,
+        has_alpha ? 1 : 0
+    );
+
+    ri.FS_FreeFile(
+        file_data
+    );
+
+    return true;
+
+
+fail:
+
+    if (texture_data)
+    {
+        free(
+            texture_data
+        );
+    }
+
+    if (file_data)
+    {
+        ri.FS_FreeFile(
+            file_data
+        );
+    }
+
+    memset(
+        image,
+        0,
+        sizeof(*image)
+    );
+
+    return false;
+}
+
+
+static struct image_s *Q2GX_FindPic(
+    char *name)
+{
+    char normalized[
+        MAX_QPATH
+    ];
+
+    struct image_s *image;
+
+    if (
+        !Q2GX_NormalizePicName(
+            name,
+            normalized
+        )
+    )
+    {
+        return NULL;
+    }
+
+    image =
+        Q2GX_FindCachedPic(
+            normalized
+        );
+
+    if (image)
+    {
+        ++q2gx_pic_hits_window;
+
+        return image;
+    }
+
+    ++q2gx_pic_misses_window;
+
+    image =
+        Q2GX_FindFreePicSlot();
+
+    if (!image)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PIC: "
+            "cache full while loading %s\n",
+            normalized
+        );
+
+        return NULL;
+    }
+
+    if (
+        !Q2GX_LoadPCXPic(
+            image,
+            normalized
+        )
+    )
+    {
+        return NULL;
+    }
+
+    return image;
+}
+
+
+static void Q2GX_ClearPicCache(void)
+{
+    unsigned int index;
+
+    unsigned int count;
+    unsigned int bytes;
+
+    count =
+        0u;
+
+    bytes =
+        0u;
+
+    for (index = 0;
+         index < Q2GX_MAX_PICS;
+         ++index)
+    {
+        struct image_s *image;
+
+        image =
+            &q2gx_pics[index];
+
+        if (image->texture_data)
+        {
+            bytes +=
+                image->texture_bytes;
+
+            free(
+                image->texture_data
+            );
+
+            ++count;
+        }
+
+        memset(
+            image,
+            0,
+            sizeof(*image)
+        );
+    }
+
+    if (count)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PIC CACHE FREE: "
+            "images=%u bytes=%u\n",
+            count,
+            bytes
+        );
+    }
 }
 
 
@@ -1541,13 +2131,6 @@ static qboolean Q2GX_Init(
 
     Q2GX_Setup2D();
 
-    if (!Q2GX_InitTextureSelfTest())
-    {
-        Q2GX_FreeResources();
-
-        return (qboolean)-1;
-    }
-
     ri.Con_Printf(
         PRINT_ALL,
         "Q2GC REF_GX DRAWFILL: "
@@ -1606,6 +2189,8 @@ static qboolean Q2GX_Init(
 
 static void Q2GX_Shutdown(void)
 {
+    Q2GX_ClearPicCache();
+
     ri.Con_Printf(
         PRINT_ALL,
         "Q2GC REF_GX: shutdown\n"
@@ -1641,8 +2226,9 @@ static struct image_s *Q2GX_RegisterSkin(
 static struct image_s *Q2GX_RegisterPic(
     char *name)
 {
-    (void)name;
-    return NULL;
+    return Q2GX_FindPic(
+        name
+    );
 }
 
 
@@ -1674,13 +2260,29 @@ static void Q2GX_DrawGetPicSize(
     int *h,
     char *name)
 {
-    (void)name;
+    struct image_s *image;
+
+    image =
+        Q2GX_FindPic(
+            name
+        );
+
+    if (!image)
+    {
+        if (w)
+            *w = -1;
+
+        if (h)
+            *h = -1;
+
+        return;
+    }
 
     if (w)
-        *w = 0;
+        *w = image->width;
 
     if (h)
-        *h = 0;
+        *h = image->height;
 }
 
 
@@ -1689,9 +2291,50 @@ static void Q2GX_DrawPic(
     int y,
     char *name)
 {
-    (void)x;
-    (void)y;
-    (void)name;
+    struct image_s *image;
+
+    image =
+        Q2GX_FindPic(
+            name
+        );
+
+    if (!image)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Can't find pic: %s\n",
+            name ? name : "(null)"
+        );
+
+        return;
+    }
+
+    ++q2gx_pic_draws_window;
+
+    if (!q2gx_pic_first_draw_logged)
+    {
+        q2gx_pic_first_draw_logged =
+            true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PIC FIRST DRAW: "
+            "DrawPic %s %dx%d at %d,%d\n",
+            image->name,
+            image->width,
+            image->height,
+            x,
+            y
+        );
+    }
+
+    Q2GX_DrawTexturedQuad(
+        (f32)x,
+        (f32)y,
+        (f32)image->width,
+        (f32)image->height,
+        &image->texture
+    );
 }
 
 
@@ -1702,11 +2345,61 @@ static void Q2GX_DrawStretchPic(
     int h,
     char *name)
 {
-    (void)x;
-    (void)y;
-    (void)w;
-    (void)h;
-    (void)name;
+    struct image_s *image;
+
+    if (
+        w <= 0 ||
+        h <= 0
+    )
+    {
+        return;
+    }
+
+    image =
+        Q2GX_FindPic(
+            name
+        );
+
+    if (!image)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Can't find pic: %s\n",
+            name ? name : "(null)"
+        );
+
+        return;
+    }
+
+    ++q2gx_stretchpic_draws_window;
+
+    if (!q2gx_pic_first_draw_logged)
+    {
+        q2gx_pic_first_draw_logged =
+            true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PIC FIRST DRAW: "
+            "DrawStretchPic %s "
+            "%dx%d -> %dx%d at %d,%d\n",
+            image->name,
+            image->width,
+            image->height,
+            w,
+            h,
+            x,
+            y
+        );
+    }
+
+    Q2GX_DrawTexturedQuad(
+        (f32)x,
+        (f32)y,
+        (f32)w,
+        (f32)h,
+        &image->texture
+    );
 }
 
 
@@ -2027,22 +2720,7 @@ static void Q2GX_BeginFrame(
     );
 
 
-    /*
-     * Q2GC_TEXTURE_PIPELINE_SELFTEST
-     *
-     * Scale synthetic 64x64 texture to 256x256.
-     */
-    if (q2gx_texture_test_ready)
-    {
-        Q2GX_DrawTexturedQuad(
-            192.0f,
-            112.0f,
-            256.0f,
-            256.0f,
-            &q2gx_texture_test_obj
-        );
     }
-}
 
 
 static void Q2GX_EndFrame(void)
@@ -2081,11 +2759,21 @@ static void Q2GX_EndFrame(void)
             "drawchar_calls=%u "
             "drawchar_runs=%u "
             "drawfill_calls=%u "
-            "texture_draws=%u\n",
+            "texture_draws=%u "
+            "pic_draws=%u "
+            "stretchpic_draws=%u "
+            "pic_loads=%u "
+            "pic_hits=%u "
+            "pic_misses=%u\n",
             q2gx_drawchar_calls_window,
             q2gx_drawchar_runs_window,
             q2gx_drawfill_calls_window,
-            q2gx_texture_draws_window
+            q2gx_texture_draws_window,
+            q2gx_pic_draws_window,
+            q2gx_stretchpic_draws_window,
+            q2gx_pic_loads_window,
+            q2gx_pic_hits_window,
+            q2gx_pic_misses_window
         );
 
         q2gx_drawchar_calls_window =
@@ -2098,6 +2786,21 @@ static void Q2GX_EndFrame(void)
             0u;
 
         q2gx_texture_draws_window =
+            0u;
+
+        q2gx_pic_draws_window =
+            0u;
+
+        q2gx_stretchpic_draws_window =
+            0u;
+
+        q2gx_pic_loads_window =
+            0u;
+
+        q2gx_pic_hits_window =
+            0u;
+
+        q2gx_pic_misses_window =
             0u;
 
         q2gx_frame_count =
