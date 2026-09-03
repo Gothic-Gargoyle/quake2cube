@@ -282,6 +282,13 @@ typedef struct q2gx_world_leaf_s
 {
     int contents;
     int cluster;
+
+    /*
+     * Q2GC_BSP_AREABITS_FILTERING_V1
+     *
+     * Quake II renderer area ID from dleaf.area.
+     */
+    int area;
     unsigned int first_leafface;
     unsigned int num_leaffaces;
 } q2gx_world_leaf_t;
@@ -341,6 +348,18 @@ static unsigned int q2gx_world_frames_window;
 static unsigned int q2gx_world_pvs_faces_window;
 static unsigned int q2gx_world_pvs_rejected_faces_window;
 static unsigned int q2gx_world_backface_rejected_faces_window;
+
+static unsigned int q2gx_world_pvs_visible_leaves_frame;
+static unsigned int q2gx_world_area_rejected_leaves_frame;
+static unsigned int q2gx_world_pvs_face_refs_frame;
+static unsigned int q2gx_world_area_rejected_face_refs_frame;
+static qboolean q2gx_world_areabits_active_frame;
+
+static unsigned int q2gx_world_pvs_visible_leaves_window;
+static unsigned int q2gx_world_area_rejected_leaves_window;
+static unsigned int q2gx_world_pvs_face_refs_window;
+static unsigned int q2gx_world_area_rejected_face_refs_window;
+static unsigned int q2gx_world_areabits_frames_window;
 static unsigned int q2gx_world_submitted_faces_window;
 static unsigned int q2gx_world_submitted_triangles_window;
 static unsigned int q2gx_world_submitted_vertices_window;
@@ -2521,6 +2540,19 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_world_cluster_changes_window = 0u;
     q2gx_world_last_cluster = INT32_MIN;
     q2gx_world_last_cluster2 = INT32_MIN;
+
+
+    q2gx_world_pvs_visible_leaves_frame = 0u;
+    q2gx_world_area_rejected_leaves_frame = 0u;
+    q2gx_world_pvs_face_refs_frame = 0u;
+    q2gx_world_area_rejected_face_refs_frame = 0u;
+    q2gx_world_areabits_active_frame = false;
+
+    q2gx_world_pvs_visible_leaves_window = 0u;
+    q2gx_world_area_rejected_leaves_window = 0u;
+    q2gx_world_pvs_face_refs_window = 0u;
+    q2gx_world_area_rejected_face_refs_window = 0u;
+    q2gx_world_areabits_frames_window = 0u;
 }
 
 
@@ -2847,6 +2879,48 @@ static qboolean Q2GX_LoadWorldGeometry(
 
         world_leaves[index].contents = (int)contents;
         world_leaves[index].cluster = (int)cluster;
+
+        /*
+         * dleaf_t layout:
+         *
+         *   +0  contents   int32
+         *   +4  cluster    int16
+         *   +6  area       int16
+         */
+        world_leaves[
+            index
+        ].area =
+            (int)
+            (
+                (int16_t)
+                Q2GX_BSPReadLE16(
+                    disk_leaf + 6
+                )
+            );
+
+        if (
+            world_leaves[
+                index
+            ].area < 0
+            ||
+            world_leaves[
+                index
+            ].area >= 256
+        )
+        {
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX AREABITS: "
+                "leaf %u invalid area %d\n",
+                index,
+                world_leaves[
+                    index
+                ].area
+            );
+
+            goto fail;
+        }
+
         world_leaves[index].first_leafface = (unsigned int)first_leafface;
         world_leaves[index].num_leaffaces = (unsigned int)num_leaffaces;
     }
@@ -3412,7 +3486,14 @@ static unsigned int Q2GX_MarkWorldPVS(
     if (cluster2_out) *cluster2_out = -1;
     if (fallback_out) *fallback_out = false;
 
-    for (face_index = 0u; face_index < q2gx_world_face_count; ++face_index)
+
+    q2gx_world_pvs_visible_leaves_frame = 0u;
+    q2gx_world_area_rejected_leaves_frame = 0u;
+    q2gx_world_pvs_face_refs_frame = 0u;
+    q2gx_world_area_rejected_face_refs_frame = 0u;
+    q2gx_world_areabits_active_frame = false;
+
+for (face_index = 0u; face_index < q2gx_world_face_count; ++face_index)
         q2gx_world_faces[face_index].pvs_visible_this_frame = false;
 
     if (!fd || !q2gx_world_nodes || !q2gx_world_leaves || !q2gx_world_leaffaces ||
@@ -3510,7 +3591,58 @@ static unsigned int Q2GX_MarkWorldPVS(
               (1u << ((unsigned int)leaf->cluster & 7u))))
             continue;
 
-        for (reference_index = leaf->first_leafface;
+
+        ++q2gx_world_pvs_visible_leaves_frame;
+
+        q2gx_world_pvs_face_refs_frame +=
+            leaf->num_leaffaces;
+
+        if (fd->areabits)
+        {
+            unsigned int area;
+
+            q2gx_world_areabits_active_frame =
+                true;
+
+            area =
+                (unsigned int)
+                leaf->area;
+
+            /*
+             * Exact stock R_RecursiveWorldNode leaf test:
+             *
+             *   areabits[area >> 3]
+             *       &
+             *   (1 << (area & 7))
+             */
+            if (
+                !(
+                    fd->areabits[
+                        area >> 3
+                    ]
+                    &
+                    (
+                        1u
+                        <<
+                        (
+                            area
+                            &
+                            7u
+                        )
+                    )
+                )
+            )
+            {
+                ++q2gx_world_area_rejected_leaves_frame;
+
+                q2gx_world_area_rejected_face_refs_frame +=
+                    leaf->num_leaffaces;
+
+                continue;
+            }
+        }
+
+for (reference_index = leaf->first_leafface;
              reference_index < leaf->first_leafface + leaf->num_leaffaces;
              ++reference_index)
         {
@@ -3750,6 +3882,26 @@ static void Q2GX_DrawFlatWorld(
     q2gx_world_submitted_triangles_window += submitted_triangles;
     q2gx_world_submitted_vertices_window += submitted_vertices;
 
+    q2gx_world_pvs_visible_leaves_window +=
+        q2gx_world_pvs_visible_leaves_frame;
+
+    q2gx_world_area_rejected_leaves_window +=
+        q2gx_world_area_rejected_leaves_frame;
+
+    q2gx_world_pvs_face_refs_window +=
+        q2gx_world_pvs_face_refs_frame;
+
+    q2gx_world_area_rejected_face_refs_window +=
+        q2gx_world_area_rejected_face_refs_frame;
+
+    if (
+        q2gx_world_areabits_active_frame
+    )
+    {
+        ++q2gx_world_areabits_frames_window;
+    }
+
+
     if (pvs_fallback)
         ++q2gx_world_pvs_fallback_frames_window;
 
@@ -3802,9 +3954,34 @@ static void Q2GX_DrawFlatWorld(
             q2gx_world_last_cluster,
             q2gx_world_last_cluster2);
 
-        q2gx_world_frames_window = 0u;
+                ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX AREABITS 120: "
+            "frames=%u "
+            "pvs_visible_leaves_total=%u "
+            "area_rejected_leaves_total=%u "
+            "pvs_face_refs_total=%u "
+            "area_rejected_face_refs_total=%u "
+            "areabits_frames=%u "
+            "mode=leaf_areabits\n",
+            q2gx_world_frames_window,
+            q2gx_world_pvs_visible_leaves_window,
+            q2gx_world_area_rejected_leaves_window,
+            q2gx_world_pvs_face_refs_window,
+            q2gx_world_area_rejected_face_refs_window,
+            q2gx_world_areabits_frames_window
+        );
+
+q2gx_world_frames_window = 0u;
         q2gx_world_pvs_faces_window = 0u;
         q2gx_world_pvs_rejected_faces_window = 0u;
+
+        q2gx_world_pvs_visible_leaves_window = 0u;
+        q2gx_world_area_rejected_leaves_window = 0u;
+        q2gx_world_pvs_face_refs_window = 0u;
+        q2gx_world_area_rejected_face_refs_window = 0u;
+        q2gx_world_areabits_frames_window = 0u;
+
         q2gx_world_backface_rejected_faces_window = 0u;
         q2gx_world_submitted_faces_window = 0u;
         q2gx_world_submitted_triangles_window = 0u;
