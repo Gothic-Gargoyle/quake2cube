@@ -261,6 +261,31 @@ typedef struct q2gx_world_vertex_s
  * first pass can count the exact GX primitive size and the
  * second pass can stream only accepted faces.
  */
+/*
+ * Q2GC_BSP_PVS_FACE_MARKING_V1
+ *
+ * Minimal Quake II BSP visibility data. V1 deliberately does
+ * not reproduce recursive world rendering yet; it only marks
+ * faces belonging to leaves in the current PVS. Existing
+ * plane-side rejection then decides which marked faces face
+ * the viewer.
+ */
+typedef struct q2gx_world_node_s
+{
+    f32 normal[3];
+    f32 dist;
+    int type;
+    int children[2];
+} q2gx_world_node_t;
+
+typedef struct q2gx_world_leaf_s
+{
+    int contents;
+    int cluster;
+    unsigned int first_leafface;
+    unsigned int num_leaffaces;
+} q2gx_world_leaf_t;
+
 typedef struct q2gx_world_face_s
 {
     unsigned int first_vertex;
@@ -274,11 +299,26 @@ typedef struct q2gx_world_face_s
     f32 dist;
 
     qboolean plane_back;
+    qboolean pvs_visible_this_frame;
     qboolean visible_this_frame;
 } q2gx_world_face_t;
 
 
 static q2gx_world_face_t *q2gx_world_faces;
+
+static q2gx_world_node_t *q2gx_world_nodes;
+static q2gx_world_leaf_t *q2gx_world_leaves;
+static uint16_t *q2gx_world_leaffaces;
+static byte *q2gx_world_vis_data;
+static int32_t *q2gx_world_vis_pvs_offsets;
+static byte *q2gx_world_pvs_row;
+static byte *q2gx_world_pvs_row2;
+static unsigned int q2gx_world_node_count;
+static unsigned int q2gx_world_leaf_count;
+static unsigned int q2gx_world_leafface_count;
+static unsigned int q2gx_world_vis_bytes;
+static unsigned int q2gx_world_vis_numclusters;
+static unsigned int q2gx_world_vis_row_bytes;
 
 static q2gx_world_vertex_t *q2gx_world_vertices;
 
@@ -298,10 +338,16 @@ static qboolean q2gx_world_first_draw_logged;
 
 static unsigned int q2gx_world_frames_window;
 
+static unsigned int q2gx_world_pvs_faces_window;
+static unsigned int q2gx_world_pvs_rejected_faces_window;
+static unsigned int q2gx_world_backface_rejected_faces_window;
 static unsigned int q2gx_world_submitted_faces_window;
-static unsigned int q2gx_world_rejected_faces_window;
 static unsigned int q2gx_world_submitted_triangles_window;
 static unsigned int q2gx_world_submitted_vertices_window;
+static unsigned int q2gx_world_pvs_fallback_frames_window;
+static unsigned int q2gx_world_cluster_changes_window;
+static int q2gx_world_last_cluster;
+static int q2gx_world_last_cluster2;
 
 
 static void Q2GX_FreeResources(void)
@@ -2134,7 +2180,11 @@ static void Q2GX_ClearPicCache(void)
 
 #define Q2GX_BSP_LUMP_PLANES       1
 #define Q2GX_BSP_LUMP_VERTEXES     2
+#define Q2GX_BSP_LUMP_VISIBILITY   3
+#define Q2GX_BSP_LUMP_NODES        4
 #define Q2GX_BSP_LUMP_FACES        6
+#define Q2GX_BSP_LUMP_LEAFS        8
+#define Q2GX_BSP_LUMP_LEAFFACES    9
 #define Q2GX_BSP_LUMP_EDGES       11
 #define Q2GX_BSP_LUMP_SURFEDGES   12
 
@@ -2400,855 +2450,534 @@ static void Q2GX_FreeWorldGeometry(void)
 {
     if (
         q2gx_world_vertices ||
-        q2gx_world_faces
-    )
+        q2gx_world_faces ||
+        q2gx_world_nodes ||
+        q2gx_world_leaves ||
+        q2gx_world_leaffaces ||
+        q2gx_world_vis_data)
     {
         ri.Con_Printf(
             PRINT_ALL,
             "Q2GC REF_GX WORLD FREE: "
-            "%s planes=%u faces=%u triangles=%u "
-            "vertices=%u vertex_bytes=%u "
-            "face_bytes=%u\n",
-            q2gx_world_name[0]
-                ? q2gx_world_name
-                : "(unnamed)",
+            "%s planes=%u faces=%u triangles=%u vertices=%u "
+            "nodes=%u leaves=%u leaffaces=%u clusters=%u "
+            "vertex_bytes=%u face_bytes=%u vis_bytes=%u\n",
+            q2gx_world_name[0] ? q2gx_world_name : "(unnamed)",
             q2gx_world_plane_count,
             q2gx_world_face_count,
             q2gx_world_triangle_count,
             q2gx_world_vertex_count,
-            (unsigned int)
-                q2gx_world_bytes,
-            (unsigned int)
-                q2gx_world_face_bytes
-        );
+            q2gx_world_node_count,
+            q2gx_world_leaf_count,
+            q2gx_world_leafface_count,
+            q2gx_world_vis_numclusters,
+            (unsigned int)q2gx_world_bytes,
+            (unsigned int)q2gx_world_face_bytes,
+            q2gx_world_vis_bytes);
     }
 
-    if (q2gx_world_vertices)
-    {
-        free(
-            q2gx_world_vertices
-        );
-    }
+    if (q2gx_world_vertices) free(q2gx_world_vertices);
+    if (q2gx_world_faces) free(q2gx_world_faces);
+    if (q2gx_world_nodes) free(q2gx_world_nodes);
+    if (q2gx_world_leaves) free(q2gx_world_leaves);
+    if (q2gx_world_leaffaces) free(q2gx_world_leaffaces);
+    if (q2gx_world_vis_data) free(q2gx_world_vis_data);
+    if (q2gx_world_vis_pvs_offsets) free(q2gx_world_vis_pvs_offsets);
+    if (q2gx_world_pvs_row) free(q2gx_world_pvs_row);
+    if (q2gx_world_pvs_row2) free(q2gx_world_pvs_row2);
 
-    if (q2gx_world_faces)
-    {
-        free(
-            q2gx_world_faces
-        );
-    }
+    q2gx_world_vertices = NULL;
+    q2gx_world_faces = NULL;
+    q2gx_world_nodes = NULL;
+    q2gx_world_leaves = NULL;
+    q2gx_world_leaffaces = NULL;
+    q2gx_world_vis_data = NULL;
+    q2gx_world_vis_pvs_offsets = NULL;
+    q2gx_world_pvs_row = NULL;
+    q2gx_world_pvs_row2 = NULL;
 
-    q2gx_world_vertices =
-        NULL;
-
-    q2gx_world_faces =
-        NULL;
-
-    q2gx_world_vertex_count =
-        0u;
-
-    q2gx_world_triangle_count =
-        0u;
-
-    q2gx_world_face_count =
-        0u;
-
-    q2gx_world_plane_count =
-        0u;
-
-    q2gx_world_bytes =
-        0u;
-
-    q2gx_world_face_bytes =
-        0u;
-
-    q2gx_world_name[0] =
-        '\0';
-
-    q2gx_world_first_draw_logged =
-        false;
-
-    q2gx_world_frames_window =
-        0u;
-
-    q2gx_world_submitted_faces_window =
-        0u;
-
-    q2gx_world_rejected_faces_window =
-        0u;
-
-    q2gx_world_submitted_triangles_window =
-        0u;
-
-    q2gx_world_submitted_vertices_window =
-        0u;
+    q2gx_world_vertex_count = 0u;
+    q2gx_world_triangle_count = 0u;
+    q2gx_world_face_count = 0u;
+    q2gx_world_plane_count = 0u;
+    q2gx_world_node_count = 0u;
+    q2gx_world_leaf_count = 0u;
+    q2gx_world_leafface_count = 0u;
+    q2gx_world_vis_bytes = 0u;
+    q2gx_world_vis_numclusters = 0u;
+    q2gx_world_vis_row_bytes = 0u;
+    q2gx_world_bytes = 0u;
+    q2gx_world_face_bytes = 0u;
+    q2gx_world_name[0] = '\0';
+    q2gx_world_first_draw_logged = false;
+    q2gx_world_frames_window = 0u;
+    q2gx_world_pvs_faces_window = 0u;
+    q2gx_world_pvs_rejected_faces_window = 0u;
+    q2gx_world_backface_rejected_faces_window = 0u;
+    q2gx_world_submitted_faces_window = 0u;
+    q2gx_world_submitted_triangles_window = 0u;
+    q2gx_world_submitted_vertices_window = 0u;
+    q2gx_world_pvs_fallback_frames_window = 0u;
+    q2gx_world_cluster_changes_window = 0u;
+    q2gx_world_last_cluster = INT32_MIN;
+    q2gx_world_last_cluster2 = INT32_MIN;
 }
 
 
 static qboolean Q2GX_LoadWorldGeometry(
     const char *map)
 {
-    char path[
-        MAX_QPATH
-    ];
-
+    char path[MAX_QPATH];
     size_t map_length;
-
     void *file_buffer;
     byte *file_data;
-
     int file_length_int;
     unsigned int file_length;
 
     const byte *plane_data;
     const byte *vertex_data;
+    const byte *visibility_data;
+    const byte *node_data;
     const byte *face_data;
+    const byte *leaf_data;
+    const byte *leafface_data;
     const byte *edge_data;
     const byte *surfedge_data;
 
-    unsigned int plane_bytes;
-    unsigned int vertex_bytes;
-    unsigned int face_bytes;
-    unsigned int edge_bytes;
-    unsigned int surfedge_bytes;
-
-    unsigned int plane_count;
-    unsigned int vertex_count;
-    unsigned int face_count;
-    unsigned int edge_count;
-    unsigned int surfedge_count;
-
+    unsigned int plane_bytes, vertex_bytes, visibility_bytes, node_bytes;
+    unsigned int face_bytes, leaf_bytes, leafface_bytes, edge_bytes, surfedge_bytes;
+    unsigned int plane_count, vertex_count, visibility_count, node_count;
+    unsigned int face_count, leaf_count, leafface_count, edge_count, surfedge_count;
+    unsigned int vis_numclusters = 0u;
+    unsigned int vis_row_bytes = 0u;
     unsigned int triangle_count;
     unsigned int gx_vertex_count;
 
-    size_t allocation_bytes;
-    size_t face_allocation_bytes;
+    size_t allocation_bytes, face_allocation_bytes;
+    size_t node_allocation_bytes, leaf_allocation_bytes;
+    size_t leafface_allocation_bytes, vis_offset_allocation_bytes = 0u;
 
-    q2gx_world_vertex_t *world_vertices;
-    q2gx_world_face_t *world_faces;
+    q2gx_world_vertex_t *world_vertices = NULL;
+    q2gx_world_face_t *world_faces = NULL;
+    q2gx_world_node_t *world_nodes = NULL;
+    q2gx_world_leaf_t *world_leaves = NULL;
+    uint16_t *world_leaffaces = NULL;
+    byte *world_vis_data = NULL;
+    int32_t *world_vis_pvs_offsets = NULL;
+    byte *world_pvs_row = NULL;
+    byte *world_pvs_row2 = NULL;
 
     unsigned int face_index;
     unsigned int output_index;
-
-    world_vertices =
-        NULL;
-
-    world_faces =
-        NULL;
+    unsigned int index;
 
     Q2GX_FreeWorldGeometry();
 
-    if (
-        !map ||
-        !map[0]
-    )
+    if (!map || !map[0])
     {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "BeginRegistration received empty map\n"
-        );
-
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: BeginRegistration received empty map\n");
         return false;
     }
 
-    map_length =
-        strlen(map);
-
-    if (
-        map_length + 10u >
-        sizeof(path)
-    )
+    map_length = strlen(map);
+    if (map_length + 10u > sizeof(path))
     {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "map name too long: %s\n",
-            map
-        );
-
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: map name too long: %s\n", map);
         return false;
     }
 
-    memcpy(
-        path,
-        "maps/",
-        5
-    );
+    memcpy(path, "maps/", 5);
+    memcpy(path + 5, map, map_length);
+    memcpy(path + 5 + map_length, ".bsp", 5);
 
-    memcpy(
-        path + 5,
-        map,
-        map_length
-    );
+    file_buffer = NULL;
+    file_length_int = ri.FS_LoadFile(path, &file_buffer);
 
-    memcpy(
-        path + 5 + map_length,
-        ".bsp",
-        5
-    );
-
-    file_buffer =
-        NULL;
-
-    file_length_int =
-        ri.FS_LoadFile(
-            path,
-            &file_buffer
-        );
-
-    if (
-        file_length_int <= 0 ||
-        !file_buffer
-    )
+    if (file_length_int <= 0 || !file_buffer)
     {
-        if (file_buffer)
+        if (file_buffer) ri.FS_FreeFile(file_buffer);
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: failed to load %s\n", path);
+        return false;
+    }
+
+    file_data = (byte *)file_buffer;
+    file_length = (unsigned int)file_length_int;
+
+    if (file_length < 8u + Q2GX_BSP_HEADER_LUMPS * 8u)
+    {
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: short BSP header %s\n", path);
+        goto fail;
+    }
+
+    if (file_data[0] != 'I' || file_data[1] != 'B' ||
+        file_data[2] != 'S' || file_data[3] != 'P')
+    {
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: bad BSP magic %s\n", path);
+        goto fail;
+    }
+
+    if (Q2GX_BSPReadLE32(file_data + 4) != Q2GX_BSP_VERSION)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX WORLD: unsupported BSP version %u in %s\n",
+            (unsigned int)Q2GX_BSPReadLE32(file_data + 4),
+            path);
+        goto fail;
+    }
+
+    if (!Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_PLANES, 20u,
+                         &plane_data, &plane_bytes, &plane_count) ||
+        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_VERTEXES, 12u,
+                         &vertex_data, &vertex_bytes, &vertex_count) ||
+        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_VISIBILITY, 1u,
+                         &visibility_data, &visibility_bytes, &visibility_count) ||
+        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_NODES, 28u,
+                         &node_data, &node_bytes, &node_count) ||
+        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_FACES, 20u,
+                         &face_data, &face_bytes, &face_count) ||
+        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_LEAFS, 28u,
+                         &leaf_data, &leaf_bytes, &leaf_count) ||
+        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_LEAFFACES, 2u,
+                         &leafface_data, &leafface_bytes, &leafface_count) ||
+        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_EDGES, 4u,
+                         &edge_data, &edge_bytes, &edge_count) ||
+        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_SURFEDGES, 4u,
+                         &surfedge_data, &surfedge_bytes, &surfedge_count))
+    {
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: invalid BSP lumps in %s\n", path);
+        goto fail;
+    }
+
+    (void)visibility_count;
+    (void)plane_bytes;
+    (void)vertex_bytes;
+    (void)node_bytes;
+    (void)face_bytes;
+    (void)leaf_bytes;
+    (void)leafface_bytes;
+    (void)edge_bytes;
+    (void)surfedge_bytes;
+
+    if (plane_count == 0u || vertex_count == 0u || node_count == 0u ||
+        face_count == 0u || leaf_count == 0u || leafface_count == 0u ||
+        edge_count == 0u || surfedge_count == 0u)
+    {
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: empty required BSP lumps in %s\n", path);
+        goto fail;
+    }
+
+    if (visibility_bytes >= 4u)
+    {
+        uint32_t numclusters_u32 = Q2GX_BSPReadLE32(visibility_data);
+        size_t header_bytes;
+
+        if (numclusters_u32 > 32767u)
         {
-            ri.FS_FreeFile(
-                file_buffer
-            );
+            ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: implausible cluster count %u\n",
+                          (unsigned int)numclusters_u32);
+            goto fail;
         }
 
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "failed to load %s\n",
-            path
-        );
-
-        return false;
+        vis_numclusters = (unsigned int)numclusters_u32;
+        header_bytes = 4u + (size_t)vis_numclusters * 8u;
+        if (header_bytes > (size_t)visibility_bytes)
+        {
+            ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: visibility header exceeds lump\n");
+            goto fail;
+        }
+        vis_row_bytes = (vis_numclusters + 7u) >> 3;
     }
 
-    file_data =
-        (byte *)file_buffer;
-
-    file_length =
-        (unsigned int)
-        file_length_int;
-
-    if (
-        file_length <
-        (
-            8u
-            +
-            Q2GX_BSP_HEADER_LUMPS * 8u
-        )
-    )
+    triangle_count = 0u;
+    for (face_index = 0u; face_index < face_count; ++face_index)
     {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "short BSP header %s\n",
-            path
-        );
-
-        goto fail;
-    }
-
-    if (
-        file_data[0] != 'I' ||
-        file_data[1] != 'B' ||
-        file_data[2] != 'S' ||
-        file_data[3] != 'P'
-    )
-    {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "bad BSP magic %s\n",
-            path
-        );
-
-        goto fail;
-    }
-
-    if (
-        Q2GX_BSPReadLE32(
-            file_data + 4
-        )
-        !=
-        Q2GX_BSP_VERSION
-    )
-    {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "unsupported BSP version %u in %s\n",
-            (unsigned int)
-                Q2GX_BSPReadLE32(
-                    file_data + 4
-                ),
-            path
-        );
-
-        goto fail;
-    }
-
-    if (
-        !Q2GX_BSPGetLump(
-            file_data,
-            file_length,
-            Q2GX_BSP_LUMP_PLANES,
-            20u,
-            &plane_data,
-            &plane_bytes,
-            &plane_count
-        )
-        ||
-        !Q2GX_BSPGetLump(
-            file_data,
-            file_length,
-            Q2GX_BSP_LUMP_VERTEXES,
-            12u,
-            &vertex_data,
-            &vertex_bytes,
-            &vertex_count
-        )
-        ||
-        !Q2GX_BSPGetLump(
-            file_data,
-            file_length,
-            Q2GX_BSP_LUMP_FACES,
-            20u,
-            &face_data,
-            &face_bytes,
-            &face_count
-        )
-        ||
-        !Q2GX_BSPGetLump(
-            file_data,
-            file_length,
-            Q2GX_BSP_LUMP_EDGES,
-            4u,
-            &edge_data,
-            &edge_bytes,
-            &edge_count
-        )
-        ||
-        !Q2GX_BSPGetLump(
-            file_data,
-            file_length,
-            Q2GX_BSP_LUMP_SURFEDGES,
-            4u,
-            &surfedge_data,
-            &surfedge_bytes,
-            &surfedge_count
-        )
-    )
-    {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "invalid geometry lumps in %s\n",
-            path
-        );
-
-        goto fail;
-    }
-
-    if (
-        plane_count == 0u ||
-        vertex_count == 0u ||
-        face_count == 0u ||
-        edge_count == 0u ||
-        surfedge_count == 0u
-    )
-    {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "empty geometry lumps in %s\n",
-            path
-        );
-
-        goto fail;
-    }
-
-    triangle_count =
-        0u;
-
-    /*
-     * Validation/count pass.
-     */
-    for (face_index = 0u;
-         face_index < face_count;
-         ++face_index)
-    {
-        const byte *face;
-
-        uint16_t planenum;
-        int16_t side;
-
-        int32_t firstedge_signed;
-        int16_t numedges_signed;
-
+        const byte *face = face_data + face_index * 20u;
+        uint16_t planenum = Q2GX_BSPReadLE16(face + 0);
+        int16_t side = (int16_t)Q2GX_BSPReadLE16(face + 2);
+        int32_t firstedge_signed = (int32_t)Q2GX_BSPReadLE32(face + 4);
+        int16_t numedges_signed = (int16_t)Q2GX_BSPReadLE16(face + 8);
         unsigned int firstedge;
         unsigned int numedges;
-
         unsigned int local_edge;
+        f32 ignored_position[3];
 
-        f32 ignored_position[
-            3
-        ];
-
-        face =
-            face_data
-            +
-            face_index * 20u;
-
-        planenum =
-            Q2GX_BSPReadLE16(
-                face + 0
-            );
-
-        side =
-            (int16_t)
-            Q2GX_BSPReadLE16(
-                face + 2
-            );
-
-        firstedge_signed =
-            (int32_t)
-            Q2GX_BSPReadLE32(
-                face + 4
-            );
-
-        numedges_signed =
-            (int16_t)
-            Q2GX_BSPReadLE16(
-                face + 8
-            );
-
-        if (
-            planenum >= plane_count ||
-            (
-                side != 0 &&
-                side != 1
-            ) ||
-            firstedge_signed < 0 ||
-            numedges_signed < 3
-        )
+        if (planenum >= plane_count || (side != 0 && side != 1) ||
+            firstedge_signed < 0 || numedges_signed < 3)
         {
             ri.Con_Printf(
                 PRINT_ALL,
-                "Q2GC REF_GX WORLD: "
-                "invalid face %u "
-                "planenum=%u side=%d "
-                "firstedge=%d numedges=%d\n",
-                face_index,
-                (unsigned int)planenum,
-                (int)side,
-                (int)firstedge_signed,
-                (int)numedges_signed
-            );
-
+                "Q2GC REF_GX WORLD: invalid face %u planenum=%u side=%d firstedge=%d numedges=%d\n",
+                face_index, (unsigned int)planenum, (int)side,
+                (int)firstedge_signed, (int)numedges_signed);
             goto fail;
         }
 
-        firstedge =
-            (unsigned int)
-            firstedge_signed;
+        firstedge = (unsigned int)firstedge_signed;
+        numedges = (unsigned int)numedges_signed;
 
-        numedges =
-            (unsigned int)
-            numedges_signed;
-
-        if (
-            firstedge >
-            surfedge_count
-            ||
-            numedges >
-            (
-                surfedge_count
-                -
-                firstedge
-            )
-        )
+        if (firstedge > surfedge_count || numedges > surfedge_count - firstedge)
         {
-            ri.Con_Printf(
-                PRINT_ALL,
-                "Q2GC REF_GX WORLD: "
-                "face %u surfedge range invalid\n",
-                face_index
-            );
-
+            ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: face %u surfedge range invalid\n", face_index);
             goto fail;
         }
 
-        for (local_edge = 0u;
-             local_edge < numedges;
-             ++local_edge)
+        for (local_edge = 0u; local_edge < numedges; ++local_edge)
         {
-            if (
-                !Q2GX_BSPResolveVertex(
-                    vertex_data,
-                    vertex_count,
-                    edge_data,
-                    edge_count,
-                    surfedge_data,
-                    surfedge_count,
-                    firstedge,
-                    local_edge,
-                    ignored_position
-                )
-            )
+            if (!Q2GX_BSPResolveVertex(
+                    vertex_data, vertex_count,
+                    edge_data, edge_count,
+                    surfedge_data, surfedge_count,
+                    firstedge, local_edge,
+                    ignored_position))
             {
-                ri.Con_Printf(
-                    PRINT_ALL,
-                    "Q2GC REF_GX WORLD: "
-                    "face %u vertex %u invalid\n",
-                    face_index,
-                    local_edge
-                );
-
+                ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: face %u vertex %u invalid\n",
+                              face_index, local_edge);
                 goto fail;
             }
         }
 
-        if (
-            triangle_count >
-            UINT32_MAX
-            -
-            (
-                numedges
-                -
-                2u
-            )
-        )
+        if (triangle_count > UINT32_MAX - (numedges - 2u))
+            goto fail;
+
+        triangle_count += numedges - 2u;
+    }
+
+    if (triangle_count > UINT32_MAX / 3u)
+        goto fail;
+
+    gx_vertex_count = triangle_count * 3u;
+    if (gx_vertex_count == 0u)
+        goto fail;
+
+    if (gx_vertex_count > SIZE_MAX / sizeof(*world_vertices) ||
+        face_count > SIZE_MAX / sizeof(*world_faces) ||
+        node_count > SIZE_MAX / sizeof(*world_nodes) ||
+        leaf_count > SIZE_MAX / sizeof(*world_leaves) ||
+        leafface_count > SIZE_MAX / sizeof(*world_leaffaces))
+    {
+        goto fail;
+    }
+
+    allocation_bytes = (size_t)gx_vertex_count * sizeof(*world_vertices);
+    face_allocation_bytes = (size_t)face_count * sizeof(*world_faces);
+    node_allocation_bytes = (size_t)node_count * sizeof(*world_nodes);
+    leaf_allocation_bytes = (size_t)leaf_count * sizeof(*world_leaves);
+    leafface_allocation_bytes = (size_t)leafface_count * sizeof(*world_leaffaces);
+
+    if (vis_numclusters > 0u)
+    {
+        if (vis_numclusters > SIZE_MAX / sizeof(*world_vis_pvs_offsets))
+            goto fail;
+        vis_offset_allocation_bytes =
+            (size_t)vis_numclusters * sizeof(*world_vis_pvs_offsets);
+    }
+
+    world_vertices = memalign(32, allocation_bytes);
+    world_faces = memalign(32, face_allocation_bytes);
+    world_nodes = malloc(node_allocation_bytes);
+    world_leaves = malloc(leaf_allocation_bytes);
+    world_leaffaces = malloc(leafface_allocation_bytes);
+
+    if (!world_vertices || !world_faces || !world_nodes ||
+        !world_leaves || !world_leaffaces)
+    {
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: allocation failure while loading %s\n", path);
+        goto fail;
+    }
+
+    memset(world_faces, 0, face_allocation_bytes);
+
+    if (visibility_bytes > 0u)
+    {
+        world_vis_data = malloc(visibility_bytes);
+        if (!world_vis_data)
+            goto fail;
+        memcpy(world_vis_data, visibility_data, visibility_bytes);
+    }
+
+    if (vis_numclusters > 0u)
+    {
+        world_vis_pvs_offsets = malloc(vis_offset_allocation_bytes);
+        world_pvs_row = malloc(vis_row_bytes);
+        world_pvs_row2 = malloc(vis_row_bytes);
+        if (!world_vis_pvs_offsets || !world_pvs_row || !world_pvs_row2)
+            goto fail;
+
+        for (index = 0u; index < vis_numclusters; ++index)
         {
+            int32_t pvs_offset = (int32_t)Q2GX_BSPReadLE32(
+                visibility_data + 4u + index * 8u);
+
+            if (pvs_offset < -1 ||
+                (pvs_offset >= 0 && (unsigned int)pvs_offset >= visibility_bytes))
+            {
+                ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: cluster %u invalid offset %d\n",
+                              index, (int)pvs_offset);
+                goto fail;
+            }
+            world_vis_pvs_offsets[index] = pvs_offset;
+        }
+    }
+
+    for (index = 0u; index < leaf_count; ++index)
+    {
+        const byte *disk_leaf = leaf_data + index * 28u;
+        int32_t contents = (int32_t)Q2GX_BSPReadLE32(disk_leaf + 0);
+        int16_t cluster = (int16_t)Q2GX_BSPReadLE16(disk_leaf + 4);
+        uint16_t first_leafface = Q2GX_BSPReadLE16(disk_leaf + 20);
+        uint16_t num_leaffaces = Q2GX_BSPReadLE16(disk_leaf + 22);
+
+        if (cluster < -1 ||
+            (cluster >= 0 && vis_numclusters > 0u &&
+             (unsigned int)cluster >= vis_numclusters))
+        {
+            ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: leaf %u invalid cluster %d\n",
+                          index, (int)cluster);
             goto fail;
         }
 
-        triangle_count +=
-            numedges
-            -
-            2u;
+        if ((unsigned int)first_leafface > leafface_count ||
+            (unsigned int)num_leaffaces >
+                leafface_count - (unsigned int)first_leafface)
+        {
+            ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: leaf %u invalid leafface range\n", index);
+            goto fail;
+        }
+
+        world_leaves[index].contents = (int)contents;
+        world_leaves[index].cluster = (int)cluster;
+        world_leaves[index].first_leafface = (unsigned int)first_leafface;
+        world_leaves[index].num_leaffaces = (unsigned int)num_leaffaces;
     }
 
-    if (
-        triangle_count >
-        UINT32_MAX / 3u
-    )
+    for (index = 0u; index < leafface_count; ++index)
     {
-        goto fail;
+        uint16_t face_reference = Q2GX_BSPReadLE16(leafface_data + index * 2u);
+        if (face_reference >= face_count)
+        {
+            ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: leafface %u references bad face %u\n",
+                          index, (unsigned int)face_reference);
+            goto fail;
+        }
+        world_leaffaces[index] = face_reference;
     }
 
-    gx_vertex_count =
-        triangle_count * 3u;
-
-    if (
-        gx_vertex_count == 0u
-    )
+    for (index = 0u; index < node_count; ++index)
     {
-        goto fail;
-    }
-
-    if (
-        gx_vertex_count >
-        SIZE_MAX /
-        sizeof(*world_vertices)
-    )
-    {
-        goto fail;
-    }
-
-    if (
-        face_count >
-        SIZE_MAX /
-        sizeof(*world_faces)
-    )
-    {
-        goto fail;
-    }
-
-    allocation_bytes =
-        (size_t)gx_vertex_count
-        *
-        sizeof(*world_vertices);
-
-    face_allocation_bytes =
-        (size_t)face_count
-        *
-        sizeof(*world_faces);
-
-    world_vertices =
-        memalign(
-            32,
-            allocation_bytes
-        );
-
-    if (!world_vertices)
-    {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "geometry allocation failed "
-            "%s bytes=%u\n",
-            path,
-            (unsigned int)
-                allocation_bytes
-        );
-
-        goto fail;
-    }
-
-    world_faces =
-        memalign(
-            32,
-            face_allocation_bytes
-        );
-
-    if (!world_faces)
-    {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX WORLD: "
-            "face metadata allocation failed "
-            "%s bytes=%u\n",
-            path,
-            (unsigned int)
-                face_allocation_bytes
-        );
-
-        goto fail;
-    }
-
-    memset(
-        world_faces,
-        0,
-        face_allocation_bytes
-    );
-
-    output_index =
-        0u;
-
-    /*
-     * Build pass.
-     *
-     * Preserve exactly the V1 triangle list, while attaching
-     * each contiguous face range to its BSP plane/side.
-     */
-    for (face_index = 0u;
-         face_index < face_count;
-         ++face_index)
-    {
-        const byte *face;
+        const byte *disk_node = node_data + index * 28u;
+        int32_t planenum = (int32_t)Q2GX_BSPReadLE32(disk_node + 0);
+        int32_t child0 = (int32_t)Q2GX_BSPReadLE32(disk_node + 4);
+        int32_t child1 = (int32_t)Q2GX_BSPReadLE32(disk_node + 8);
         const byte *plane;
+        int32_t plane_type;
+        unsigned int child_index;
 
-        q2gx_world_face_t *world_face;
-
-        uint16_t planenum;
-        int16_t side;
-
-        unsigned int firstedge;
-        unsigned int numedges;
-
-        unsigned int triangle;
-
-        f32 fan_origin[
-            3
-        ];
-
-        u8 red;
-        u8 green;
-        u8 blue;
-
-        face =
-            face_data
-            +
-            face_index * 20u;
-
-        planenum =
-            Q2GX_BSPReadLE16(
-                face + 0
-            );
-
-        side =
-            (int16_t)
-            Q2GX_BSPReadLE16(
-                face + 2
-            );
-
-        firstedge =
-            (unsigned int)
-            (
-                (int32_t)
-                Q2GX_BSPReadLE32(
-                    face + 4
-                )
-            );
-
-        numedges =
-            (unsigned int)
-            (
-                (int16_t)
-                Q2GX_BSPReadLE16(
-                    face + 8
-                )
-            );
-
-        plane =
-            plane_data
-            +
-            (unsigned int)planenum * 20u;
-
-        world_face =
-            &world_faces[
-                face_index
-            ];
-
-        world_face->first_vertex =
-            output_index;
-
-        world_face->triangle_count =
-            numedges
-            -
-            2u;
-
-        world_face->vertex_count =
-            world_face->triangle_count
-            *
-            3u;
-
-        world_face->normal[0] =
-            Q2GX_BSPReadLEFloat(
-                plane + 0
-            );
-
-        world_face->normal[1] =
-            Q2GX_BSPReadLEFloat(
-                plane + 4
-            );
-
-        world_face->normal[2] =
-            Q2GX_BSPReadLEFloat(
-                plane + 8
-            );
-
-        world_face->dist =
-            Q2GX_BSPReadLEFloat(
-                plane + 12
-            );
-
-        world_face->plane_back =
-            side
-                ? true
-                : false;
-
-        world_face->visible_this_frame =
-            false;
-
-        if (
-            !Q2GX_BSPResolveVertex(
-                vertex_data,
-                vertex_count,
-                edge_data,
-                edge_count,
-                surfedge_data,
-                surfedge_count,
-                firstedge,
-                0u,
-                fan_origin
-            )
-        )
+        if (planenum < 0 || (unsigned int)planenum >= plane_count)
         {
+            ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: node %u bad planenum %d\n",
+                          index, (int)planenum);
             goto fail;
         }
 
-        red =
-            (u8)
-            (
-                64u
-                +
-                (
-                    face_index * 53u
-                )
-                %
-                160u
-            );
-
-        green =
-            (u8)
-            (
-                64u
-                +
-                (
-                    face_index * 97u
-                )
-                %
-                160u
-            );
-
-        blue =
-            (u8)
-            (
-                64u
-                +
-                (
-                    face_index * 151u
-                )
-                %
-                160u
-            );
-
-        for (triangle = 1u;
-             triangle + 1u < numedges;
-             ++triangle)
+        for (child_index = 0u; child_index < 2u; ++child_index)
         {
-            f32 p1[
-                3
-            ];
+            int32_t child = child_index ? child1 : child0;
+            if (child >= 0)
+            {
+                if ((unsigned int)child >= node_count)
+                {
+                    ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: node %u bad node child %d\n",
+                                  index, (int)child);
+                    goto fail;
+                }
+            }
+            else
+            {
+                uint32_t leaf_index;
+                if (child == INT32_MIN)
+                    goto fail;
+                leaf_index = (uint32_t)(-1 - child);
+                if (leaf_index >= leaf_count)
+                {
+                    ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: node %u bad leaf child %u\n",
+                                  index, (unsigned int)leaf_index);
+                    goto fail;
+                }
+            }
+        }
 
-            f32 p2[
-                3
-            ];
+        plane = plane_data + (unsigned int)planenum * 20u;
+        world_nodes[index].normal[0] = Q2GX_BSPReadLEFloat(plane + 0);
+        world_nodes[index].normal[1] = Q2GX_BSPReadLEFloat(plane + 4);
+        world_nodes[index].normal[2] = Q2GX_BSPReadLEFloat(plane + 8);
+        world_nodes[index].dist = Q2GX_BSPReadLEFloat(plane + 12);
+        plane_type = (int32_t)Q2GX_BSPReadLE32(plane + 16);
+        world_nodes[index].type = (int)plane_type;
+        world_nodes[index].children[0] = (int)child0;
+        world_nodes[index].children[1] = (int)child1;
+    }
 
+    output_index = 0u;
+    for (face_index = 0u; face_index < face_count; ++face_index)
+    {
+        const byte *face = face_data + face_index * 20u;
+        uint16_t planenum = Q2GX_BSPReadLE16(face + 0);
+        int16_t side = (int16_t)Q2GX_BSPReadLE16(face + 2);
+        unsigned int firstedge = (unsigned int)((int32_t)Q2GX_BSPReadLE32(face + 4));
+        unsigned int numedges = (unsigned int)((int16_t)Q2GX_BSPReadLE16(face + 8));
+        const byte *plane = plane_data + (unsigned int)planenum * 20u;
+        q2gx_world_face_t *world_face = &world_faces[face_index];
+        unsigned int triangle;
+        f32 fan_origin[3];
+        u8 red, green, blue;
+
+        world_face->first_vertex = output_index;
+        world_face->triangle_count = numedges - 2u;
+        world_face->vertex_count = world_face->triangle_count * 3u;
+        world_face->normal[0] = Q2GX_BSPReadLEFloat(plane + 0);
+        world_face->normal[1] = Q2GX_BSPReadLEFloat(plane + 4);
+        world_face->normal[2] = Q2GX_BSPReadLEFloat(plane + 8);
+        world_face->dist = Q2GX_BSPReadLEFloat(plane + 12);
+        world_face->plane_back = side ? true : false;
+        world_face->pvs_visible_this_frame = false;
+        world_face->visible_this_frame = false;
+
+        if (!Q2GX_BSPResolveVertex(
+                vertex_data, vertex_count,
+                edge_data, edge_count,
+                surfedge_data, surfedge_count,
+                firstedge, 0u, fan_origin))
+            goto fail;
+
+        red = (u8)(64u + (face_index * 53u) % 160u);
+        green = (u8)(64u + (face_index * 97u) % 160u);
+        blue = (u8)(64u + (face_index * 151u) % 160u);
+
+        for (triangle = 1u; triangle + 1u < numedges; ++triangle)
+        {
+            f32 p1[3], p2[3];
             q2gx_world_vertex_t *out;
 
-            if (
+            if (!Q2GX_BSPResolveVertex(
+                    vertex_data, vertex_count,
+                    edge_data, edge_count,
+                    surfedge_data, surfedge_count,
+                    firstedge, triangle, p1) ||
                 !Q2GX_BSPResolveVertex(
-                    vertex_data,
-                    vertex_count,
-                    edge_data,
-                    edge_count,
-                    surfedge_data,
-                    surfedge_count,
-                    firstedge,
-                    triangle,
-                    p1
-                )
-                ||
-                !Q2GX_BSPResolveVertex(
-                    vertex_data,
-                    vertex_count,
-                    edge_data,
-                    edge_count,
-                    surfedge_data,
-                    surfedge_count,
-                    firstedge,
-                    triangle + 1u,
-                    p2
-                )
-            )
-            {
+                    vertex_data, vertex_count,
+                    edge_data, edge_count,
+                    surfedge_data, surfedge_count,
+                    firstedge, triangle + 1u, p2))
                 goto fail;
-            }
 
-            if (
-                output_index + 3u >
-                gx_vertex_count
-            )
-            {
+            if (output_index + 3u > gx_vertex_count)
                 goto fail;
-            }
 
-            out =
-                &world_vertices[
-                    output_index
-                ];
+            out = &world_vertices[output_index];
 
 #define Q2GX_STORE_WORLD_VERTEX(dst, src) \
-            do \
-            { \
+            do { \
                 (dst)->x = (src)[0]; \
                 (dst)->y = (src)[1]; \
                 (dst)->z = (src)[2]; \
@@ -3258,130 +2987,91 @@ static qboolean Q2GX_LoadWorldGeometry(
                 (dst)->a = 255u; \
             } while (0)
 
-            Q2GX_STORE_WORLD_VERTEX(
-                &out[0],
-                fan_origin
-            );
-
-            Q2GX_STORE_WORLD_VERTEX(
-                &out[1],
-                p1
-            );
-
-            Q2GX_STORE_WORLD_VERTEX(
-                &out[2],
-                p2
-            );
-
+            Q2GX_STORE_WORLD_VERTEX(&out[0], fan_origin);
+            Q2GX_STORE_WORLD_VERTEX(&out[1], p1);
+            Q2GX_STORE_WORLD_VERTEX(&out[2], p2);
 #undef Q2GX_STORE_WORLD_VERTEX
-
-            output_index +=
-                3u;
+            output_index += 3u;
         }
 
-        if (
-            output_index
-            -
-            world_face->first_vertex
-            !=
-            world_face->vertex_count
-        )
+        if (output_index - world_face->first_vertex != world_face->vertex_count)
         {
-            ri.Con_Printf(
-                PRINT_ALL,
-                "Q2GC REF_GX WORLD: "
-                "face %u vertex range mismatch\n",
-                face_index
-            );
-
+            ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: face %u vertex range mismatch\n", face_index);
             goto fail;
         }
     }
 
-    if (
-        output_index !=
-        gx_vertex_count
-    )
-    {
+    if (output_index != gx_vertex_count)
         goto fail;
-    }
 
-    q2gx_world_vertices =
-        world_vertices;
+    q2gx_world_vertices = world_vertices;
+    q2gx_world_faces = world_faces;
+    q2gx_world_nodes = world_nodes;
+    q2gx_world_leaves = world_leaves;
+    q2gx_world_leaffaces = world_leaffaces;
+    q2gx_world_vis_data = world_vis_data;
+    q2gx_world_vis_pvs_offsets = world_vis_pvs_offsets;
+    q2gx_world_pvs_row = world_pvs_row;
+    q2gx_world_pvs_row2 = world_pvs_row2;
 
-    q2gx_world_faces =
-        world_faces;
+    q2gx_world_vertex_count = gx_vertex_count;
+    q2gx_world_triangle_count = triangle_count;
+    q2gx_world_face_count = face_count;
+    q2gx_world_plane_count = plane_count;
+    q2gx_world_node_count = node_count;
+    q2gx_world_leaf_count = leaf_count;
+    q2gx_world_leafface_count = leafface_count;
+    q2gx_world_vis_bytes = visibility_bytes;
+    q2gx_world_vis_numclusters = vis_numclusters;
+    q2gx_world_vis_row_bytes = vis_row_bytes;
+    q2gx_world_bytes = allocation_bytes;
+    q2gx_world_face_bytes = face_allocation_bytes;
+    q2gx_world_last_cluster = INT32_MIN;
+    q2gx_world_last_cluster2 = INT32_MIN;
 
-    q2gx_world_vertex_count =
-        gx_vertex_count;
-
-    q2gx_world_triangle_count =
-        triangle_count;
-
-    q2gx_world_face_count =
-        face_count;
-
-    q2gx_world_plane_count =
-        plane_count;
-
-    q2gx_world_bytes =
-        allocation_bytes;
-
-    q2gx_world_face_bytes =
-        face_allocation_bytes;
-
-    memcpy(
-        q2gx_world_name,
-        path,
-        strlen(path) + 1
-    );
+    memcpy(q2gx_world_name, path, strlen(path) + 1);
 
     ri.Con_Printf(
         PRINT_ALL,
-        "Q2GC REF_GX WORLD LOAD: "
-        "%s planes=%u faces=%u triangles=%u "
-        "vertices=%u vertex_bytes=%u "
-        "face_bytes=%u backface_metadata=1\n",
+        "Q2GC REF_GX WORLD LOAD: %s planes=%u nodes=%u leaves=%u leaffaces=%u "
+        "clusters=%u visrow=%u faces=%u triangles=%u vertices=%u "
+        "pvs_metadata=1 backface_metadata=1\n",
         q2gx_world_name,
         q2gx_world_plane_count,
+        q2gx_world_node_count,
+        q2gx_world_leaf_count,
+        q2gx_world_leafface_count,
+        q2gx_world_vis_numclusters,
+        q2gx_world_vis_row_bytes,
         q2gx_world_face_count,
         q2gx_world_triangle_count,
-        q2gx_world_vertex_count,
-        (unsigned int)
-            q2gx_world_bytes,
-        (unsigned int)
-            q2gx_world_face_bytes
-    );
+        q2gx_world_vertex_count);
 
-    ri.FS_FreeFile(
-        file_buffer
-    );
+    world_vertices = NULL;
+    world_faces = NULL;
+    world_nodes = NULL;
+    world_leaves = NULL;
+    world_leaffaces = NULL;
+    world_vis_data = NULL;
+    world_vis_pvs_offsets = NULL;
+    world_pvs_row = NULL;
+    world_pvs_row2 = NULL;
 
+    ri.FS_FreeFile(file_buffer);
     return true;
 
-
 fail:
-
-    if (world_vertices)
-    {
-        free(
-            world_vertices
-        );
-    }
-
-    if (world_faces)
-    {
-        free(
-            world_faces
-        );
-    }
-
-    ri.FS_FreeFile(
-        file_buffer
-    );
-
+    if (world_vertices) free(world_vertices);
+    if (world_faces) free(world_faces);
+    if (world_nodes) free(world_nodes);
+    if (world_leaves) free(world_leaves);
+    if (world_leaffaces) free(world_leaffaces);
+    if (world_vis_data) free(world_vis_data);
+    if (world_vis_pvs_offsets) free(world_vis_pvs_offsets);
+    if (world_pvs_row) free(world_pvs_row);
+    if (world_pvs_row2) free(world_pvs_row2);
+    ri.FS_FreeFile(file_buffer);
     Q2GX_FreeWorldGeometry();
-
     return false;
 }
 
@@ -3593,6 +3283,255 @@ static void Q2GX_SetupWorld3D(
 }
 
 
+static unsigned int Q2GX_MarkAllWorldFacesPVS(void)
+{
+    unsigned int face_index;
+    for (face_index = 0u; face_index < q2gx_world_face_count; ++face_index)
+        q2gx_world_faces[face_index].pvs_visible_this_frame = true;
+    return q2gx_world_face_count;
+}
+
+static int Q2GX_PointInLeaf(const f32 point[3])
+{
+    int node_index = 0;
+    unsigned int safety = 0u;
+
+    if (!point || !q2gx_world_nodes || !q2gx_world_leaves ||
+        q2gx_world_node_count == 0u || q2gx_world_leaf_count == 0u)
+        return -1;
+
+    for (;;)
+    {
+        const q2gx_world_node_t *node;
+        f32 dot;
+        int child;
+
+        ++safety;
+        if (safety > q2gx_world_node_count + 64u)
+            return -1;
+        if (node_index < 0 || (unsigned int)node_index >= q2gx_world_node_count)
+            return -1;
+
+        node = &q2gx_world_nodes[node_index];
+        if (node->type >= 0 && node->type < 3)
+            dot = point[node->type] - node->dist;
+        else
+            dot = point[0] * node->normal[0] +
+                  point[1] * node->normal[1] +
+                  point[2] * node->normal[2] - node->dist;
+
+        child = node->children[dot > 0.0f ? 0 : 1];
+        if (child >= 0)
+        {
+            node_index = child;
+            continue;
+        }
+        if (child == INT32_MIN)
+            return -1;
+        node_index = -1 - child;
+        if (node_index < 0 || (unsigned int)node_index >= q2gx_world_leaf_count)
+            return -1;
+        return node_index;
+    }
+}
+
+static qboolean Q2GX_DecompressClusterPVS(int cluster, byte *output)
+{
+    unsigned int source_offset;
+    unsigned int output_offset;
+    int32_t compressed_offset;
+
+    if (!output || q2gx_world_vis_row_bytes == 0u)
+        return false;
+
+    if (cluster == -1 || !q2gx_world_vis_data || !q2gx_world_vis_pvs_offsets ||
+        q2gx_world_vis_numclusters == 0u)
+    {
+        memset(output, 0xff, q2gx_world_vis_row_bytes);
+        return true;
+    }
+
+    if (cluster < 0 || (unsigned int)cluster >= q2gx_world_vis_numclusters)
+        return false;
+
+    compressed_offset = q2gx_world_vis_pvs_offsets[cluster];
+    if (compressed_offset < 0)
+    {
+        memset(output, 0xff, q2gx_world_vis_row_bytes);
+        return true;
+    }
+    if ((unsigned int)compressed_offset >= q2gx_world_vis_bytes)
+        return false;
+
+    source_offset = (unsigned int)compressed_offset;
+    output_offset = 0u;
+
+    while (output_offset < q2gx_world_vis_row_bytes)
+    {
+        byte value;
+        if (source_offset >= q2gx_world_vis_bytes)
+            return false;
+        value = q2gx_world_vis_data[source_offset++];
+        if (value)
+        {
+            output[output_offset++] = value;
+            continue;
+        }
+        else
+        {
+            unsigned int zero_count;
+            if (source_offset >= q2gx_world_vis_bytes)
+                return false;
+            zero_count = q2gx_world_vis_data[source_offset++];
+            if (zero_count == 0u ||
+                zero_count > q2gx_world_vis_row_bytes - output_offset)
+                return false;
+            memset(output + output_offset, 0, zero_count);
+            output_offset += zero_count;
+        }
+    }
+
+    return true;
+}
+
+static unsigned int Q2GX_MarkWorldPVS(
+    const refdef_t *fd,
+    int *leaf_index_out,
+    int *cluster_out,
+    int *cluster2_out,
+    qboolean *fallback_out)
+{
+    unsigned int face_index;
+    int leaf_index;
+    int cluster;
+    int cluster2;
+    unsigned int marked_faces = 0u;
+
+    if (leaf_index_out) *leaf_index_out = -1;
+    if (cluster_out) *cluster_out = -1;
+    if (cluster2_out) *cluster2_out = -1;
+    if (fallback_out) *fallback_out = false;
+
+    for (face_index = 0u; face_index < q2gx_world_face_count; ++face_index)
+        q2gx_world_faces[face_index].pvs_visible_this_frame = false;
+
+    if (!fd || !q2gx_world_nodes || !q2gx_world_leaves || !q2gx_world_leaffaces ||
+        !q2gx_world_vis_data || !q2gx_world_vis_pvs_offsets ||
+        !q2gx_world_pvs_row || !q2gx_world_pvs_row2 ||
+        q2gx_world_vis_numclusters == 0u || q2gx_world_vis_row_bytes == 0u)
+    {
+        if (fallback_out) *fallback_out = true;
+        return Q2GX_MarkAllWorldFacesPVS();
+    }
+
+    leaf_index = Q2GX_PointInLeaf(fd->vieworg);
+    if (leaf_index < 0 || (unsigned int)leaf_index >= q2gx_world_leaf_count)
+    {
+        if (fallback_out) *fallback_out = true;
+        return Q2GX_MarkAllWorldFacesPVS();
+    }
+
+    cluster = q2gx_world_leaves[leaf_index].cluster;
+    cluster2 = cluster;
+
+    {
+        f32 temp[3];
+        int second_leaf_index;
+        const q2gx_world_leaf_t *view_leaf = &q2gx_world_leaves[leaf_index];
+
+        temp[0] = fd->vieworg[0];
+        temp[1] = fd->vieworg[1];
+        temp[2] = fd->vieworg[2];
+
+        if (!view_leaf->contents)
+            temp[2] -= 16.0f;
+        else
+            temp[2] += 16.0f;
+
+        second_leaf_index = Q2GX_PointInLeaf(temp);
+        if (second_leaf_index >= 0 &&
+            (unsigned int)second_leaf_index < q2gx_world_leaf_count)
+        {
+            const q2gx_world_leaf_t *second_leaf =
+                &q2gx_world_leaves[second_leaf_index];
+
+            if (!(second_leaf->contents & CONTENTS_SOLID) &&
+                second_leaf->cluster != cluster2)
+            {
+                cluster2 = second_leaf->cluster;
+            }
+        }
+    }
+
+    if (leaf_index_out) *leaf_index_out = leaf_index;
+    if (cluster_out) *cluster_out = cluster;
+    if (cluster2_out) *cluster2_out = cluster2;
+
+    if (cluster == -1)
+    {
+        if (fallback_out) *fallback_out = true;
+        return Q2GX_MarkAllWorldFacesPVS();
+    }
+
+    if (!Q2GX_DecompressClusterPVS(cluster, q2gx_world_pvs_row))
+    {
+        if (fallback_out) *fallback_out = true;
+        return Q2GX_MarkAllWorldFacesPVS();
+    }
+
+    if (cluster2 != cluster)
+    {
+        unsigned int byte_index;
+        if (cluster2 == -1 ||
+            !Q2GX_DecompressClusterPVS(cluster2, q2gx_world_pvs_row2))
+        {
+            if (fallback_out) *fallback_out = true;
+            return Q2GX_MarkAllWorldFacesPVS();
+        }
+
+        for (byte_index = 0u; byte_index < q2gx_world_vis_row_bytes; ++byte_index)
+            q2gx_world_pvs_row[byte_index] |= q2gx_world_pvs_row2[byte_index];
+    }
+
+    for (face_index = 0u; face_index < q2gx_world_leaf_count; ++face_index)
+    {
+        const q2gx_world_leaf_t *leaf = &q2gx_world_leaves[face_index];
+        unsigned int reference_index;
+
+        if (leaf->cluster < 0)
+            continue;
+        if ((unsigned int)leaf->cluster >= q2gx_world_vis_numclusters)
+        {
+            if (fallback_out) *fallback_out = true;
+            return Q2GX_MarkAllWorldFacesPVS();
+        }
+
+        if (!(q2gx_world_pvs_row[(unsigned int)leaf->cluster >> 3] &
+              (1u << ((unsigned int)leaf->cluster & 7u))))
+            continue;
+
+        for (reference_index = leaf->first_leafface;
+             reference_index < leaf->first_leafface + leaf->num_leaffaces;
+             ++reference_index)
+        {
+            unsigned int referenced_face = q2gx_world_leaffaces[reference_index];
+            if (referenced_face >= q2gx_world_face_count)
+            {
+                if (fallback_out) *fallback_out = true;
+                return Q2GX_MarkAllWorldFacesPVS();
+            }
+
+            if (!q2gx_world_faces[referenced_face].pvs_visible_this_frame)
+            {
+                q2gx_world_faces[referenced_face].pvs_visible_this_frame = true;
+                ++marked_faces;
+            }
+        }
+    }
+
+    return marked_faces;
+}
+
 static qboolean Q2GX_WorldFaceIsVisible(
     q2gx_world_face_t *face,
     const refdef_t *fd)
@@ -3652,402 +3591,228 @@ static void Q2GX_DrawFlatWorld(
     refdef_t *fd)
 {
     unsigned int face_index;
-
+    unsigned int pvs_faces;
+    unsigned int pvs_rejected_faces;
+    unsigned int backface_rejected_faces;
     unsigned int submitted_faces;
-    unsigned int rejected_faces;
-
     unsigned int submitted_triangles;
     unsigned int submitted_vertices;
-
     unsigned int remaining_vertices;
-
     unsigned int stream_face;
     unsigned int face_vertex_offset;
+    int leaf_index = -1;
+    int cluster = -1;
+    int cluster2 = -1;
+    qboolean pvs_fallback = false;
 
-    if (
-        !fd ||
-        !q2gx_world_vertices ||
-        !q2gx_world_faces ||
-        q2gx_world_vertex_count == 0u ||
-        q2gx_world_face_count == 0u
-    )
+    if (!fd || !q2gx_world_vertices || !q2gx_world_faces ||
+        q2gx_world_vertex_count == 0u || q2gx_world_face_count == 0u)
+        return;
+
+    if (fd->rdflags & RDF_NOWORLDMODEL)
+        return;
+
+    pvs_faces = Q2GX_MarkWorldPVS(
+        fd, &leaf_index, &cluster, &cluster2, &pvs_fallback);
+
+    if (pvs_faces > q2gx_world_face_count)
     {
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: marked face count exceeds total\n");
         return;
     }
 
-    if (
-        fd->rdflags
-        &
-        RDF_NOWORLDMODEL
-    )
+    pvs_rejected_faces = q2gx_world_face_count - pvs_faces;
+    backface_rejected_faces = 0u;
+    submitted_faces = 0u;
+    submitted_triangles = 0u;
+    submitted_vertices = 0u;
+
+    for (face_index = 0u; face_index < q2gx_world_face_count; ++face_index)
     {
-        return;
-    }
+        q2gx_world_face_t *face = &q2gx_world_faces[face_index];
+        face->visible_this_frame = false;
 
-    submitted_faces =
-        0u;
+        if (!face->pvs_visible_this_frame)
+            continue;
 
-    rejected_faces =
-        0u;
-
-    submitted_triangles =
-        0u;
-
-    submitted_vertices =
-        0u;
-
-    /*
-     * Pass 1:
-     *
-     * evaluate exactly one BSP plane-side test per face,
-     * retain visibility for the streaming pass, and determine
-     * the exact GX primitive vertex count.
-     */
-    for (face_index = 0u;
-         face_index < q2gx_world_face_count;
-         ++face_index)
-    {
-        q2gx_world_face_t *face;
-
-        face =
-            &q2gx_world_faces[
-                face_index
-            ];
-
-        face->visible_this_frame =
-            Q2GX_WorldFaceIsVisible(
-                face,
-                fd
-            );
-
-        if (
-            face->visible_this_frame
-        )
+        face->visible_this_frame = Q2GX_WorldFaceIsVisible(face, fd);
+        if (face->visible_this_frame)
         {
             ++submitted_faces;
-
-            submitted_triangles +=
-                face->triangle_count;
-
-            submitted_vertices +=
-                face->vertex_count;
+            submitted_triangles += face->triangle_count;
+            submitted_vertices += face->vertex_count;
         }
         else
         {
-            ++rejected_faces;
+            ++backface_rejected_faces;
         }
     }
 
-    if (
-        submitted_faces
-        +
-        rejected_faces
-        !=
-        q2gx_world_face_count
-    )
+    if (submitted_faces + backface_rejected_faces != pvs_faces)
     {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX BACKFACE: "
-            "face accounting mismatch\n"
-        );
-
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: PVS/backface accounting mismatch\n");
         return;
     }
 
-    if (
-        submitted_vertices
-        !=
-        submitted_triangles * 3u
-    )
+    if (pvs_faces + pvs_rejected_faces != q2gx_world_face_count)
     {
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX BACKFACE: "
-            "triangle accounting mismatch\n"
-        );
-
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: total face accounting mismatch\n");
         return;
     }
 
-    Q2GX_SetupWorld3D(
-        fd
-    );
-
-    /*
-     * Pass 2:
-     *
-     * stream accepted face ranges into triangle-aligned
-     * GX_Begin chunks.
-     *
-     * We keep GX_CULL_NONE deliberately; the CPU test is the
-     * only new rejection mechanism in this milestone.
-     */
-    remaining_vertices =
-        submitted_vertices;
-
-    stream_face =
-        0u;
-
-    face_vertex_offset =
-        0u;
-
-    while (
-        remaining_vertices >
-        0u
-    )
+    if (submitted_vertices != submitted_triangles * 3u)
     {
-        unsigned int chunk;
-        unsigned int emitted;
+        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: triangle accounting mismatch\n");
+        return;
+    }
 
-        chunk =
-            remaining_vertices;
+    Q2GX_SetupWorld3D(fd);
 
-        if (
-            chunk >
-            65532u
-        )
-        {
-            chunk =
-                65532u;
-        }
+    remaining_vertices = submitted_vertices;
+    stream_face = 0u;
+    face_vertex_offset = 0u;
 
-        chunk -=
-            chunk % 3u;
+    while (remaining_vertices > 0u)
+    {
+        unsigned int chunk = remaining_vertices;
+        unsigned int emitted = 0u;
 
-        if (
-            chunk == 0u
-        )
-        {
+        if (chunk > 65532u)
+            chunk = 65532u;
+        chunk -= chunk % 3u;
+        if (chunk == 0u)
             break;
-        }
 
-        GX_Begin(
-            GX_TRIANGLES,
-            GX_VTXFMT0,
-            (u16)chunk
-        );
+        GX_Begin(GX_TRIANGLES, GX_VTXFMT0, (u16)chunk);
 
-        emitted =
-            0u;
-
-        while (
-            emitted <
-            chunk
-        )
+        while (emitted < chunk)
         {
             q2gx_world_face_t *face;
-
             unsigned int available;
             unsigned int take;
             unsigned int index;
 
-            while (
-                stream_face <
-                q2gx_world_face_count
-                &&
-                !q2gx_world_faces[
-                    stream_face
-                ].visible_this_frame
-            )
+            while (stream_face < q2gx_world_face_count &&
+                   !q2gx_world_faces[stream_face].visible_this_frame)
             {
                 ++stream_face;
-
-                face_vertex_offset =
-                    0u;
+                face_vertex_offset = 0u;
             }
 
-            if (
-                stream_face >=
-                q2gx_world_face_count
-            )
-            {
+            if (stream_face >= q2gx_world_face_count)
                 break;
-            }
 
-            face =
-                &q2gx_world_faces[
-                    stream_face
-                ];
+            face = &q2gx_world_faces[stream_face];
+            available = face->vertex_count - face_vertex_offset;
+            take = chunk - emitted;
+            if (take > available)
+                take = available;
 
-            available =
-                face->vertex_count
-                -
-                face_vertex_offset;
-
-            take =
-                chunk
-                -
-                emitted;
-
-            if (
-                take >
-                available
-            )
+            for (index = 0u; index < take; ++index)
             {
-                take =
-                    available;
-            }
-
-            for (index = 0u;
-                 index < take;
-                 ++index)
-            {
-                const q2gx_world_vertex_t *vertex;
-
-                vertex =
+                const q2gx_world_vertex_t *vertex =
                     &q2gx_world_vertices[
-                        face->first_vertex
-                        +
-                        face_vertex_offset
-                        +
-                        index
-                    ];
+                        face->first_vertex + face_vertex_offset + index];
 
-                GX_Position3f32(
-                    vertex->x,
-                    vertex->y,
-                    vertex->z
-                );
-
-                GX_Color4u8(
-                    vertex->r,
-                    vertex->g,
-                    vertex->b,
-                    vertex->a
-                );
+                GX_Position3f32(vertex->x, vertex->y, vertex->z);
+                GX_Color4u8(vertex->r, vertex->g, vertex->b, vertex->a);
             }
 
-            emitted +=
-                take;
+            emitted += take;
+            face_vertex_offset += take;
 
-            face_vertex_offset +=
-                take;
-
-            if (
-                face_vertex_offset ==
-                face->vertex_count
-            )
+            if (face_vertex_offset == face->vertex_count)
             {
                 ++stream_face;
-
-                face_vertex_offset =
-                    0u;
+                face_vertex_offset = 0u;
             }
         }
 
         GX_End();
 
-        if (
-            emitted !=
-            chunk
-        )
+        if (emitted != chunk)
         {
             ri.Con_Printf(
                 PRINT_ALL,
-                "Q2GC REF_GX BACKFACE: "
-                "stream accounting mismatch "
-                "emitted=%u chunk=%u\n",
-                emitted,
-                chunk
-            );
-
+                "Q2GC REF_GX PVS: stream accounting mismatch emitted=%u chunk=%u\n",
+                emitted, chunk);
             break;
         }
 
-        remaining_vertices -=
-            chunk;
+        remaining_vertices -= chunk;
     }
 
     ++q2gx_world_frames_window;
+    q2gx_world_pvs_faces_window += pvs_faces;
+    q2gx_world_pvs_rejected_faces_window += pvs_rejected_faces;
+    q2gx_world_backface_rejected_faces_window += backface_rejected_faces;
+    q2gx_world_submitted_faces_window += submitted_faces;
+    q2gx_world_submitted_triangles_window += submitted_triangles;
+    q2gx_world_submitted_vertices_window += submitted_vertices;
 
-    q2gx_world_submitted_faces_window +=
-        submitted_faces;
+    if (pvs_fallback)
+        ++q2gx_world_pvs_fallback_frames_window;
 
-    q2gx_world_rejected_faces_window +=
-        rejected_faces;
-
-    q2gx_world_submitted_triangles_window +=
-        submitted_triangles;
-
-    q2gx_world_submitted_vertices_window +=
-        submitted_vertices;
-
-    if (
-        !q2gx_world_first_draw_logged
-    )
+    if (cluster != q2gx_world_last_cluster || cluster2 != q2gx_world_last_cluster2)
     {
-        q2gx_world_first_draw_logged =
-            true;
-
-        ri.Con_Printf(
-            PRINT_ALL,
-            "Q2GC REF_GX BACKFACE FIRST DRAW: "
-            "%s "
-            "vieworg=%.1f,%.1f,%.1f "
-            "total_faces=%u "
-            "submitted_faces=%u "
-            "rejected_faces=%u "
-            "submitted_triangles=%u "
-            "submitted_vertices=%u "
-            "mode=cpu_plane_side\n",
-            q2gx_world_name,
-            fd->vieworg[0],
-            fd->vieworg[1],
-            fd->vieworg[2],
-            q2gx_world_face_count,
-            submitted_faces,
-            rejected_faces,
-            submitted_triangles,
-            submitted_vertices
-        );
+        ++q2gx_world_cluster_changes_window;
+        q2gx_world_last_cluster = cluster;
+        q2gx_world_last_cluster2 = cluster2;
     }
 
-    if (
-        q2gx_world_frames_window >=
-        120u
-    )
+    if (!q2gx_world_first_draw_logged)
+    {
+        q2gx_world_first_draw_logged = true;
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PVS FIRST DRAW: %s leaf=%d cluster=%d cluster2=%d "
+            "total_faces=%u pvs_faces=%u pvs_rejected=%u backface_rejected=%u "
+            "submitted_faces=%u submitted_triangles=%u submitted_vertices=%u "
+            "fallback=%u mode=minimal_pvs_face_marking\n",
+            q2gx_world_name,
+            leaf_index, cluster, cluster2,
+            q2gx_world_face_count,
+            pvs_faces,
+            pvs_rejected_faces,
+            backface_rejected_faces,
+            submitted_faces,
+            submitted_triangles,
+            submitted_vertices,
+            pvs_fallback ? 1u : 0u);
+    }
+
+    if (q2gx_world_frames_window >= 120u)
     {
         ri.Con_Printf(
             PRINT_ALL,
-            "Q2GC REF_GX BACKFACE 120: "
-            "frames=%u "
-            "total_faces=%u "
-            "submitted_faces_total=%u "
-            "rejected_faces_total=%u "
-            "submitted_triangles_total=%u "
-            "submitted_vertices_total=%u "
-            "mode=cpu_plane_side\n",
+            "Q2GC REF_GX PVS 120: frames=%u total_faces=%u pvs_faces_total=%u "
+            "pvs_rejected_total=%u backface_rejected_total=%u submitted_faces_total=%u "
+            "submitted_triangles_total=%u submitted_vertices_total=%u fallback_frames=%u "
+            "cluster_changes=%u cluster=%d cluster2=%d mode=minimal_pvs_face_marking\n",
             q2gx_world_frames_window,
             q2gx_world_face_count,
+            q2gx_world_pvs_faces_window,
+            q2gx_world_pvs_rejected_faces_window,
+            q2gx_world_backface_rejected_faces_window,
             q2gx_world_submitted_faces_window,
-            q2gx_world_rejected_faces_window,
             q2gx_world_submitted_triangles_window,
-            q2gx_world_submitted_vertices_window
-        );
+            q2gx_world_submitted_vertices_window,
+            q2gx_world_pvs_fallback_frames_window,
+            q2gx_world_cluster_changes_window,
+            q2gx_world_last_cluster,
+            q2gx_world_last_cluster2);
 
-        q2gx_world_frames_window =
-            0u;
-
-        q2gx_world_submitted_faces_window =
-            0u;
-
-        q2gx_world_rejected_faces_window =
-            0u;
-
-        q2gx_world_submitted_triangles_window =
-            0u;
-
-        q2gx_world_submitted_vertices_window =
-            0u;
+        q2gx_world_frames_window = 0u;
+        q2gx_world_pvs_faces_window = 0u;
+        q2gx_world_pvs_rejected_faces_window = 0u;
+        q2gx_world_backface_rejected_faces_window = 0u;
+        q2gx_world_submitted_faces_window = 0u;
+        q2gx_world_submitted_triangles_window = 0u;
+        q2gx_world_submitted_vertices_window = 0u;
+        q2gx_world_pvs_fallback_frames_window = 0u;
+        q2gx_world_cluster_changes_window = 0u;
     }
 
-    /*
-     * HUD/menu rendering follows RenderFrame.
-     *
-     * Preserve the proven 3D -> 2D transition and the V1c
-     * end-of-frame color/Z clear contract.
-     */
     Q2GX_Setup2D();
 }
 
