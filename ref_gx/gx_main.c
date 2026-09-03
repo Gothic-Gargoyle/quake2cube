@@ -328,6 +328,42 @@ typedef struct q2gx_world_texinfo_s
  * Q2GC_WAL_WORLD_TEXTURES_V1
  * Unique static ordinary WAL mip0 converted to GX RGBA8.
  */
+/*
+ * Q2GC_BRUSH_ENTITIES_V1
+ *
+ * client/ref.h deliberately exposes model_s as opaque.  ref_gx
+ * therefore owns a tiny handle type sufficient for the renderer
+ * families it has actually implemented.
+ */
+#define Q2GX_MODEL_HANDLE_MAGIC 0x51324758u
+#define Q2GX_MODEL_KIND_WORLD 1u
+#define Q2GX_MODEL_KIND_INLINE_BSP 2u
+#define Q2GX_BRUSH_BACKFACE_EPSILON 0.01f
+
+struct model_s
+{
+    uint32_t magic;
+    unsigned int kind;
+    unsigned int model_index;
+};
+
+typedef struct q2gx_brush_model_s
+{
+    struct model_s handle;
+
+    f32 mins[3];
+    f32 maxs[3];
+    f32 origin[3];
+
+    int headnode;
+
+    unsigned int first_face;
+    unsigned int face_count;
+
+    qboolean registered;
+} q2gx_brush_model_t;
+
+
 typedef struct q2gx_world_wal_texture_s
 {
     char name[33];
@@ -425,6 +461,24 @@ static q2gx_world_vertex_t *q2gx_world_vertices;
 static unsigned int q2gx_world_vertex_count;
 static unsigned int q2gx_world_triangle_count;
 static unsigned int q2gx_world_face_count;
+
+static unsigned int q2gx_world_static_first_face;
+static unsigned int q2gx_world_static_face_count;
+
+static q2gx_brush_model_t *q2gx_brush_models;
+static unsigned int q2gx_brush_model_count;
+static unsigned int q2gx_brush_registered_inline_count;
+
+static qboolean q2gx_brush_first_draw_logged;
+
+static unsigned int q2gx_brush_entities_window;
+static unsigned int q2gx_brush_faces_tested_window;
+static unsigned int q2gx_brush_backface_rejected_window;
+static unsigned int q2gx_brush_visible_faces_window;
+static unsigned int q2gx_brush_textured_faces_window;
+static unsigned int q2gx_brush_fallback_faces_window;
+static unsigned int q2gx_brush_wal_binds_window;
+static unsigned int q2gx_brush_vertices_window;
 static unsigned int q2gx_world_plane_count;
 
 static size_t q2gx_world_bytes;
@@ -2293,6 +2347,7 @@ static void Q2GX_ClearPicCache(void)
 #define Q2GX_BSP_LUMP_PLANES       1
 #define Q2GX_BSP_LUMP_VERTEXES     2
 #define Q2GX_BSP_LUMP_TEXINFO       5
+#define Q2GX_BSP_LUMP_MODELS 13u
 #define Q2GX_BSP_LUMP_VISIBILITY   3
 #define Q2GX_BSP_LUMP_NODES        4
 #define Q2GX_BSP_LUMP_FACES        6
@@ -3200,12 +3255,49 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_world_wal_batch_vertices_window =
         0u;
 
+
+
+    if (q2gx_brush_models)
+    {
+        free(
+            q2gx_brush_models
+        );
+
+        q2gx_brush_models = NULL;
+    }
+
+    q2gx_brush_model_count = 0u;
+    q2gx_brush_registered_inline_count = 0u;
+
+    q2gx_world_static_first_face = 0u;
+    q2gx_world_static_face_count = 0u;
+
+    q2gx_brush_first_draw_logged = false;
+
+    q2gx_brush_entities_window = 0u;
+    q2gx_brush_faces_tested_window = 0u;
+    q2gx_brush_backface_rejected_window = 0u;
+    q2gx_brush_visible_faces_window = 0u;
+    q2gx_brush_textured_faces_window = 0u;
+    q2gx_brush_fallback_faces_window = 0u;
+    q2gx_brush_wal_binds_window = 0u;
+    q2gx_brush_vertices_window = 0u;
 }
 
 
 static qboolean Q2GX_LoadWorldGeometry(
     const char *map)
 {
+    const byte *model_data = NULL;
+    unsigned int model_bytes = 0u;
+    unsigned int model_count = 0u;
+
+    q2gx_brush_model_t *world_brush_models = NULL;
+
+    unsigned int world_model_first_face = 0u;
+    unsigned int world_model_face_count = 0u;
+
+
     unsigned int *wal_face_fill_counts = NULL;
 
     unsigned int wal_batched_face_count = 0u;
@@ -3356,6 +3448,206 @@ static qboolean Q2GX_LoadWorldGeometry(
     }
 
     (void)visibility_count;
+    if (
+        !Q2GX_BSPGetLump(
+            file_data,
+            file_length,
+            Q2GX_BSP_LUMP_MODELS,
+            48u,
+            &model_data,
+            &model_bytes,
+            &model_count
+        )
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH: invalid MODELS lump in %s\n",
+            path
+        );
+
+        goto fail;
+    }
+
+    if (model_count == 0u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH: map has no BSP models\n"
+        );
+
+        goto fail;
+    }
+
+    world_brush_models =
+        calloc(
+            model_count,
+            sizeof(*world_brush_models)
+        );
+
+    if (!world_brush_models)
+        goto fail;
+
+    {
+        unsigned int model_index;
+
+        for (
+            model_index = 0u;
+            model_index < model_count;
+            ++model_index
+        )
+        {
+            const byte *disk_model =
+                model_data
+                +
+                model_index * 48u;
+
+            q2gx_brush_model_t *brush_model =
+                &world_brush_models[
+                    model_index
+                ];
+
+            int32_t first_face_signed;
+            int32_t face_count_signed;
+
+            unsigned int axis;
+
+            brush_model->handle.magic =
+                Q2GX_MODEL_HANDLE_MAGIC;
+
+            brush_model->handle.kind =
+                (
+                    model_index == 0u
+                )
+                ?
+                Q2GX_MODEL_KIND_WORLD
+                :
+                Q2GX_MODEL_KIND_INLINE_BSP;
+
+            brush_model->handle.model_index =
+                model_index;
+
+            for (axis = 0u; axis < 3u; ++axis)
+            {
+                brush_model->mins[axis] =
+                    Q2GX_BSPReadLEFloat(
+                        disk_model
+                        +
+                        axis * 4u
+                    )
+                    -
+                    1.0f;
+
+                brush_model->maxs[axis] =
+                    Q2GX_BSPReadLEFloat(
+                        disk_model
+                        +
+                        12u
+                        +
+                        axis * 4u
+                    )
+                    +
+                    1.0f;
+
+                brush_model->origin[axis] =
+                    Q2GX_BSPReadLEFloat(
+                        disk_model
+                        +
+                        24u
+                        +
+                        axis * 4u
+                    );
+            }
+
+            brush_model->headnode =
+                (int)
+                (
+                    (int32_t)
+                    Q2GX_BSPReadLE32(
+                        disk_model + 36u
+                    )
+                );
+
+            first_face_signed =
+                (int32_t)
+                Q2GX_BSPReadLE32(
+                    disk_model + 40u
+                );
+
+            face_count_signed =
+                (int32_t)
+                Q2GX_BSPReadLE32(
+                    disk_model + 44u
+                );
+
+            if (
+                first_face_signed < 0
+                ||
+                face_count_signed < 0
+            )
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BRUSH: "
+                    "model *%u has negative face range\n",
+                    model_index
+                );
+
+                goto fail;
+            }
+
+            brush_model->first_face =
+                (unsigned int)
+                first_face_signed;
+
+            brush_model->face_count =
+                (unsigned int)
+                face_count_signed;
+
+            if (
+                brush_model->first_face
+                >
+                face_count
+                ||
+                brush_model->face_count
+                >
+                face_count
+                -
+                brush_model->first_face
+            )
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BRUSH: "
+                    "model *%u invalid face range "
+                    "first=%u count=%u total=%u\n",
+                    model_index,
+                    brush_model->first_face,
+                    brush_model->face_count,
+                    face_count
+                );
+
+                goto fail;
+            }
+        }
+    }
+
+    world_model_first_face =
+        world_brush_models[0].first_face;
+
+    world_model_face_count =
+        world_brush_models[0].face_count;
+
+    if (world_model_face_count == 0u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH: world model has no faces\n"
+        );
+
+        goto fail;
+    }
+
     (void)plane_bytes;
     (void)vertex_bytes;
     (void)node_bytes;
@@ -4063,8 +4355,12 @@ triangle_count = 0u;
         }
 
         for (
-            face_index = 0u;
-            face_index < face_count;
+            face_index = world_model_first_face;
+            face_index
+            <
+            world_model_first_face
+            +
+            world_model_face_count;
             ++face_index
         )
         {
@@ -4136,15 +4432,12 @@ triangle_count = 0u;
 
             if (batch_texture->face_count == 0u)
             {
-                ri.Con_Printf(
-                    PRINT_ALL,
-                    "Q2GC REF_GX BATCH: "
-                    "cache %u (%s) owns zero faces\n",
-                    texture_index,
-                    batch_texture->name
-                );
-
-                goto fail;
+                /*
+                 * A texture may be used only by an inline BSP
+                 * model. Keep it cached for brush entities, but
+                 * it has no static-world batch list.
+                 */
+                continue;
             }
 
             if (
@@ -4185,8 +4478,12 @@ triangle_count = 0u;
             goto fail;
 
         for (
-            face_index = 0u;
-            face_index < face_count;
+            face_index = world_model_first_face;
+            face_index
+            <
+            world_model_first_face
+            +
+            world_model_face_count;
             ++face_index
         )
         {
@@ -4376,6 +4673,19 @@ q2gx_world_vertices = world_vertices;
     q2gx_world_vertex_count = gx_vertex_count;
     q2gx_world_triangle_count = triangle_count;
     q2gx_world_face_count = face_count;
+
+    q2gx_world_static_first_face =
+        world_model_first_face;
+
+    q2gx_world_static_face_count =
+        world_model_face_count;
+
+    q2gx_brush_models =
+        world_brush_models;
+
+    q2gx_brush_model_count =
+        model_count;
+
     q2gx_world_plane_count = plane_count;
     q2gx_world_node_count = node_count;
     q2gx_world_leaf_count = leaf_count;
@@ -4475,9 +4785,46 @@ q2gx_world_vertices = world_vertices;
         wal_max_batch_vertices
     );
 
+
+    world_brush_models = NULL;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX BRUSH LOAD: "
+        "%s "
+        "models=%u "
+        "inline_models=%u "
+        "world_first_face=%u "
+        "world_faces=%u "
+        "inline_faces=%u "
+        "total_faces=%u "
+        "mode=inline_bsp_model_split\n",
+        q2gx_world_name,
+        q2gx_brush_model_count,
+        q2gx_brush_model_count > 0u
+            ? q2gx_brush_model_count - 1u
+            : 0u,
+        q2gx_world_static_first_face,
+        q2gx_world_static_face_count,
+        q2gx_world_face_count
+            -
+            q2gx_world_static_face_count,
+        q2gx_world_face_count
+    );
+
 return true;
 
 fail:
+
+    if (world_brush_models)
+    {
+        free(
+            world_brush_models
+        );
+
+        world_brush_models = NULL;
+    }
+
 
     if (wal_face_fill_counts)
     {
@@ -4726,12 +5073,59 @@ static void Q2GX_SetupWorld3D(
 }
 
 
+static qboolean Q2GX_IsStaticWorldFaceIndex(
+    unsigned int face_index)
+{
+    return
+        face_index
+        >=
+        q2gx_world_static_first_face
+        &&
+        face_index
+        -
+        q2gx_world_static_first_face
+        <
+        q2gx_world_static_face_count;
+}
+
+
 static unsigned int Q2GX_MarkAllWorldFacesPVS(void)
 {
     unsigned int face_index;
-    for (face_index = 0u; face_index < q2gx_world_face_count; ++face_index)
-        q2gx_world_faces[face_index].pvs_visible_this_frame = true;
-    return q2gx_world_face_count;
+
+    if (!q2gx_world_faces)
+        return 0u;
+
+    for (
+        face_index = 0u;
+        face_index < q2gx_world_face_count;
+        ++face_index
+    )
+    {
+        q2gx_world_faces[
+            face_index
+        ].pvs_visible_this_frame =
+            false;
+    }
+
+    for (
+        face_index = q2gx_world_static_first_face;
+        face_index
+        <
+        q2gx_world_static_first_face
+        +
+        q2gx_world_static_face_count;
+        ++face_index
+    )
+    {
+        q2gx_world_faces[
+            face_index
+        ].pvs_visible_this_frame =
+            true;
+    }
+
+    return
+        q2gx_world_static_face_count;
 }
 
 static int Q2GX_PointInLeaf(const f32 point[3])
@@ -5022,6 +5416,15 @@ for (reference_index = leaf->first_leafface;
                 return Q2GX_MarkAllWorldFacesPVS();
             }
 
+            if (
+                !Q2GX_IsStaticWorldFaceIndex(
+                    referenced_face
+                )
+            )
+            {
+                continue;
+            }
+
             if (!q2gx_world_faces[referenced_face].pvs_visible_this_frame)
             {
                 q2gx_world_faces[referenced_face].pvs_visible_this_frame = true;
@@ -5088,6 +5491,511 @@ static qboolean Q2GX_WorldFaceIsVisible(
 }
 
 
+typedef struct q2gx_brush_transform_s
+{
+    f32 origin[3];
+
+    f32 sin_roll;
+    f32 cos_roll;
+
+    f32 sin_pitch;
+    f32 cos_pitch;
+
+    f32 sin_yaw;
+    f32 cos_yaw;
+} q2gx_brush_transform_t;
+
+
+static void Q2GX_InitBrushTransform(
+    const entity_t *entity,
+    q2gx_brush_transform_t *transform)
+{
+    const f32 degrees_to_radians =
+        0.01745329251994329577f;
+
+    f32 roll;
+    f32 pitch;
+    f32 yaw;
+
+    memset(
+        transform,
+        0,
+        sizeof(*transform)
+    );
+
+    transform->origin[0] = entity->origin[0];
+    transform->origin[1] = entity->origin[1];
+    transform->origin[2] = entity->origin[2];
+
+    roll = entity->angles[2] * degrees_to_radians;
+    pitch = entity->angles[0] * degrees_to_radians;
+    yaw = entity->angles[1] * degrees_to_radians;
+
+    transform->sin_roll = sinf(roll);
+    transform->cos_roll = cosf(roll);
+    transform->sin_pitch = sinf(pitch);
+    transform->cos_pitch = cosf(pitch);
+    transform->sin_yaw = sinf(yaw);
+    transform->cos_yaw = cosf(yaw);
+}
+
+
+static void Q2GX_TransformBrushPoint(
+    const q2gx_brush_transform_t *transform,
+    const q2gx_world_vertex_t *vertex,
+    f32 *world_x,
+    f32 *world_y,
+    f32 *world_z)
+{
+    f32 x1;
+    f32 y1;
+    f32 z1;
+
+    f32 x2;
+    f32 y2;
+    f32 z2;
+
+    /*
+     * Exact stock brush model transform after the historic
+     * R_DrawBrushModel pitch/roll sign workaround:
+     *
+     *   Translate(origin)
+     *   Rotate(+yaw,   Z)
+     *   Rotate(+pitch, Y)
+     *   Rotate(+roll,  X)
+     *
+     * OpenGL composes this as T * Rz * Ry * Rx, so apply
+     * Rx -> Ry -> Rz to each local BSP vertex.
+     */
+    x1 = vertex->x;
+
+    y1 =
+        transform->cos_roll * vertex->y
+        -
+        transform->sin_roll * vertex->z;
+
+    z1 =
+        transform->sin_roll * vertex->y
+        +
+        transform->cos_roll * vertex->z;
+
+    x2 =
+        transform->cos_pitch * x1
+        +
+        transform->sin_pitch * z1;
+
+    y2 = y1;
+
+    z2 =
+        -transform->sin_pitch * x1
+        +
+        transform->cos_pitch * z1;
+
+    *world_x =
+        transform->cos_yaw * x2
+        -
+        transform->sin_yaw * y2
+        +
+        transform->origin[0];
+
+    *world_y =
+        transform->sin_yaw * x2
+        +
+        transform->cos_yaw * y2
+        +
+        transform->origin[1];
+
+    *world_z =
+        z2
+        +
+        transform->origin[2];
+}
+
+
+static qboolean Q2GX_BrushFaceIsVisible(
+    const q2gx_world_face_t *face,
+    const f32 modelorg[3])
+{
+    f32 dot;
+
+    dot =
+        modelorg[0] * face->normal[0]
+        +
+        modelorg[1] * face->normal[1]
+        +
+        modelorg[2] * face->normal[2]
+        -
+        face->dist;
+
+    if (face->plane_back)
+    {
+        return
+            dot
+            <
+            -
+            Q2GX_BRUSH_BACKFACE_EPSILON;
+    }
+
+    return
+        dot
+        >
+        Q2GX_BRUSH_BACKFACE_EPSILON;
+}
+
+
+static void Q2GX_DrawBrushEntities(
+    refdef_t *fd)
+{
+    unsigned int entity_index;
+
+    unsigned int entities_drawn = 0u;
+    unsigned int faces_tested = 0u;
+    unsigned int backface_rejected = 0u;
+    unsigned int visible_faces = 0u;
+    unsigned int textured_faces = 0u;
+    unsigned int fallback_faces = 0u;
+    unsigned int wal_binds = 0u;
+    unsigned int vertices_drawn = 0u;
+
+    if (
+        !fd
+        ||
+        fd->num_entities <= 0
+        ||
+        !fd->entities
+        ||
+        !q2gx_brush_models
+        ||
+        q2gx_brush_model_count <= 1u
+    )
+    {
+        return;
+    }
+
+    for (
+        entity_index = 0u;
+        entity_index < (unsigned int)fd->num_entities;
+        ++entity_index
+    )
+    {
+        entity_t *entity =
+            &fd->entities[
+                entity_index
+            ];
+
+        struct model_s *handle;
+        q2gx_brush_model_t *brush_model;
+        q2gx_brush_transform_t transform;
+        f32 modelorg[3];
+        qboolean rotated;
+        unsigned int local_face;
+
+        if (!entity->model)
+            continue;
+
+        handle = entity->model;
+
+        if (
+            handle->magic != Q2GX_MODEL_HANDLE_MAGIC
+            ||
+            handle->kind != Q2GX_MODEL_KIND_INLINE_BSP
+            ||
+            handle->model_index == 0u
+            ||
+            handle->model_index >= q2gx_brush_model_count
+        )
+        {
+            continue;
+        }
+
+        brush_model =
+            &q2gx_brush_models[
+                handle->model_index
+            ];
+
+        ++entities_drawn;
+
+        rotated =
+            entity->angles[0] != 0.0f
+            ||
+            entity->angles[1] != 0.0f
+            ||
+            entity->angles[2] != 0.0f;
+
+        modelorg[0] = fd->vieworg[0] - entity->origin[0];
+        modelorg[1] = fd->vieworg[1] - entity->origin[1];
+        modelorg[2] = fd->vieworg[2] - entity->origin[2];
+
+        if (rotated)
+        {
+            vec3_t temp;
+            vec3_t forward;
+            vec3_t right;
+            vec3_t up;
+
+            temp[0] = modelorg[0];
+            temp[1] = modelorg[1];
+            temp[2] = modelorg[2];
+
+            AngleVectors(
+                entity->angles,
+                forward,
+                right,
+                up
+            );
+
+            modelorg[0] = DotProduct(temp, forward);
+            modelorg[1] = -DotProduct(temp, right);
+            modelorg[2] = DotProduct(temp, up);
+        }
+
+        Q2GX_InitBrushTransform(
+            entity,
+            &transform
+        );
+
+        for (
+            local_face = 0u;
+            local_face < brush_model->face_count;
+            ++local_face
+        )
+        {
+            unsigned int face_index =
+                brush_model->first_face
+                +
+                local_face;
+
+            q2gx_world_face_t *face;
+            q2gx_world_texinfo_t *texinfo;
+            unsigned int vertex_index;
+            qboolean use_wal;
+
+            if (face_index >= q2gx_world_face_count)
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BRUSH: "
+                    "model *%u face overflow %u\n",
+                    handle->model_index,
+                    face_index
+                );
+
+                return;
+            }
+
+            face =
+                &q2gx_world_faces[
+                    face_index
+                ];
+
+            ++faces_tested;
+
+            if (!Q2GX_BrushFaceIsVisible(face, modelorg))
+            {
+                ++backface_rejected;
+                continue;
+            }
+
+            ++visible_faces;
+
+            texinfo =
+                &q2gx_world_texinfos[
+                    face->texinfo_index
+                ];
+
+            use_wal =
+                !(
+                    face->surface_flags
+                    &
+                    Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+                )
+                &&
+                texinfo->next_texinfo < 0
+                &&
+                texinfo->wal_cache_index >= 0
+                &&
+                (unsigned int)texinfo->wal_cache_index
+                <
+                q2gx_world_wal_texture_count;
+
+            if (use_wal)
+            {
+                Q2GX_BindWorldWALTexture(
+                    &q2gx_world_wal_textures[
+                        (unsigned int)
+                        texinfo->wal_cache_index
+                    ]
+                );
+
+                ++textured_faces;
+                ++wal_binds;
+            }
+            else
+            {
+                Q2GX_BindWorldFlatFallback();
+                ++fallback_faces;
+            }
+
+            if (face->vertex_count > 65535u)
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BRUSH: "
+                    "face %u too large vertices=%u\n",
+                    face_index,
+                    face->vertex_count
+                );
+
+                return;
+            }
+
+            GX_Begin(
+                GX_TRIANGLES,
+                GX_VTXFMT0,
+                (u16)face->vertex_count
+            );
+
+            for (
+                vertex_index = 0u;
+                vertex_index < face->vertex_count;
+                ++vertex_index
+            )
+            {
+                const q2gx_world_vertex_t *vertex =
+                    &q2gx_world_vertices[
+                        face->first_vertex
+                        +
+                        vertex_index
+                    ];
+
+                f32 world_x;
+                f32 world_y;
+                f32 world_z;
+
+                Q2GX_TransformBrushPoint(
+                    &transform,
+                    vertex,
+                    &world_x,
+                    &world_y,
+                    &world_z
+                );
+
+                GX_Position3f32(
+                    world_x,
+                    world_y,
+                    world_z
+                );
+
+                GX_Color4u8(
+                    vertex->r,
+                    vertex->g,
+                    vertex->b,
+                    vertex->a
+                );
+
+                GX_TexCoord2f32(
+                    vertex->s,
+                    vertex->t
+                );
+            }
+
+            GX_End();
+
+            vertices_drawn +=
+                face->vertex_count;
+
+            if (!q2gx_brush_first_draw_logged)
+            {
+                q2gx_brush_first_draw_logged = true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX BRUSH FIRST DRAW: "
+                    "model=*%u "
+                    "first_face=%u "
+                    "face_count=%u "
+                    "origin=%.3f,%.3f,%.3f "
+                    "angles=%.3f,%.3f,%.3f "
+                    "textured=%u "
+                    "mode=inline_bsp_entities\n",
+                    handle->model_index,
+                    brush_model->first_face,
+                    brush_model->face_count,
+                    entity->origin[0],
+                    entity->origin[1],
+                    entity->origin[2],
+                    entity->angles[0],
+                    entity->angles[1],
+                    entity->angles[2],
+                    use_wal ? 1u : 0u
+                );
+            }
+        }
+    }
+
+    if (
+        visible_faces + backface_rejected
+        !=
+        faces_tested
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH: "
+            "face accounting mismatch "
+            "tested=%u visible=%u rejected=%u\n",
+            faces_tested,
+            visible_faces,
+            backface_rejected
+        );
+
+        return;
+    }
+
+    if (
+        textured_faces + fallback_faces
+        !=
+        visible_faces
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH: "
+            "surface accounting mismatch "
+            "visible=%u textured=%u fallback=%u\n",
+            visible_faces,
+            textured_faces,
+            fallback_faces
+        );
+
+        return;
+    }
+
+    if (wal_binds != textured_faces)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH: "
+            "WAL bind accounting mismatch "
+            "binds=%u textured=%u\n",
+            wal_binds,
+            textured_faces
+        );
+
+        return;
+    }
+
+    q2gx_brush_entities_window += entities_drawn;
+    q2gx_brush_faces_tested_window += faces_tested;
+    q2gx_brush_backface_rejected_window += backface_rejected;
+    q2gx_brush_visible_faces_window += visible_faces;
+    q2gx_brush_textured_faces_window += textured_faces;
+    q2gx_brush_fallback_faces_window += fallback_faces;
+    q2gx_brush_wal_binds_window += wal_binds;
+    q2gx_brush_vertices_window += vertices_drawn;
+}
+
+
 static void Q2GX_DrawFlatWorld(
     refdef_t *fd)
 {
@@ -5113,19 +6021,30 @@ int leaf_index = -1;
     pvs_faces = Q2GX_MarkWorldPVS(
         fd, &leaf_index, &cluster, &cluster2, &pvs_fallback);
 
-    if (pvs_faces > q2gx_world_face_count)
+    if (pvs_faces > q2gx_world_static_face_count)
     {
         ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: marked face count exceeds total\n");
         return;
     }
 
-    pvs_rejected_faces = q2gx_world_face_count - pvs_faces;
+    pvs_rejected_faces =
+        q2gx_world_static_face_count
+        -
+        pvs_faces;
     backface_rejected_faces = 0u;
     submitted_faces = 0u;
     submitted_triangles = 0u;
     submitted_vertices = 0u;
 
-    for (face_index = 0u; face_index < q2gx_world_face_count; ++face_index)
+    for (
+        face_index = q2gx_world_static_first_face;
+        face_index
+        <
+        q2gx_world_static_first_face
+        +
+        q2gx_world_static_face_count;
+        ++face_index
+    )
     {
         q2gx_world_face_t *face = &q2gx_world_faces[face_index];
         face->visible_this_frame = false;
@@ -5152,7 +6071,11 @@ int leaf_index = -1;
         return;
     }
 
-    if (pvs_faces + pvs_rejected_faces != q2gx_world_face_count)
+    if (pvs_faces
+        +
+        pvs_rejected_faces
+        !=
+        q2gx_world_static_face_count)
     {
         ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX PVS: total face accounting mismatch\n");
         return;
@@ -5471,10 +6394,14 @@ int leaf_index = -1;
          * original BSP face order.
          */
         for (
-            face_index = 0u;
-            face_index < q2gx_world_face_count;
-            ++face_index
-        )
+        face_index = q2gx_world_static_first_face;
+        face_index
+        <
+        q2gx_world_static_first_face
+        +
+        q2gx_world_static_face_count;
+        ++face_index
+    )
         {
             q2gx_world_face_t *face =
                 &q2gx_world_faces[
@@ -5695,7 +6622,11 @@ int leaf_index = -1;
             wal_textured_vertices;
     }
 
-++q2gx_world_frames_window;
+Q2GX_DrawBrushEntities(
+        fd
+    );
+
+    ++q2gx_world_frames_window;
     q2gx_world_pvs_faces_window += pvs_faces;
     q2gx_world_pvs_rejected_faces_window += pvs_rejected_faces;
     q2gx_world_backface_rejected_faces_window += backface_rejected_faces;
@@ -5748,7 +6679,7 @@ int leaf_index = -1;
             "fallback=%u mode=minimal_pvs_face_marking\n",
             q2gx_world_name,
             leaf_index, cluster, cluster2,
-            q2gx_world_face_count,
+            q2gx_world_static_face_count,
             pvs_faces,
             pvs_rejected_faces,
             backface_rejected_faces,
@@ -5767,7 +6698,7 @@ int leaf_index = -1;
             "submitted_triangles_total=%u submitted_vertices_total=%u fallback_frames=%u "
             "cluster_changes=%u cluster=%d cluster2=%d mode=minimal_pvs_face_marking\n",
             q2gx_world_frames_window,
-            q2gx_world_face_count,
+            q2gx_world_static_face_count,
             q2gx_world_pvs_faces_window,
             q2gx_world_pvs_rejected_faces_window,
             q2gx_world_backface_rejected_faces_window,
@@ -5851,6 +6782,32 @@ ri.Con_Printf(
             q2gx_world_texinfo_count
         );
 
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH 120: "
+            "frames=%u "
+            "entities_total=%u "
+            "faces_tested_total=%u "
+            "backface_rejected_total=%u "
+            "visible_faces_total=%u "
+            "textured_faces_total=%u "
+            "fallback_faces_total=%u "
+            "wal_binds_total=%u "
+            "vertices_total=%u "
+            "registered_inline=%u "
+            "mode=inline_bsp_entities\n",
+            q2gx_world_frames_window,
+            q2gx_brush_entities_window,
+            q2gx_brush_faces_tested_window,
+            q2gx_brush_backface_rejected_window,
+            q2gx_brush_visible_faces_window,
+            q2gx_brush_textured_faces_window,
+            q2gx_brush_fallback_faces_window,
+            q2gx_brush_wal_binds_window,
+            q2gx_brush_vertices_window,
+            q2gx_brush_registered_inline_count
+        );
+
 q2gx_world_frames_window = 0u;
         q2gx_world_pvs_faces_window = 0u;
         q2gx_world_pvs_rejected_faces_window = 0u;
@@ -5881,6 +6838,16 @@ q2gx_world_frames_window = 0u;
         q2gx_world_submitted_vertices_window = 0u;
         q2gx_world_pvs_fallback_frames_window = 0u;
         q2gx_world_cluster_changes_window = 0u;
+
+        q2gx_brush_entities_window = 0u;
+        q2gx_brush_faces_tested_window = 0u;
+        q2gx_brush_backface_rejected_window = 0u;
+        q2gx_brush_visible_faces_window = 0u;
+        q2gx_brush_textured_faces_window = 0u;
+        q2gx_brush_fallback_faces_window = 0u;
+        q2gx_brush_wal_binds_window = 0u;
+        q2gx_brush_vertices_window = 0u;
+
     }
 
     Q2GX_Setup2D();
@@ -6198,8 +7165,89 @@ static void Q2GX_BeginRegistration(
 static struct model_s *Q2GX_RegisterModel(
     char *name)
 {
-    (void)name;
-    return NULL;
+    char *end = NULL;
+    long model_index;
+
+    if (!name || !name[0])
+        return NULL;
+
+    if (name[0] != '*')
+        return NULL;
+
+    model_index =
+        strtol(
+            name + 1,
+            &end,
+            10
+        );
+
+    if (
+        end == name + 1
+        ||
+        !end
+        ||
+        *end != '\0'
+        ||
+        model_index <= 0
+        ||
+        (unsigned long)model_index
+        >=
+        (unsigned long)q2gx_brush_model_count
+        ||
+        !q2gx_brush_models
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH REGISTER: "
+            "invalid inline model %s\n",
+            name
+        );
+
+        return NULL;
+    }
+
+    {
+        q2gx_brush_model_t *brush_model =
+            &q2gx_brush_models[
+                (unsigned int)
+                model_index
+            ];
+
+        if (
+            brush_model->handle.magic
+            !=
+            Q2GX_MODEL_HANDLE_MAGIC
+            ||
+            brush_model->handle.kind
+            !=
+            Q2GX_MODEL_KIND_INLINE_BSP
+        )
+        {
+            return NULL;
+        }
+
+        if (!brush_model->registered)
+        {
+            brush_model->registered = true;
+            ++q2gx_brush_registered_inline_count;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX BRUSH REGISTER: "
+                "model=*%u "
+                "first_face=%u "
+                "face_count=%u "
+                "mode=inline_bsp_handle\n",
+                brush_model->handle.model_index,
+                brush_model->first_face,
+                brush_model->face_count
+            );
+        }
+
+        return
+            &brush_model->handle;
+    }
 }
 
 
