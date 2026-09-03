@@ -210,17 +210,27 @@ void Sys_Mkdir(char *path)
 
 char * Sys_FindFirst(char *path, unsigned musthave, unsigned canhave)
 {
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	return Q2_SaveFindFirst(path, musthave, canhave);
+#else
 	return NULL;
+#endif
 }
 
 char * Sys_FindNext(unsigned musthave, unsigned canhave)
 {
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	return Q2_SaveFindNext(musthave, canhave);
+#else
 	return NULL;
+#endif
 }
 
 void Sys_FindClose(void)
 {
-	
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	Q2_SaveFindClose();
+#endif
 }
 
 void ProcessKeyEvent(int key, qboolean down)

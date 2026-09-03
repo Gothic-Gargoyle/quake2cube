@@ -20,6 +20,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "server.h"
 
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+extern int Q2_SavePrepareSource(
+    const char *directoryName);
+
+extern void Q2_SaveReleasePersistentCaches(void);
+
+extern int Q2_SaveBatchBegin(
+    const char *directoryName);
+
+extern int Q2_SaveBatchEnd(void);
+#endif
+
 /*
 ===============================================================================
 
@@ -225,13 +237,34 @@ void CopyFile (char *src, char *dst)
 SV_CopySaveGame
 ================
 */
-void SV_CopySaveGame (char *src, char *dst)
+qboolean SV_CopySaveGame (char *src, char *dst)
 {
 	char	name[MAX_OSPATH], name2[MAX_OSPATH];
 	int		l, len;
 	char	*found;
 
 	Com_DPrintf("SV_CopySaveGame(%s, %s)\n", src, dst);
+
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	if (!Q2_SavePrepareSource (src))
+	{
+		Com_Printf (
+			"Could not prepare save source %s.\n",
+			src);
+		return false;
+	}
+#endif
+
+
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	if (!Q2_SaveBatchBegin (dst))
+	{
+		Q2_SaveReleasePersistentCaches();
+
+		Com_Printf ("Could not begin save transaction for %s.\n", dst);
+		return false;
+	}
+#endif
 
 	SV_WipeSavegame (dst);
 
@@ -266,6 +299,20 @@ void SV_CopySaveGame (char *src, char *dst)
 		found = Sys_FindNext( 0, 0 );
 	}
 	Sys_FindClose ();
+
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+	if (!Q2_SaveBatchEnd ())
+	{
+		Q2_SaveReleasePersistentCaches();
+
+		Com_Printf ("Failed to persist savegame %s.\n", dst);
+		return false;
+	}
+
+	Q2_SaveReleasePersistentCaches();
+#endif
+
+	return true;
 }
 
 
@@ -542,7 +589,8 @@ void SV_GameMap_f (void)
 	if (!dedicated->value)
 	{
 		SV_WriteServerFile (true);
-		SV_CopySaveGame ("current", "save0");
+		if (!SV_CopySaveGame ("current", "save0"))
+			Com_Printf ("Autosave failed.\n");
 	}
 }
 
@@ -621,7 +669,11 @@ void SV_Loadgame_f (void)
 	}
 	fclose (f);
 
-	SV_CopySaveGame (Cmd_Argv(1), "current");
+	if (!SV_CopySaveGame (Cmd_Argv(1), "current"))
+	{
+		Com_Printf ("Failed to restore savegame.\n");
+		return;
+	}
 
 	SV_ReadServerFile ();
 
@@ -689,7 +741,11 @@ void SV_Savegame_f (void)
 	SV_WriteServerFile (false);
 
 	// copy it off
-	SV_CopySaveGame ("current", dir);
+	if (!SV_CopySaveGame ("current", dir))
+	{
+		Com_Printf ("Save failed.\n");
+		return;
+	}
 
 	Com_Printf ("Done.\n");
 }
@@ -1047,4 +1103,3 @@ void SV_InitOperatorCommands (void)
 
 	Cmd_AddCommand ("sv", SV_ServerCommand_f);
 }
-

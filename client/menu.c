@@ -2171,7 +2171,11 @@ LOADGAME MENU
 =============================================================================
 */
 
-#define	MAX_SAVEGAMES	15
+#ifdef Q2_GAMECUBE_SAVE_SHIM
+#define MAX_SAVEGAMES 4
+#else
+#define MAX_SAVEGAMES 15
+#endif
 
 static menuframework_s	s_savegame_menu;
 
