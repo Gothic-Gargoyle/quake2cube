@@ -651,6 +651,16 @@ static unsigned int q2gx_world_warp_vertices_window;
 static unsigned int q2gx_world_warp_load_fail_window;
 static qboolean q2gx_world_warp_first_draw_logged;
 
+/* Q2GC_REFDEF_POLYBLEND_V1 */
+static unsigned int q2gx_polyblend_frames_window;
+static unsigned int q2gx_polyblend_active_frames_window;
+static unsigned int q2gx_polyblend_underwater_frames_window;
+static unsigned int q2gx_polyblend_quads_window;
+static unsigned int q2gx_polyblend_alpha_min_window;
+static unsigned int q2gx_polyblend_alpha_max_window;
+static qboolean q2gx_polyblend_underwater_first_logged;
+
+
 /* Q2GC_WORLD_TRANSWARP_V1 */
 typedef struct q2gx_world_transwarp_sort_s
 {
@@ -3656,6 +3666,15 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_world_transwarp_subpolys_window = 0u;
     q2gx_world_transwarp_vertices_window = 0u;
     q2gx_world_transwarp_first_draw_logged = false;
+
+
+    q2gx_polyblend_frames_window = 0u;
+    q2gx_polyblend_active_frames_window = 0u;
+    q2gx_polyblend_underwater_frames_window = 0u;
+    q2gx_polyblend_quads_window = 0u;
+    q2gx_polyblend_alpha_min_window = 0u;
+    q2gx_polyblend_alpha_max_window = 0u;
+    q2gx_polyblend_underwater_first_logged = false;
 }
 
 
@@ -10883,6 +10902,175 @@ static void Q2GX_DrawTranslucentWarpWorld(
 
 
 
+
+static u8 Q2GX_Float01ToU8(f32 value)
+{
+    if (value <= 0.0f)
+        return 0u;
+
+    if (value >= 1.0f)
+        return 255u;
+
+    return (u8)(value * 255.0f + 0.5f);
+}
+
+
+/*
+ * Q2GC_REFDEF_POLYBLEND_V1
+ *
+ * Stock ref_gl's R_PolyBlend consumes the already-composed refdef blend
+ * after the 3D scene.  Do the same here: no contents-color recomputation
+ * in the renderer.
+ */
+static void Q2GX_DrawRefdefPolyBlend(refdef_t *fd)
+{
+    u8 r;
+    u8 g;
+    u8 b;
+    u8 a;
+    qboolean underwater;
+
+    if (!fd)
+        return;
+
+    ++q2gx_polyblend_frames_window;
+
+    underwater =
+        (fd->rdflags & RDF_UNDERWATER)
+        ? true
+        : false;
+
+    a = Q2GX_Float01ToU8(fd->blend[3]);
+
+    if (a > 0u)
+    {
+        r = Q2GX_Float01ToU8(fd->blend[0]);
+        g = Q2GX_Float01ToU8(fd->blend[1]);
+        b = Q2GX_Float01ToU8(fd->blend[2]);
+
+        Q2GX_Setup2D();
+
+        GX_SetTevOrder(
+            GX_TEVSTAGE0,
+            GX_TEXCOORDNULL,
+            GX_TEXMAP_NULL,
+            GX_COLOR0A0
+        );
+
+        GX_SetTevOp(
+            GX_TEVSTAGE0,
+            GX_PASSCLR
+        );
+
+        GX_SetCullMode(GX_CULL_NONE);
+
+        GX_SetZMode(
+            GX_FALSE,
+            GX_ALWAYS,
+            GX_FALSE
+        );
+
+        GX_SetBlendMode(
+            GX_BM_BLEND,
+            GX_BL_SRCALPHA,
+            GX_BL_INVSRCALPHA,
+            GX_LO_CLEAR
+        );
+
+        GX_Begin(
+            GX_QUADS,
+            GX_VTXFMT0,
+            4u
+        );
+
+        GX_Position2f32(0.0f, 0.0f);
+        GX_Color4u8(r, g, b, a);
+
+        GX_Position2f32(640.0f, 0.0f);
+        GX_Color4u8(r, g, b, a);
+
+        GX_Position2f32(640.0f, 480.0f);
+        GX_Color4u8(r, g, b, a);
+
+        GX_Position2f32(0.0f, 480.0f);
+        GX_Color4u8(r, g, b, a);
+
+        GX_End();
+
+        ++q2gx_polyblend_active_frames_window;
+        ++q2gx_polyblend_quads_window;
+
+        if (
+            q2gx_polyblend_alpha_min_window == 0u
+            ||
+            (unsigned int)a < q2gx_polyblend_alpha_min_window
+        )
+        {
+            q2gx_polyblend_alpha_min_window = (unsigned int)a;
+        }
+
+        if ((unsigned int)a > q2gx_polyblend_alpha_max_window)
+            q2gx_polyblend_alpha_max_window = (unsigned int)a;
+
+        if (underwater)
+        {
+            ++q2gx_polyblend_underwater_frames_window;
+
+            if (!q2gx_polyblend_underwater_first_logged)
+            {
+                q2gx_polyblend_underwater_first_logged = true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX POLYBLEND UNDERWATER FIRST: "
+                    "rgba_u8=%u,%u,%u,%u "
+                    "blend=%.3f,%.3f,%.3f,%.3f "
+                    "rdflags=0x%x "
+                    "mode=refdef_srcalpha_quad_v1\n",
+                    (unsigned int)r,
+                    (unsigned int)g,
+                    (unsigned int)b,
+                    (unsigned int)a,
+                    fd->blend[0],
+                    fd->blend[1],
+                    fd->blend[2],
+                    fd->blend[3],
+                    fd->rdflags
+                );
+            }
+        }
+    }
+
+    if (q2gx_polyblend_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX POLYBLEND 120: "
+            "frames=%u "
+            "active_frames=%u "
+            "underwater_frames=%u "
+            "quads=%u "
+            "alpha_min_u8=%u "
+            "alpha_max_u8=%u "
+            "mode=refdef_srcalpha_quad_v1\n",
+            q2gx_polyblend_frames_window,
+            q2gx_polyblend_active_frames_window,
+            q2gx_polyblend_underwater_frames_window,
+            q2gx_polyblend_quads_window,
+            q2gx_polyblend_alpha_min_window,
+            q2gx_polyblend_alpha_max_window
+        );
+
+        q2gx_polyblend_frames_window = 0u;
+        q2gx_polyblend_active_frames_window = 0u;
+        q2gx_polyblend_underwater_frames_window = 0u;
+        q2gx_polyblend_quads_window = 0u;
+        q2gx_polyblend_alpha_min_window = 0u;
+        q2gx_polyblend_alpha_max_window = 0u;
+    }
+}
+
+
 static void Q2GX_DrawFlatWorld(
     refdef_t *fd)
 {
@@ -11814,6 +12002,8 @@ q2gx_world_frames_window = 0u;
         q2gx_brush_vertices_window = 0u;
 
     }
+
+    Q2GX_DrawRefdefPolyBlend(fd);
 
     Q2GX_Setup2D();
 }
