@@ -594,6 +594,25 @@ static unsigned int q2gx_alias_invalid_skin_window;
 static unsigned int q2gx_alias_custom_skin_fallback_window;
 static unsigned int q2gx_alias_animated_samples_window;
 
+/* Q2GC_TRANSLUCENT_ALIAS_V1D_SHARED_CORE_INPUT_RESTORE */
+static qboolean q2gx_alias_translucent_pass;
+
+static unsigned int q2gx_transalias_frames_window;
+static unsigned int q2gx_transalias_seen_window;
+static unsigned int q2gx_transalias_drawn_window;
+static unsigned int q2gx_transalias_shell_skipped_window;
+static unsigned int q2gx_transalias_non_smoke_skipped_window;
+static unsigned int q2gx_transalias_triangles_window;
+static unsigned int q2gx_transalias_vertices_window;
+static unsigned int q2gx_transalias_skin_binds_window;
+static unsigned int q2gx_transalias_tlut_loads_window;
+static unsigned int q2gx_transalias_invalid_frame_window;
+static unsigned int q2gx_transalias_invalid_skin_window;
+static unsigned int q2gx_transalias_alpha_min_window = 255u;
+static unsigned int q2gx_transalias_alpha_max_window;
+static qboolean q2gx_transalias_first_draw_logged;
+static qboolean q2gx_transalias_nonsmoke_first_draw_logged;
+
 /* Q2GC_VIEW_WEAPON_V1 */
 static cvar_t *q2gx_viewweapon_hand;
 
@@ -6573,6 +6592,78 @@ static void Q2GX_SetupAlias3D(void)
     GX_SetCullMode(GX_CULL_NONE);
 }
 
+/*
+ * Q2GC_TRANSLUCENT_ALIAS_V1D_SHARED_CORE_INPUT_RESTORE
+ *
+ * Q2GX_SetupWorld3D() intentionally installs the untextured
+ * POS+CLR world contract. The ordinary alias stream submits
+ * POS+CLR+TEX0. Rebuild that complete input contract before an
+ * alias draw that follows the special view-weapon pass.
+ */
+static void Q2GX_RebuildAliasInputContract(void)
+{
+    GX_ClearVtxDesc();
+
+    GX_SetVtxDesc(
+        GX_VA_POS,
+        GX_DIRECT
+    );
+
+    GX_SetVtxDesc(
+        GX_VA_CLR0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxDesc(
+        GX_VA_TEX0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_POS,
+        GX_POS_XYZ,
+        GX_F32,
+        0
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_CLR0,
+        GX_CLR_RGBA,
+        GX_RGBA8,
+        0
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_TEX0,
+        GX_TEX_ST,
+        GX_F32,
+        0
+    );
+
+    GX_SetNumChans(1);
+    GX_SetNumTexGens(1);
+
+    GX_SetTexCoordGen(
+        GX_TEXCOORD0,
+        GX_TG_MTX2x4,
+        GX_TG_TEX0,
+        GX_IDENTITY
+    );
+
+    GX_SetNumTevStages(1);
+
+    GX_SetTevOrder(
+        GX_TEVSTAGE0,
+        GX_TEXCOORD0,
+        GX_TEXMAP0,
+        GX_COLOR0A0
+    );
+}
+
+
 static void Q2GX_DrawAliasEntities(refdef_t *fd)
 {
     unsigned int entity_index;
@@ -6593,7 +6684,10 @@ static void Q2GX_DrawAliasEntities(refdef_t *fd)
     if (!fd)
         return;
 
-    ++q2gx_alias_frames_window;
+    if (q2gx_alias_translucent_pass)
+        ++q2gx_transalias_frames_window;
+    else
+        ++q2gx_alias_frames_window;
 
     if (fd->num_entities > 0 && fd->entities)
     {
@@ -6616,6 +6710,7 @@ static void Q2GX_DrawAliasEntities(refdef_t *fd)
 
             qboolean invalid_skin;
             qboolean custom_skin_fallback;
+            unsigned int transalias_alpha_u8 = 255u;
             unsigned int triangle_index;
 
             if (!entity->model)
@@ -6645,7 +6740,71 @@ static void Q2GX_DrawAliasEntities(refdef_t *fd)
                 continue;
             }
 
-            if (entity->flags & RF_TRANSLUCENT)
+            if (q2gx_alias_translucent_pass)
+            {
+                f32 transalias_alpha;
+
+                if (!(entity->flags & RF_TRANSLUCENT))
+                    continue;
+
+                ++q2gx_transalias_seen_window;
+
+                if (
+                    entity->flags
+                    &
+                    (
+                        RF_SHELL_RED
+                        |
+                        RF_SHELL_GREEN
+                        |
+                        RF_SHELL_BLUE
+                        |
+                        RF_SHELL_DOUBLE
+                        |
+                        RF_SHELL_HALF_DAM
+                    )
+                )
+                {
+                    ++q2gx_transalias_shell_skipped_window;
+                    continue;
+                }
+
+                if (entity->flags & RF_BEAM)
+                    continue;
+
+                transalias_alpha = entity->alpha;
+
+                if (transalias_alpha < 0.0f)
+                    transalias_alpha = 0.0f;
+                else if (transalias_alpha > 1.0f)
+                    transalias_alpha = 1.0f;
+
+                transalias_alpha_u8 =
+                    (unsigned int)(
+                        transalias_alpha * 255.0f + 0.5f
+                    );
+
+                if (
+                    transalias_alpha_u8
+                    <
+                    q2gx_transalias_alpha_min_window
+                )
+                {
+                    q2gx_transalias_alpha_min_window =
+                        transalias_alpha_u8;
+                }
+
+                if (
+                    transalias_alpha_u8
+                    >
+                    q2gx_transalias_alpha_max_window
+                )
+                {
+                    q2gx_transalias_alpha_max_window =
+                        transalias_alpha_u8;
+                }
+            }
+            else if (entity->flags & RF_TRANSLUCENT)
             {
                 ++translucent_skipped;
                 continue;
@@ -6717,6 +6876,35 @@ static void Q2GX_DrawAliasEntities(refdef_t *fd)
             );
 
             Q2GX_SetupAlias3D();
+
+            /*
+             * Q2GC_TRANSLUCENT_ALIAS_V1D_SHARED_CORE_INPUT_RESTORE
+             *
+             * Probe J proved that rebuilding the alias input contract
+             * fixes the post-viewweapon opaque alias stream.  V1d
+             * now layers the complete, separately proven translucent
+             * state on that repaired stream, smoke-only.
+             */
+            if (q2gx_alias_translucent_pass)
+            {
+                GX_SetTevOp(
+                    GX_TEVSTAGE0,
+                    GX_MODULATE
+                );
+
+                GX_SetBlendMode(
+                    GX_BM_BLEND,
+                    GX_BL_SRCALPHA,
+                    GX_BL_INVSRCALPHA,
+                    GX_LO_CLEAR
+                );
+
+                GX_SetZMode(
+                    GX_TRUE,
+                    GX_LEQUAL,
+                    GX_FALSE
+                );
+            }
 
             GX_LoadTlut(
                 &skin->tlut,
@@ -6791,7 +6979,13 @@ static void Q2GX_DrawAliasEntities(refdef_t *fd)
                         255u,
                         255u,
                         255u,
-                        255u
+                        (u8)(
+                            q2gx_alias_translucent_pass
+                            ?
+                            transalias_alpha_u8
+                            :
+                            255u
+                        )
                     );
 
                     GX_TexCoord2f32(
@@ -6802,6 +6996,78 @@ static void Q2GX_DrawAliasEntities(refdef_t *fd)
             }
 
             GX_End();
+
+            if (q2gx_alias_translucent_pass)
+                Q2GX_SetupAlias3D();
+
+            if (
+                q2gx_alias_translucent_pass
+                &&
+                !q2gx_transalias_first_draw_logged
+            )
+            {
+                q2gx_transalias_first_draw_logged = true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX TRANSALIAS FIRST DRAW: "
+                    "%s "
+                    "frame=%u "
+                    "oldframe=%u "
+                    "backlerp=%.4f "
+                    "tris=%u "
+                    "skin=%s "
+                    "flags=%d "
+                    "alpha=%.4f "
+                    "alpha_u8=%u "
+                    "state=translucent "
+                    "mode=rf_translucent_md2_shared_core_v1d\n",
+                    model->name,
+                    frame_index,
+                    old_frame_index,
+                    entity->backlerp,
+                    model->num_tris,
+                    skin->name,
+                    entity->flags,
+                    entity->alpha,
+                    transalias_alpha_u8
+                );
+            }
+
+            if (
+                q2gx_alias_translucent_pass
+                &&
+                !q2gx_transalias_nonsmoke_first_draw_logged
+                &&
+                strcmp(
+                    model->name,
+                    "models/objects/smoke/tris.md2"
+                ) != 0
+            )
+            {
+                q2gx_transalias_nonsmoke_first_draw_logged = true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX TRANSALIAS NONSMOKE FIRST DRAW: "
+                    "%s "
+                    "frame=%u "
+                    "tris=%u "
+                    "skin=%s "
+                    "flags=%d "
+                    "alpha=%.4f "
+                    "alpha_u8=%u "
+                    "state=translucent "
+                    "mode=rf_translucent_md2_shared_core_v1d\n",
+                    model->name,
+                    frame_index,
+                    model->num_tris,
+                    skin->name,
+                    entity->flags,
+                    entity->alpha,
+                    transalias_alpha_u8
+                );
+            }
 
             ++entities_drawn;
             triangles_drawn += model->num_tris;
@@ -6835,6 +7101,97 @@ static void Q2GX_DrawAliasEntities(refdef_t *fd)
             }
         }
     }
+
+    if (q2gx_alias_translucent_pass)
+    {
+        q2gx_transalias_drawn_window +=
+            entities_drawn;
+
+        q2gx_transalias_triangles_window +=
+            triangles_drawn;
+
+        q2gx_transalias_vertices_window +=
+            vertices_drawn;
+
+        q2gx_transalias_skin_binds_window +=
+            skin_binds;
+
+        q2gx_transalias_tlut_loads_window +=
+            tlut_loads;
+
+        q2gx_transalias_invalid_frame_window +=
+            invalid_frames;
+
+        q2gx_transalias_invalid_skin_window +=
+            invalid_skins;
+
+        if (q2gx_transalias_frames_window >= 120u)
+        {
+            unsigned int alpha_min =
+                q2gx_transalias_drawn_window > 0u
+                ?
+                q2gx_transalias_alpha_min_window
+                :
+                0u;
+
+            unsigned int alpha_max =
+                q2gx_transalias_drawn_window > 0u
+                ?
+                q2gx_transalias_alpha_max_window
+                :
+                0u;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX TRANSALIAS 120: "
+                "frames=%u "
+                "seen_total=%u "
+                "drawn_total=%u "
+                "shell_skipped_total=%u "
+                "non_smoke_skipped_total=%u "
+                "triangles_total=%u "
+                "vertices_total=%u "
+                "skin_binds_total=%u "
+                "tlut_loads_total=%u "
+                "invalid_frame_total=%u "
+                "invalid_skin_total=%u "
+                "alpha_min_u8=%u "
+                "alpha_max_u8=%u "
+                "state=translucent "
+                "mode=rf_translucent_md2_shared_core_v1d\n",
+                q2gx_transalias_frames_window,
+                q2gx_transalias_seen_window,
+                q2gx_transalias_drawn_window,
+                q2gx_transalias_shell_skipped_window,
+                q2gx_transalias_non_smoke_skipped_window,
+                q2gx_transalias_triangles_window,
+                q2gx_transalias_vertices_window,
+                q2gx_transalias_skin_binds_window,
+                q2gx_transalias_tlut_loads_window,
+                q2gx_transalias_invalid_frame_window,
+                q2gx_transalias_invalid_skin_window,
+                alpha_min,
+                alpha_max
+            );
+
+            q2gx_transalias_frames_window = 0u;
+            q2gx_transalias_seen_window = 0u;
+            q2gx_transalias_drawn_window = 0u;
+            q2gx_transalias_shell_skipped_window = 0u;
+            q2gx_transalias_non_smoke_skipped_window = 0u;
+            q2gx_transalias_triangles_window = 0u;
+            q2gx_transalias_vertices_window = 0u;
+            q2gx_transalias_skin_binds_window = 0u;
+            q2gx_transalias_tlut_loads_window = 0u;
+            q2gx_transalias_invalid_frame_window = 0u;
+            q2gx_transalias_invalid_skin_window = 0u;
+            q2gx_transalias_alpha_min_window = 255u;
+            q2gx_transalias_alpha_max_window = 0u;
+        }
+
+        return;
+    }
+
 
     q2gx_alias_entities_window += entities_drawn;
     q2gx_alias_weapon_skipped_window += weapon_skipped;
@@ -8578,6 +8935,16 @@ Q2GX_DrawBrushEntities(
     Q2GX_DrawViewWeaponEntities(
         fd
     );
+
+    Q2GX_RebuildAliasInputContract();
+
+    q2gx_alias_translucent_pass = true;
+
+    Q2GX_DrawAliasEntities(
+        fd
+    );
+
+    q2gx_alias_translucent_pass = false;
 
     ++q2gx_world_frames_window;
     q2gx_world_pvs_faces_window += pvs_faces;
