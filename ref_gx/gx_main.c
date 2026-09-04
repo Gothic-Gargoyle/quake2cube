@@ -629,6 +629,86 @@ static unsigned int q2gx_particles_min_frame_window = 0xffffffffu;
 static unsigned int q2gx_particles_max_frame_window;
 static qboolean q2gx_particles_first_draw_logged;
 
+/* Q2GC_WORLD_WARP_V1 */
+#define Q2GX_WARP_SUBDIVIDE_SIZE 64.0f
+#define Q2GX_WARP_SUBDIVIDE_EDGE_EPSILON 8.0f
+#define Q2GX_WARP_MAX_VERTS 64u
+#define Q2GX_WARP_TURBSCALE (256.0f / (2.0f * 3.14159265358979323846f))
+
+static q2gx_world_wal_texture_t *q2gx_world_warp_textures;
+static qboolean *q2gx_world_warp_texture_loaded;
+static qboolean *q2gx_world_warp_texture_failed;
+static unsigned int q2gx_world_warp_texture_capacity;
+
+static unsigned int q2gx_world_warp_frames_window;
+static unsigned int q2gx_world_warp_visible_faces_window;
+static unsigned int q2gx_world_warp_drawn_faces_window;
+static unsigned int q2gx_world_warp_translucent_skipped_window;
+static unsigned int q2gx_world_warp_flowing_faces_window;
+static unsigned int q2gx_world_warp_texture_binds_window;
+static unsigned int q2gx_world_warp_subpolys_window;
+static unsigned int q2gx_world_warp_vertices_window;
+static unsigned int q2gx_world_warp_load_fail_window;
+static qboolean q2gx_world_warp_first_draw_logged;
+
+/* Q2GC_WORLD_TRANSWARP_V1 */
+typedef struct q2gx_world_transwarp_sort_s
+{
+    unsigned int face_index;
+    f32 depth_sq;
+} q2gx_world_transwarp_sort_t;
+
+static q2gx_world_transwarp_sort_t *q2gx_world_transwarp_sort;
+static unsigned int q2gx_world_transwarp_sort_capacity;
+
+static unsigned int q2gx_world_transwarp_frames_window;
+static unsigned int q2gx_world_transwarp_visible_faces_window;
+static unsigned int q2gx_world_transwarp_drawn_faces_window;
+static unsigned int q2gx_world_transwarp_alpha33_faces_window;
+static unsigned int q2gx_world_transwarp_alpha66_faces_window;
+static unsigned int q2gx_world_transwarp_flowing_faces_window;
+static unsigned int q2gx_world_transwarp_texture_binds_window;
+static unsigned int q2gx_world_transwarp_subpolys_window;
+static unsigned int q2gx_world_transwarp_vertices_window;
+static qboolean q2gx_world_transwarp_first_draw_logged;
+
+static const f32 q2gx_world_warp_sin[256] =
+{
+    0.0f, 0.098165f, 0.1962705f, 0.2942585f, 0.3920685f, 0.4896425f, 0.58692f, 0.68385f,
+    0.78036f, 0.876405f, 0.97192f, 1.06685f, 1.16114f, 1.254725f, 1.34756f, 1.43958f,
+    1.530735f, 1.620965f, 1.71022f, 1.798445f, 1.885585f, 1.971595f, 2.05641f, 2.13999f,
+    2.22228f, 2.303235f, 2.382795f, 2.460925f, 2.537575f, 2.61269f, 2.686235f, 2.75816f,
+    2.828425f, 2.89699f, 2.963805f, 3.028835f, 3.09204f, 3.153385f, 3.21283f, 3.27034f,
+    3.32588f, 3.379415f, 3.430915f, 3.48035f, 3.527685f, 3.572895f, 3.615955f, 3.65684f,
+    3.69552f, 3.73197f, 3.766175f, 3.798115f, 3.82776f, 3.855105f, 3.880125f, 3.90281f,
+    3.92314f, 3.94111f, 3.956705f, 3.96992f, 3.98074f, 3.98916f, 3.99518f, 3.998795f,
+    4.0f, 3.998795f, 3.99518f, 3.98916f, 3.98074f, 3.96992f, 3.956705f, 3.94111f,
+    3.92314f, 3.90281f, 3.880125f, 3.855105f, 3.82776f, 3.798115f, 3.766175f, 3.73197f,
+    3.69552f, 3.65684f, 3.615955f, 3.572895f, 3.527685f, 3.48035f, 3.430915f, 3.379415f,
+    3.32588f, 3.27034f, 3.21283f, 3.153385f, 3.09204f, 3.028835f, 2.963805f, 2.89699f,
+    2.828425f, 2.75816f, 2.686235f, 2.61269f, 2.537575f, 2.460925f, 2.382795f, 2.303235f,
+    2.22228f, 2.13999f, 2.05641f, 1.971595f, 1.885585f, 1.798445f, 1.71022f, 1.620965f,
+    1.530735f, 1.43958f, 1.34756f, 1.254725f, 1.16114f, 1.06685f, 0.97192f, 0.876405f,
+    0.78036f, 0.68385f, 0.58692f, 0.4896425f, 0.3920685f, 0.2942585f, 0.1962705f, 0.098165f,
+    4.898585e-16f, -0.098165f, -0.1962705f, -0.2942585f, -0.3920685f, -0.4896425f, -0.58692f, -0.68385f,
+    -0.78036f, -0.876405f, -0.97192f, -1.06685f, -1.16114f, -1.254725f, -1.34756f, -1.43958f,
+    -1.530735f, -1.620965f, -1.71022f, -1.798445f, -1.885585f, -1.971595f, -2.05641f, -2.13999f,
+    -2.22228f, -2.303235f, -2.382795f, -2.460925f, -2.537575f, -2.61269f, -2.686235f, -2.75816f,
+    -2.828425f, -2.89699f, -2.963805f, -3.028835f, -3.09204f, -3.153385f, -3.21283f, -3.27034f,
+    -3.32588f, -3.379415f, -3.430915f, -3.48035f, -3.527685f, -3.572895f, -3.615955f, -3.65684f,
+    -3.69552f, -3.73197f, -3.766175f, -3.798115f, -3.82776f, -3.855105f, -3.880125f, -3.90281f,
+    -3.92314f, -3.94111f, -3.956705f, -3.96992f, -3.98074f, -3.98916f, -3.99518f, -3.998795f,
+    -4.0f, -3.998795f, -3.99518f, -3.98916f, -3.98074f, -3.96992f, -3.956705f, -3.94111f,
+    -3.92314f, -3.90281f, -3.880125f, -3.855105f, -3.82776f, -3.798115f, -3.766175f, -3.73197f,
+    -3.69552f, -3.65684f, -3.615955f, -3.572895f, -3.527685f, -3.48035f, -3.430915f, -3.379415f,
+    -3.32588f, -3.27034f, -3.21283f, -3.153385f, -3.09204f, -3.028835f, -2.963805f, -2.89699f,
+    -2.828425f, -2.75816f, -2.686235f, -2.61269f, -2.537575f, -2.460925f, -2.382795f, -2.303235f,
+    -2.22228f, -2.13999f, -2.05641f, -1.971595f, -1.885585f, -1.798445f, -1.71022f, -1.620965f,
+    -1.530735f, -1.43958f, -1.34756f, -1.254725f, -1.16114f, -1.06685f, -0.97192f, -0.876405f,
+    -0.78036f, -0.68385f, -0.58692f, -0.4896425f, -0.3920685f, -0.2942585f, -0.1962705f, -0.098165f
+};
+
+
 /* Q2GC_WORLD_SKY_V1 */
 #define Q2GX_SKY_FACE_COUNT 6u
 #define Q2GX_SKY_MAX_CLIP_VERTS 64u
@@ -3525,6 +3605,57 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_brush_fallback_faces_window = 0u;
     q2gx_brush_wal_binds_window = 0u;
     q2gx_brush_vertices_window = 0u;
+
+
+    Q2GX_FreeWorldWALTextureArray(
+        q2gx_world_warp_textures,
+        q2gx_world_warp_texture_capacity
+    );
+
+    q2gx_world_warp_textures = NULL;
+
+    if (q2gx_world_warp_texture_loaded)
+    {
+        free(q2gx_world_warp_texture_loaded);
+        q2gx_world_warp_texture_loaded = NULL;
+    }
+
+    if (q2gx_world_warp_texture_failed)
+    {
+        free(q2gx_world_warp_texture_failed);
+        q2gx_world_warp_texture_failed = NULL;
+    }
+
+    q2gx_world_warp_texture_capacity = 0u;
+
+    q2gx_world_warp_frames_window = 0u;
+    q2gx_world_warp_visible_faces_window = 0u;
+    q2gx_world_warp_drawn_faces_window = 0u;
+    q2gx_world_warp_translucent_skipped_window = 0u;
+    q2gx_world_warp_flowing_faces_window = 0u;
+    q2gx_world_warp_texture_binds_window = 0u;
+    q2gx_world_warp_subpolys_window = 0u;
+    q2gx_world_warp_vertices_window = 0u;
+    q2gx_world_warp_load_fail_window = 0u;
+    q2gx_world_warp_first_draw_logged = false;
+
+    if (q2gx_world_transwarp_sort)
+    {
+        free(q2gx_world_transwarp_sort);
+        q2gx_world_transwarp_sort = NULL;
+    }
+
+    q2gx_world_transwarp_sort_capacity = 0u;
+    q2gx_world_transwarp_frames_window = 0u;
+    q2gx_world_transwarp_visible_faces_window = 0u;
+    q2gx_world_transwarp_drawn_faces_window = 0u;
+    q2gx_world_transwarp_alpha33_faces_window = 0u;
+    q2gx_world_transwarp_alpha66_faces_window = 0u;
+    q2gx_world_transwarp_flowing_faces_window = 0u;
+    q2gx_world_transwarp_texture_binds_window = 0u;
+    q2gx_world_transwarp_subpolys_window = 0u;
+    q2gx_world_transwarp_vertices_window = 0u;
+    q2gx_world_transwarp_first_draw_logged = false;
 }
 
 
@@ -9411,6 +9542,1347 @@ sky_stats:
 }
 
 
+
+
+static qboolean Q2GX_EnsureWorldWarpTextureCache(void)
+{
+    if (
+        q2gx_world_warp_textures
+        &&
+        q2gx_world_warp_texture_loaded
+        &&
+        q2gx_world_warp_texture_failed
+        &&
+        q2gx_world_warp_texture_capacity
+        ==
+        q2gx_world_texinfo_count
+    )
+    {
+        return true;
+    }
+
+    if (q2gx_world_texinfo_count == 0u)
+        return false;
+
+    Q2GX_FreeWorldWALTextureArray(
+        q2gx_world_warp_textures,
+        q2gx_world_warp_texture_capacity
+    );
+
+    q2gx_world_warp_textures = NULL;
+
+    if (q2gx_world_warp_texture_loaded)
+        free(q2gx_world_warp_texture_loaded);
+
+    if (q2gx_world_warp_texture_failed)
+        free(q2gx_world_warp_texture_failed);
+
+    q2gx_world_warp_texture_loaded = NULL;
+    q2gx_world_warp_texture_failed = NULL;
+    q2gx_world_warp_texture_capacity = 0u;
+
+    q2gx_world_warp_textures =
+        calloc(
+            q2gx_world_texinfo_count,
+            sizeof(*q2gx_world_warp_textures)
+        );
+
+    q2gx_world_warp_texture_loaded =
+        calloc(
+            q2gx_world_texinfo_count,
+            sizeof(*q2gx_world_warp_texture_loaded)
+        );
+
+    q2gx_world_warp_texture_failed =
+        calloc(
+            q2gx_world_texinfo_count,
+            sizeof(*q2gx_world_warp_texture_failed)
+        );
+
+    if (
+        !q2gx_world_warp_textures
+        ||
+        !q2gx_world_warp_texture_loaded
+        ||
+        !q2gx_world_warp_texture_failed
+    )
+    {
+        Q2GX_FreeWorldWALTextureArray(
+            q2gx_world_warp_textures,
+            q2gx_world_texinfo_count
+        );
+
+        q2gx_world_warp_textures = NULL;
+
+        if (q2gx_world_warp_texture_loaded)
+            free(q2gx_world_warp_texture_loaded);
+
+        if (q2gx_world_warp_texture_failed)
+            free(q2gx_world_warp_texture_failed);
+
+        q2gx_world_warp_texture_loaded = NULL;
+        q2gx_world_warp_texture_failed = NULL;
+
+        return false;
+    }
+
+    q2gx_world_warp_texture_capacity =
+        q2gx_world_texinfo_count;
+
+    return true;
+}
+
+
+static q2gx_world_wal_texture_t *Q2GX_GetWorldWarpTexture(
+    unsigned int texinfo_index)
+{
+    q2gx_world_texinfo_t *texinfo;
+
+    if (
+        texinfo_index
+        >=
+        q2gx_world_texinfo_count
+    )
+    {
+        return NULL;
+    }
+
+    if (!Q2GX_EnsureWorldWarpTextureCache())
+        return NULL;
+
+    if (q2gx_world_warp_texture_failed[texinfo_index])
+        return NULL;
+
+    if (!q2gx_world_warp_texture_loaded[texinfo_index])
+    {
+        texinfo =
+            &q2gx_world_texinfos[
+                texinfo_index
+            ];
+
+        if (
+            !Q2GX_LoadWorldWALTexture(
+                texinfo->texture,
+                &q2gx_world_warp_textures[
+                    texinfo_index
+                ]
+            )
+        )
+        {
+            q2gx_world_warp_texture_failed[
+                texinfo_index
+            ] = true;
+
+            ++q2gx_world_warp_load_fail_window;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX WARP: WAL load failed "
+                "texinfo=%u texture=%s\n",
+                texinfo_index,
+                texinfo->texture
+            );
+
+            return NULL;
+        }
+
+        q2gx_world_warp_texture_loaded[
+            texinfo_index
+        ] = true;
+    }
+
+    return
+        &q2gx_world_warp_textures[
+            texinfo_index
+        ];
+}
+
+
+static void Q2GX_SetupOpaqueWarp3D(
+    refdef_t *fd)
+{
+    Q2GX_SetupTexturedWorld3D(fd);
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_REPLACE
+    );
+
+    GX_SetBlendMode(
+        GX_BM_NONE,
+        GX_BL_ONE,
+        GX_BL_ZERO,
+        GX_LO_CLEAR
+    );
+
+    GX_SetZMode(
+        GX_TRUE,
+        GX_LEQUAL,
+        GX_TRUE
+    );
+
+    GX_SetCullMode(
+        GX_CULL_NONE
+    );
+}
+
+
+static void Q2GX_EmitWarpLeafPolygon(
+    refdef_t *fd,
+    const q2gx_world_texinfo_t *texinfo,
+    unsigned int numverts,
+    const f32 verts[][3],
+    u8 alpha,
+    unsigned int *subpolys,
+    unsigned int *vertices)
+{
+    unsigned int i;
+    f32 scroll = 0.0f;
+
+    if (
+        !fd
+        ||
+        !texinfo
+        ||
+        numverts < 3u
+        ||
+        numverts > 65535u
+    )
+    {
+        return;
+    }
+
+    if (texinfo->flags & Q2GX_SURF_FLOWING)
+    {
+        f32 phase =
+            fd->time * 0.5f;
+
+        phase -= floorf(phase);
+
+        scroll =
+            -64.0f * phase;
+    }
+
+    GX_Begin(
+        GX_TRIANGLEFAN,
+        GX_VTXFMT0,
+        (u16)numverts
+    );
+
+    for (i = 0u; i < numverts; ++i)
+    {
+        f32 os =
+            verts[i][0] * texinfo->vecs[0][0]
+            +
+            verts[i][1] * texinfo->vecs[0][1]
+            +
+            verts[i][2] * texinfo->vecs[0][2]
+            +
+            texinfo->vecs[0][3];
+
+        f32 ot =
+            verts[i][0] * texinfo->vecs[1][0]
+            +
+            verts[i][1] * texinfo->vecs[1][1]
+            +
+            verts[i][2] * texinfo->vecs[1][2]
+            +
+            texinfo->vecs[1][3];
+
+        int s_index =
+            ((int)(
+                (
+                    ot * 0.125f
+                    +
+                    fd->time
+                )
+                *
+                Q2GX_WARP_TURBSCALE
+            ))
+            &
+            255;
+
+        int t_index =
+            ((int)(
+                (
+                    os * 0.125f
+                    +
+                    fd->time
+                )
+                *
+                Q2GX_WARP_TURBSCALE
+            ))
+            &
+            255;
+
+        f32 warp_s =
+            (
+                os
+                +
+                q2gx_world_warp_sin[s_index]
+                +
+                scroll
+            )
+            *
+            (1.0f / 64.0f);
+
+        f32 warp_t =
+            (
+                ot
+                +
+                q2gx_world_warp_sin[t_index]
+            )
+            *
+            (1.0f / 64.0f);
+
+        GX_Position3f32(
+            verts[i][0],
+            verts[i][1],
+            verts[i][2]
+        );
+
+        GX_Color4u8(
+            255u,
+            255u,
+            255u,
+            alpha
+        );
+
+        GX_TexCoord2f32(
+            warp_s,
+            warp_t
+        );
+    }
+
+    GX_End();
+
+    ++(*subpolys);
+    *vertices += numverts;
+}
+
+
+static void Q2GX_DrawWarpSubdividedPolygon(
+    refdef_t *fd,
+    const q2gx_world_texinfo_t *texinfo,
+    unsigned int numverts,
+    const f32 verts[][3],
+    u8 alpha,
+    unsigned int *subpolys,
+    unsigned int *vertices)
+{
+    unsigned int axis;
+
+    if (
+        numverts < 3u
+        ||
+        numverts > 60u
+    )
+    {
+        return;
+    }
+
+    for (axis = 0u; axis < 3u; ++axis)
+    {
+        f32 mins = verts[0][axis];
+        f32 maxs = verts[0][axis];
+        f32 split;
+        f32 dist[Q2GX_WARP_MAX_VERTS];
+        f32 looped[Q2GX_WARP_MAX_VERTS][3];
+        f32 front[Q2GX_WARP_MAX_VERTS][3];
+        f32 back[Q2GX_WARP_MAX_VERTS][3];
+        unsigned int front_count = 0u;
+        unsigned int back_count = 0u;
+        unsigned int i;
+
+        for (i = 1u; i < numverts; ++i)
+        {
+            if (verts[i][axis] < mins)
+                mins = verts[i][axis];
+
+            if (verts[i][axis] > maxs)
+                maxs = verts[i][axis];
+        }
+
+        split =
+            Q2GX_WARP_SUBDIVIDE_SIZE
+            *
+            floorf(
+                (
+                    (mins + maxs) * 0.5f
+                    /
+                    Q2GX_WARP_SUBDIVIDE_SIZE
+                )
+                +
+                0.5f
+            );
+
+        if (
+            maxs - split
+            <
+            Q2GX_WARP_SUBDIVIDE_EDGE_EPSILON
+        )
+        {
+            continue;
+        }
+
+        if (
+            split - mins
+            <
+            Q2GX_WARP_SUBDIVIDE_EDGE_EPSILON
+        )
+        {
+            continue;
+        }
+
+        for (i = 0u; i < numverts; ++i)
+        {
+            dist[i] =
+                verts[i][axis] - split;
+
+            looped[i][0] = verts[i][0];
+            looped[i][1] = verts[i][1];
+            looped[i][2] = verts[i][2];
+        }
+
+        dist[numverts] = dist[0];
+
+        looped[numverts][0] = looped[0][0];
+        looped[numverts][1] = looped[0][1];
+        looped[numverts][2] = looped[0][2];
+
+        for (i = 0u; i < numverts; ++i)
+        {
+            unsigned int k;
+
+            if (dist[i] >= 0.0f)
+            {
+                if (
+                    front_count
+                    >=
+                    Q2GX_WARP_MAX_VERTS
+                )
+                {
+                    return;
+                }
+
+                front[front_count][0] =
+                    looped[i][0];
+
+                front[front_count][1] =
+                    looped[i][1];
+
+                front[front_count][2] =
+                    looped[i][2];
+
+                ++front_count;
+            }
+
+            if (dist[i] <= 0.0f)
+            {
+                if (
+                    back_count
+                    >=
+                    Q2GX_WARP_MAX_VERTS
+                )
+                {
+                    return;
+                }
+
+                back[back_count][0] =
+                    looped[i][0];
+
+                back[back_count][1] =
+                    looped[i][1];
+
+                back[back_count][2] =
+                    looped[i][2];
+
+                ++back_count;
+            }
+
+            if (
+                dist[i] == 0.0f
+                ||
+                dist[i + 1u] == 0.0f
+                ||
+                (
+                    (dist[i] > 0.0f)
+                    ==
+                    (dist[i + 1u] > 0.0f)
+                )
+            )
+            {
+                continue;
+            }
+
+            if (
+                front_count
+                >=
+                Q2GX_WARP_MAX_VERTS
+                ||
+                back_count
+                >=
+                Q2GX_WARP_MAX_VERTS
+            )
+            {
+                return;
+            }
+
+            {
+                f32 frac =
+                    dist[i]
+                    /
+                    (
+                        dist[i]
+                        -
+                        dist[i + 1u]
+                    );
+
+                for (k = 0u; k < 3u; ++k)
+                {
+                    f32 value =
+                        looped[i][k]
+                        +
+                        frac
+                        *
+                        (
+                            looped[i + 1u][k]
+                            -
+                            looped[i][k]
+                        );
+
+                    front[front_count][k] =
+                        value;
+
+                    back[back_count][k] =
+                        value;
+                }
+            }
+
+            ++front_count;
+            ++back_count;
+        }
+
+        Q2GX_DrawWarpSubdividedPolygon(
+            fd,
+            texinfo,
+            front_count,
+            front,
+            alpha,
+            subpolys,
+            vertices
+        );
+
+        Q2GX_DrawWarpSubdividedPolygon(
+            fd,
+            texinfo,
+            back_count,
+            back,
+            alpha,
+            subpolys,
+            vertices
+        );
+
+        return;
+    }
+
+    Q2GX_EmitWarpLeafPolygon(
+        fd,
+        texinfo,
+        numverts,
+        verts,
+        alpha,
+        subpolys,
+        vertices
+    );
+}
+
+
+static void Q2GX_DrawOpaqueWarpWorld(
+    refdef_t *fd)
+{
+    unsigned int local_face;
+
+    unsigned int visible_faces = 0u;
+    unsigned int drawn_faces = 0u;
+    unsigned int translucent_skipped = 0u;
+    unsigned int flowing_faces = 0u;
+    unsigned int texture_binds = 0u;
+    unsigned int subpolys = 0u;
+    unsigned int vertices = 0u;
+
+    if (
+        !fd
+        ||
+        !q2gx_world_faces
+        ||
+        !q2gx_world_vertices
+        ||
+        !q2gx_world_texinfos
+        ||
+        q2gx_world_static_face_count == 0u
+    )
+    {
+        return;
+    }
+
+    ++q2gx_world_warp_frames_window;
+
+    for (
+        local_face = 0u;
+        local_face < q2gx_world_static_face_count;
+        ++local_face
+    )
+    {
+        unsigned int face_index =
+            q2gx_world_static_first_face
+            +
+            local_face;
+
+        q2gx_world_face_t *face;
+        q2gx_world_texinfo_t *texinfo;
+        q2gx_world_wal_texture_t *texture;
+
+        unsigned int original_vertices;
+        f32 polygon[Q2GX_WARP_MAX_VERTS][3];
+        unsigned int i;
+
+        if (face_index >= q2gx_world_face_count)
+            return;
+
+        face =
+            &q2gx_world_faces[
+                face_index
+            ];
+
+        if (!face->visible_this_frame)
+            continue;
+
+        if (
+            !(
+                face->surface_flags
+                &
+                Q2GX_SURF_WARP
+            )
+        )
+        {
+            continue;
+        }
+
+        ++visible_faces;
+
+        if (
+            face->surface_flags
+            &
+            (
+                Q2GX_SURF_TRANS33
+                |
+                Q2GX_SURF_TRANS66
+            )
+        )
+        {
+            ++translucent_skipped;
+            continue;
+        }
+
+        if (
+            face->texinfo_index
+            >=
+            q2gx_world_texinfo_count
+        )
+        {
+            continue;
+        }
+
+        texinfo =
+            &q2gx_world_texinfos[
+                face->texinfo_index
+            ];
+
+        original_vertices =
+            face->triangle_count
+            +
+            2u;
+
+        if (
+            original_vertices < 3u
+            ||
+            original_vertices > 60u
+            ||
+            face->vertex_count < 3u
+        )
+        {
+            continue;
+        }
+
+        polygon[0][0] =
+            q2gx_world_vertices[
+                face->first_vertex + 0u
+            ].x;
+
+        polygon[0][1] =
+            q2gx_world_vertices[
+                face->first_vertex + 0u
+            ].y;
+
+        polygon[0][2] =
+            q2gx_world_vertices[
+                face->first_vertex + 0u
+            ].z;
+
+        polygon[1][0] =
+            q2gx_world_vertices[
+                face->first_vertex + 1u
+            ].x;
+
+        polygon[1][1] =
+            q2gx_world_vertices[
+                face->first_vertex + 1u
+            ].y;
+
+        polygon[1][2] =
+            q2gx_world_vertices[
+                face->first_vertex + 1u
+            ].z;
+
+        for (i = 2u; i < original_vertices; ++i)
+        {
+            unsigned int source_offset =
+                (i - 2u) * 3u
+                +
+                2u;
+
+            if (
+                source_offset
+                >=
+                face->vertex_count
+            )
+            {
+                original_vertices = 0u;
+                break;
+            }
+
+            polygon[i][0] =
+                q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    source_offset
+                ].x;
+
+            polygon[i][1] =
+                q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    source_offset
+                ].y;
+
+            polygon[i][2] =
+                q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    source_offset
+                ].z;
+        }
+
+        if (original_vertices == 0u)
+            continue;
+
+        texture =
+            Q2GX_GetWorldWarpTexture(
+                face->texinfo_index
+            );
+
+        if (!texture)
+            continue;
+
+        Q2GX_SetupOpaqueWarp3D(fd);
+
+        GX_LoadTexObj(
+            &texture->texture,
+            GX_TEXMAP0
+        );
+
+        ++texture_binds;
+
+        Q2GX_DrawWarpSubdividedPolygon(
+            fd,
+            texinfo,
+            original_vertices,
+            polygon,
+            255u,
+            &subpolys,
+            &vertices
+        );
+
+        ++drawn_faces;
+
+        if (texinfo->flags & Q2GX_SURF_FLOWING)
+            ++flowing_faces;
+
+        if (!q2gx_world_warp_first_draw_logged)
+        {
+            q2gx_world_warp_first_draw_logged = true;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX WARP FIRST DRAW: "
+                "face=%u "
+                "texture=%s "
+                "original_vertices=%u "
+                "flowing=%u "
+                "flags=0x%02x "
+                "mode=stock_subdivide_turbsin_wal_v1\n",
+                face_index,
+                texinfo->texture,
+                original_vertices,
+                (
+                    texinfo->flags
+                    &
+                    Q2GX_SURF_FLOWING
+                )
+                ?
+                1u
+                :
+                0u,
+                texinfo->flags
+            );
+        }
+    }
+
+    if (drawn_faces > 0u)
+        Q2GX_SetupTexturedWorld3D(fd);
+
+    q2gx_world_warp_visible_faces_window += visible_faces;
+    q2gx_world_warp_drawn_faces_window += drawn_faces;
+    q2gx_world_warp_translucent_skipped_window += translucent_skipped;
+    q2gx_world_warp_flowing_faces_window += flowing_faces;
+    q2gx_world_warp_texture_binds_window += texture_binds;
+    q2gx_world_warp_subpolys_window += subpolys;
+    q2gx_world_warp_vertices_window += vertices;
+
+    if (q2gx_world_warp_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX WARP 120: "
+            "frames=%u "
+            "visible_faces_total=%u "
+            "drawn_faces_total=%u "
+            "translucent_skipped_total=%u "
+            "flowing_faces_total=%u "
+            "texture_binds_total=%u "
+            "subpolys_total=%u "
+            "vertices_total=%u "
+            "load_fail_total=%u "
+            "mode=stock_subdivide_turbsin_wal_v1\n",
+            q2gx_world_warp_frames_window,
+            q2gx_world_warp_visible_faces_window,
+            q2gx_world_warp_drawn_faces_window,
+            q2gx_world_warp_translucent_skipped_window,
+            q2gx_world_warp_flowing_faces_window,
+            q2gx_world_warp_texture_binds_window,
+            q2gx_world_warp_subpolys_window,
+            q2gx_world_warp_vertices_window,
+            q2gx_world_warp_load_fail_window
+        );
+
+        q2gx_world_warp_frames_window = 0u;
+        q2gx_world_warp_visible_faces_window = 0u;
+        q2gx_world_warp_drawn_faces_window = 0u;
+        q2gx_world_warp_translucent_skipped_window = 0u;
+        q2gx_world_warp_flowing_faces_window = 0u;
+        q2gx_world_warp_texture_binds_window = 0u;
+        q2gx_world_warp_subpolys_window = 0u;
+        q2gx_world_warp_vertices_window = 0u;
+        q2gx_world_warp_load_fail_window = 0u;
+    }
+}
+
+static qboolean Q2GX_EnsureTransWarpSortBuffer(void)
+{
+    if (
+        q2gx_world_transwarp_sort
+        &&
+        q2gx_world_transwarp_sort_capacity
+        >=
+        q2gx_world_static_face_count
+    )
+    {
+        return true;
+    }
+
+    if (q2gx_world_transwarp_sort)
+    {
+        free(q2gx_world_transwarp_sort);
+        q2gx_world_transwarp_sort = NULL;
+    }
+
+    q2gx_world_transwarp_sort_capacity = 0u;
+
+    if (q2gx_world_static_face_count == 0u)
+        return false;
+
+    q2gx_world_transwarp_sort =
+        calloc(
+            q2gx_world_static_face_count,
+            sizeof(*q2gx_world_transwarp_sort)
+        );
+
+    if (!q2gx_world_transwarp_sort)
+        return false;
+
+    q2gx_world_transwarp_sort_capacity =
+        q2gx_world_static_face_count;
+
+    return true;
+}
+
+
+static int Q2GX_CompareTransWarpBackToFront(
+    const void *left,
+    const void *right)
+{
+    const q2gx_world_transwarp_sort_t *a = left;
+    const q2gx_world_transwarp_sort_t *b = right;
+
+    if (a->depth_sq < b->depth_sq)
+        return 1;
+    if (a->depth_sq > b->depth_sq)
+        return -1;
+    if (a->face_index < b->face_index)
+        return -1;
+    if (a->face_index > b->face_index)
+        return 1;
+    return 0;
+}
+
+
+static void Q2GX_SetupTranslucentWarp3D(
+    refdef_t *fd)
+{
+    Q2GX_SetupTexturedWorld3D(fd);
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_MODULATE
+    );
+
+    GX_SetBlendMode(
+        GX_BM_BLEND,
+        GX_BL_SRCALPHA,
+        GX_BL_INVSRCALPHA,
+        GX_LO_CLEAR
+    );
+
+    GX_SetZMode(
+        GX_TRUE,
+        GX_LEQUAL,
+        GX_TRUE
+    );
+
+    GX_SetCullMode(
+        GX_CULL_NONE
+    );
+}
+
+
+static void Q2GX_DrawTranslucentWarpWorld(
+    refdef_t *fd)
+{
+    unsigned int local_face;
+    unsigned int sort_count = 0u;
+    unsigned int sorted_index;
+
+    unsigned int visible_faces = 0u;
+    unsigned int drawn_faces = 0u;
+    unsigned int alpha33_faces = 0u;
+    unsigned int alpha66_faces = 0u;
+    unsigned int flowing_faces = 0u;
+    unsigned int texture_binds = 0u;
+    unsigned int subpolys = 0u;
+    unsigned int vertices = 0u;
+
+    if (
+        !fd
+        ||
+        !q2gx_world_faces
+        ||
+        !q2gx_world_vertices
+        ||
+        !q2gx_world_texinfos
+        ||
+        q2gx_world_static_face_count == 0u
+    )
+    {
+        return;
+    }
+
+    ++q2gx_world_transwarp_frames_window;
+
+    if (!Q2GX_EnsureTransWarpSortBuffer())
+        return;
+
+    for (
+        local_face = 0u;
+        local_face < q2gx_world_static_face_count;
+        ++local_face
+    )
+    {
+        unsigned int face_index =
+            q2gx_world_static_first_face
+            +
+            local_face;
+
+        q2gx_world_face_t *face;
+        f32 center[3] = {0.0f, 0.0f, 0.0f};
+        f32 dx;
+        f32 dy;
+        f32 dz;
+        unsigned int i;
+
+        if (face_index >= q2gx_world_face_count)
+            return;
+
+        face =
+            &q2gx_world_faces[
+                face_index
+            ];
+
+        if (!face->visible_this_frame)
+            continue;
+
+        if (
+            !(
+                face->surface_flags
+                &
+                Q2GX_SURF_WARP
+            )
+            ||
+            !(
+                face->surface_flags
+                &
+                (
+                    Q2GX_SURF_TRANS33
+                    |
+                    Q2GX_SURF_TRANS66
+                )
+            )
+        )
+        {
+            continue;
+        }
+
+        ++visible_faces;
+
+        if (
+            face->vertex_count == 0u
+            ||
+            sort_count
+            >=
+            q2gx_world_transwarp_sort_capacity
+        )
+        {
+            continue;
+        }
+
+        for (i = 0u; i < face->vertex_count; ++i)
+        {
+            const q2gx_world_vertex_t *vertex =
+                &q2gx_world_vertices[
+                    face->first_vertex + i
+                ];
+
+            center[0] += vertex->x;
+            center[1] += vertex->y;
+            center[2] += vertex->z;
+        }
+
+        center[0] /= (f32)face->vertex_count;
+        center[1] /= (f32)face->vertex_count;
+        center[2] /= (f32)face->vertex_count;
+
+        dx = center[0] - fd->vieworg[0];
+        dy = center[1] - fd->vieworg[1];
+        dz = center[2] - fd->vieworg[2];
+
+        q2gx_world_transwarp_sort[
+            sort_count
+        ].face_index = face_index;
+
+        q2gx_world_transwarp_sort[
+            sort_count
+        ].depth_sq =
+            dx * dx
+            +
+            dy * dy
+            +
+            dz * dz;
+
+        ++sort_count;
+    }
+
+    if (sort_count > 1u)
+    {
+        qsort(
+            q2gx_world_transwarp_sort,
+            sort_count,
+            sizeof(*q2gx_world_transwarp_sort),
+            Q2GX_CompareTransWarpBackToFront
+        );
+    }
+
+    if (sort_count > 0u)
+        Q2GX_SetupTranslucentWarp3D(fd);
+
+    for (
+        sorted_index = 0u;
+        sorted_index < sort_count;
+        ++sorted_index
+    )
+    {
+        unsigned int face_index =
+            q2gx_world_transwarp_sort[
+                sorted_index
+            ].face_index;
+
+        q2gx_world_face_t *face =
+            &q2gx_world_faces[
+                face_index
+            ];
+
+        q2gx_world_texinfo_t *texinfo;
+        q2gx_world_wal_texture_t *texture;
+
+        unsigned int original_vertices;
+        f32 polygon[Q2GX_WARP_MAX_VERTS][3];
+        unsigned int i;
+        u8 alpha;
+
+        if (
+            face->texinfo_index
+            >=
+            q2gx_world_texinfo_count
+        )
+        {
+            continue;
+        }
+
+        texinfo =
+            &q2gx_world_texinfos[
+                face->texinfo_index
+            ];
+
+        if (face->surface_flags & Q2GX_SURF_TRANS33)
+        {
+            alpha = 84u;
+            ++alpha33_faces;
+        }
+        else if (face->surface_flags & Q2GX_SURF_TRANS66)
+        {
+            alpha = 168u;
+            ++alpha66_faces;
+        }
+        else
+        {
+            continue;
+        }
+
+        original_vertices =
+            face->triangle_count
+            +
+            2u;
+
+        if (
+            original_vertices < 3u
+            ||
+            original_vertices > 60u
+            ||
+            face->vertex_count < 3u
+        )
+        {
+            continue;
+        }
+
+        polygon[0][0] =
+            q2gx_world_vertices[
+                face->first_vertex + 0u
+            ].x;
+        polygon[0][1] =
+            q2gx_world_vertices[
+                face->first_vertex + 0u
+            ].y;
+        polygon[0][2] =
+            q2gx_world_vertices[
+                face->first_vertex + 0u
+            ].z;
+
+        polygon[1][0] =
+            q2gx_world_vertices[
+                face->first_vertex + 1u
+            ].x;
+        polygon[1][1] =
+            q2gx_world_vertices[
+                face->first_vertex + 1u
+            ].y;
+        polygon[1][2] =
+            q2gx_world_vertices[
+                face->first_vertex + 1u
+            ].z;
+
+        for (i = 2u; i < original_vertices; ++i)
+        {
+            unsigned int source_offset =
+                (i - 2u) * 3u
+                +
+                2u;
+
+            if (
+                source_offset
+                >=
+                face->vertex_count
+            )
+            {
+                original_vertices = 0u;
+                break;
+            }
+
+            polygon[i][0] =
+                q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    source_offset
+                ].x;
+            polygon[i][1] =
+                q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    source_offset
+                ].y;
+            polygon[i][2] =
+                q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    source_offset
+                ].z;
+        }
+
+        if (original_vertices == 0u)
+            continue;
+
+        texture =
+            Q2GX_GetWorldWarpTexture(
+                face->texinfo_index
+            );
+
+        if (!texture)
+            continue;
+
+        GX_LoadTexObj(
+            &texture->texture,
+            GX_TEXMAP0
+        );
+
+        ++texture_binds;
+
+        Q2GX_DrawWarpSubdividedPolygon(
+            fd,
+            texinfo,
+            original_vertices,
+            polygon,
+            alpha,
+            &subpolys,
+            &vertices
+        );
+
+        ++drawn_faces;
+
+        if (texinfo->flags & Q2GX_SURF_FLOWING)
+            ++flowing_faces;
+
+        if (!q2gx_world_transwarp_first_draw_logged)
+        {
+            q2gx_world_transwarp_first_draw_logged = true;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX TRANSWARP FIRST DRAW: "
+                "face=%u "
+                "texture=%s "
+                "alpha_u8=%u "
+                "original_vertices=%u "
+                "flowing=%u "
+                "flags=0x%02x "
+                "mode=stock_alpha_far_to_near_subdivide_turbsin_wal_v1\n",
+                face_index,
+                texinfo->texture,
+                (unsigned int)alpha,
+                original_vertices,
+                (
+                    texinfo->flags
+                    &
+                    Q2GX_SURF_FLOWING
+                )
+                ?
+                1u
+                :
+                0u,
+                texinfo->flags
+            );
+        }
+    }
+
+    if (drawn_faces > 0u)
+        Q2GX_SetupTexturedWorld3D(fd);
+
+    q2gx_world_transwarp_visible_faces_window += visible_faces;
+    q2gx_world_transwarp_drawn_faces_window += drawn_faces;
+    q2gx_world_transwarp_alpha33_faces_window += alpha33_faces;
+    q2gx_world_transwarp_alpha66_faces_window += alpha66_faces;
+    q2gx_world_transwarp_flowing_faces_window += flowing_faces;
+    q2gx_world_transwarp_texture_binds_window += texture_binds;
+    q2gx_world_transwarp_subpolys_window += subpolys;
+    q2gx_world_transwarp_vertices_window += vertices;
+
+    if (q2gx_world_transwarp_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX TRANSWARP 120: "
+            "frames=%u "
+            "visible_faces_total=%u "
+            "drawn_faces_total=%u "
+            "alpha33_faces_total=%u "
+            "alpha66_faces_total=%u "
+            "flowing_faces_total=%u "
+            "texture_binds_total=%u "
+            "subpolys_total=%u "
+            "vertices_total=%u "
+            "mode=stock_alpha_far_to_near_subdivide_turbsin_wal_v1\n",
+            q2gx_world_transwarp_frames_window,
+            q2gx_world_transwarp_visible_faces_window,
+            q2gx_world_transwarp_drawn_faces_window,
+            q2gx_world_transwarp_alpha33_faces_window,
+            q2gx_world_transwarp_alpha66_faces_window,
+            q2gx_world_transwarp_flowing_faces_window,
+            q2gx_world_transwarp_texture_binds_window,
+            q2gx_world_transwarp_subpolys_window,
+            q2gx_world_transwarp_vertices_window
+        );
+
+        q2gx_world_transwarp_frames_window = 0u;
+        q2gx_world_transwarp_visible_faces_window = 0u;
+        q2gx_world_transwarp_drawn_faces_window = 0u;
+        q2gx_world_transwarp_alpha33_faces_window = 0u;
+        q2gx_world_transwarp_alpha66_faces_window = 0u;
+        q2gx_world_transwarp_flowing_faces_window = 0u;
+        q2gx_world_transwarp_texture_binds_window = 0u;
+        q2gx_world_transwarp_subpolys_window = 0u;
+        q2gx_world_transwarp_vertices_window = 0u;
+    }
+}
+
+
+
 static void Q2GX_DrawFlatWorld(
     refdef_t *fd)
 {
@@ -9535,6 +11007,8 @@ int leaf_index = -1;
         unsigned int wal_animated_flat_faces = 0u;
         unsigned int wal_special_flat_faces = 0u;
         unsigned int wal_sky_faces = 0u;
+        unsigned int wal_opaque_warp_faces = 0u;
+        unsigned int wal_translucent_warp_faces = 0u;
 
         unsigned int wal_visible_textures = 0u;
         unsigned int wal_texture_binds = 0u;
@@ -9840,6 +11314,32 @@ int leaf_index = -1;
                 continue;
             }
 
+            if (
+                face->surface_flags
+                &
+                Q2GX_SURF_WARP
+            )
+            {
+                if (
+                    face->surface_flags
+                    &
+                    (
+                        Q2GX_SURF_TRANS33
+                        |
+                        Q2GX_SURF_TRANS66
+                    )
+                )
+                {
+                    ++wal_translucent_warp_faces;
+                }
+                else
+                {
+                    ++wal_opaque_warp_faces;
+                }
+
+                continue;
+            }
+
             texinfo =
                 &q2gx_world_texinfos[
                     face->texinfo_index
@@ -9936,6 +11436,10 @@ int leaf_index = -1;
             wal_special_flat_faces
             +
             wal_sky_faces
+            +
+            wal_opaque_warp_faces
+            +
+            wal_translucent_warp_faces
             !=
             submitted_faces
         )
@@ -10050,7 +11554,9 @@ int leaf_index = -1;
             wal_textured_vertices;
     }
 
-Q2GX_DrawSkyBox(fd);
+Q2GX_DrawOpaqueWarpWorld(fd);
+
+    Q2GX_DrawSkyBox(fd);
 
 Q2GX_DrawBrushEntities(
         fd
@@ -10082,6 +11588,8 @@ Q2GX_DrawBrushEntities(
      * so particles follow the completed opaque/view/translucent entity stack.
      */
     Q2GX_DrawParticles(fd);
+
+    Q2GX_DrawTranslucentWarpWorld(fd);
 
     ++q2gx_world_frames_window;
     q2gx_world_pvs_faces_window += pvs_faces;
