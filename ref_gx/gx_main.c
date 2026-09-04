@@ -8821,6 +8821,9 @@ static void Q2GX_DrawAliasShadows(
     static unsigned int receiver_hits_window;
     static unsigned int receiver_fallbacks_window;
 
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V4 */
+    static unsigned int receiver_miss_skipped_window;
+
     /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
     static unsigned int receiver_leaves_visited_window;
 
@@ -8845,6 +8848,9 @@ static void Q2GX_DrawAliasShadows(
     unsigned int receiver_queries = 0u;
     unsigned int receiver_hits = 0u;
     unsigned int receiver_fallbacks = 0u;
+
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V4 */
+    unsigned int receiver_miss_skipped = 0u;
 
     /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
     unsigned int receiver_leaves_visited = 0u;
@@ -9083,12 +9089,22 @@ static void Q2GX_DrawAliasShadows(
             }
             else
             {
+                /*
+                 * Q2GC_ALIAS_SHADOW_RECEIVER_V4
+                 *
+                 * V1 used entity-origin height as a bootstrap
+                 * fallback when no receiver existed. V3 proved the
+                 * real BSP trace and the classifier showed remaining
+                 * misses are effect/airborne cases with no eligible
+                 * receiving triangles.
+                 *
+                 * A projected shadow without a receiver is not
+                 * meaningful, so do not submit one.
+                 */
                 ++receiver_fallbacks;
+                ++receiver_miss_skipped;
 
-                receiver_z =
-                    entity->origin[2];
-
-                lheight = 0.0f;
+                continue;
             }
 
             /*
@@ -9276,7 +9292,7 @@ static void Q2GX_DrawAliasShadows(
                     "receiver_tris=%u "
                     "alpha=128 "
                     "receiver=bsp_segment_triangles "
-                    "mode=stock_projection_receiver_v3\n",
+                    "mode=stock_projection_receiver_v4\n",
                     model->name,
                     frame_index,
                     old_frame_index,
@@ -9328,6 +9344,10 @@ static void Q2GX_DrawAliasShadows(
     receiver_fallbacks_window +=
         receiver_fallbacks;
 
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V4 */
+    receiver_miss_skipped_window +=
+        receiver_miss_skipped;
+
     /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
     receiver_leaves_visited_window +=
         receiver_leaves_visited;
@@ -9353,16 +9373,26 @@ static void Q2GX_DrawAliasShadows(
     {
         ri.Con_Printf(
             PRINT_ALL,
+            "Q2GC REF_GX SHADOW MISS 120: "
+            "receiver_misses=%u "
+            "shadows_skipped=%u "
+            "policy=no_receiver_no_shadow_v4\n",
+            receiver_fallbacks_window,
+            receiver_miss_skipped_window
+        );
+
+        ri.Con_Printf(
+            PRINT_ALL,
             "Q2GC REF_GX SHADOW RECEIVER 120: "
             "queries=%u "
             "hits=%u "
-            "fallbacks=%u "
+            "misses=%u "
             "leaves_visited=%u "
             "faces_tested=%u "
             "triangles_tested=%u "
             "min_lheight=%.3f "
             "max_lheight=%.3f "
-            "mode=bsp_segment_vertical_triangles_v3\n",
+            "mode=bsp_segment_vertical_triangles_v4\n",
             receiver_queries_window,
             receiver_hits_window,
             receiver_fallbacks_window,
@@ -9399,7 +9429,7 @@ static void Q2GX_DrawAliasShadows(
             "invalid_frame_total=%u "
             "alpha=128 "
             "receiver=bsp_segment_triangles "
-            "mode=stock_projection_receiver_v3\n",
+            "mode=stock_projection_receiver_v4\n",
             frames_window,
             (
                 shadow_cvar
@@ -9431,6 +9461,9 @@ static void Q2GX_DrawAliasShadows(
         receiver_queries_window = 0u;
         receiver_hits_window = 0u;
         receiver_fallbacks_window = 0u;
+
+        /* Q2GC_ALIAS_SHADOW_RECEIVER_V4 */
+        receiver_miss_skipped_window = 0u;
 
         /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
         receiver_leaves_visited_window = 0u;
