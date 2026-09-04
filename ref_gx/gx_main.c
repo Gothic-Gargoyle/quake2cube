@@ -8111,128 +8111,35 @@ static void Q2GX_SetupAliasShadow3D(void)
 
 
 /*
- * Q2GC_ALIAS_SHADOW_RECEIVER_V2
+ * Q2GC_ALIAS_SHADOW_RECEIVER_V3
  *
- * Traverse the already-retained native GX BSP node tree and
- * return the leaf containing a world-space point.
+ * V2 searched only the leaf containing the entity origin.
+ * That is correct when the receiving surface belongs to that
+ * leaf, but it can miss a floor lower down the vertical ray.
  *
- * Quake II BSP child convention:
- *   >= 0 : node index
- *   <  0 : leaf index encoded as -1-child
+ * V3 walks the complete BSP segment:
+ *
+ *     origin -> origin - (0, 0, 2048)
+ *
+ * and tests the marksurfaces of every crossed leaf.
+ *
+ * This remains geometry-only: no lightmap sampling is involved.
  */
-static int Q2GX_ShadowFindPointLeaf(
-    const f32 point[3])
+typedef struct q2gx_shadow_receiver_trace_s
 {
-    int node_index = 0;
-    unsigned int safety = 0u;
+    f32 x;
+    f32 y;
 
-    if (
-        !point
-        ||
-        !q2gx_world_nodes
-        ||
-        !q2gx_world_leaves
-        ||
-        q2gx_world_node_count == 0u
-        ||
-        q2gx_world_leaf_count == 0u
-    )
-    {
-        return -1;
-    }
+    f32 top_z;
+    f32 bottom_z;
 
-    for (;;)
-    {
-        const q2gx_world_node_t *node;
-        f32 dot;
-        int child;
-        int leaf_index;
+    qboolean found;
+    f32 best_z;
 
-        ++safety;
-
-        if (
-            safety
-            >
-            q2gx_world_node_count + 64u
-        )
-        {
-            return -1;
-        }
-
-        if (
-            node_index < 0
-            ||
-            (unsigned int)node_index
-            >=
-            q2gx_world_node_count
-        )
-        {
-            return -1;
-        }
-
-        node =
-            &q2gx_world_nodes[
-                (unsigned int)node_index
-            ];
-
-        if (
-            node->type >= 0
-            &&
-            node->type < 3
-        )
-        {
-            dot =
-                point[
-                    node->type
-                ]
-                -
-                node->dist;
-        }
-        else
-        {
-            dot =
-                point[0] * node->normal[0]
-                +
-                point[1] * node->normal[1]
-                +
-                point[2] * node->normal[2]
-                -
-                node->dist;
-        }
-
-        child =
-            node->children[
-                dot > 0.0f ? 0 : 1
-            ];
-
-        if (child >= 0)
-        {
-            node_index = child;
-            continue;
-        }
-
-        if (child == INT32_MIN)
-            return -1;
-
-        leaf_index =
-            -1
-            -
-            child;
-
-        if (
-            leaf_index < 0
-            ||
-            (unsigned int)leaf_index
-            >=
-            q2gx_world_leaf_count
-        )
-        {
-            return -1;
-        }
-
-        return leaf_index;
-    }
-}
+    unsigned int leaves_visited;
+    unsigned int faces_tested;
+    unsigned int triangles_tested;
+} q2gx_shadow_receiver_trace_t;
 
 
 /*
@@ -8328,10 +8235,6 @@ static qboolean Q2GX_ShadowTriangleHeight(
         -
         wb;
 
-    /*
-     * Tiny tolerance avoids dropping a receiver exactly on a
-     * shared triangle edge.
-     */
     if (
         wa < -0.001f
         ||
@@ -8354,72 +8257,32 @@ static qboolean Q2GX_ShadowTriangleHeight(
 }
 
 
-/*
- * Q2GC_ALIAS_SHADOW_RECEIVER_V2
- *
- * Geometry-only equivalent of the part of stock R_LightPoint()
- * shadows actually need: lightspot.z.
- *
- * We intentionally do NOT sample lightmaps here.
- *
- * Search only the point's leaf marksurfaces, only static world
- * faces, and only ordinary non-special surfaces. Pick the highest
- * vertical triangle hit below the entity within stock's 2048-unit
- * downward search range.
- */
-static qboolean Q2GX_FindAliasShadowReceiver(
-    const f32 origin[3],
-    f32 *receiver_z_out,
-    unsigned int *faces_tested_out,
-    unsigned int *triangles_tested_out)
+static void Q2GX_ShadowTestReceiverLeaf(
+    int leaf_index,
+    q2gx_shadow_receiver_trace_t *trace)
 {
-    int leaf_index;
     const q2gx_world_leaf_t *leaf;
 
     unsigned int mark_index;
     unsigned int mark_end;
 
-    qboolean found = false;
-    f32 best_z = -9999999.0f;
-
-    unsigned int faces_tested = 0u;
-    unsigned int triangles_tested = 0u;
-
-    if (faces_tested_out)
-        *faces_tested_out = 0u;
-
-    if (triangles_tested_out)
-        *triangles_tested_out = 0u;
-
     if (
-        !origin
+        !trace
         ||
-        !receiver_z_out
+        leaf_index < 0
+        ||
+        (unsigned int)leaf_index >= q2gx_world_leaf_count
+        ||
+        !q2gx_world_leaves
+        ||
+        !q2gx_world_leaffaces
         ||
         !q2gx_world_faces
         ||
         !q2gx_world_vertices
-        ||
-        !q2gx_world_leaffaces
     )
     {
-        return false;
-    }
-
-    leaf_index =
-        Q2GX_ShadowFindPointLeaf(
-            origin
-        );
-
-    if (
-        leaf_index < 0
-        ||
-        (unsigned int)leaf_index
-        >=
-        q2gx_world_leaf_count
-    )
-    {
-        return false;
+        return;
     }
 
     leaf =
@@ -8439,8 +8302,10 @@ static qboolean Q2GX_FindAliasShadowReceiver(
         leaf->first_leafface
     )
     {
-        return false;
+        return;
     }
+
+    ++trace->leaves_visited;
 
     mark_end =
         leaf->first_leafface
@@ -8460,7 +8325,6 @@ static qboolean Q2GX_FindAliasShadowReceiver(
             ];
 
         const q2gx_world_face_t *face;
-
         unsigned int vertex_offset;
 
         if (
@@ -8487,11 +8351,8 @@ static qboolean Q2GX_FindAliasShadowReceiver(
             ];
 
         /*
-         * Stock R_LightPoint is looking for an ordinary BSP
-         * receiving surface, not sky/turbulent/alpha specials.
-         *
-         * Also reject vertical/downward planes: they cannot be a
-         * sensible floor receiver for our vertical shadow ray.
+         * Preserve V2 receiver eligibility exactly.
+         * This experiment changes traversal, not surface policy.
          */
         if (
             face->surface_flags
@@ -8522,13 +8383,8 @@ static qboolean Q2GX_FindAliasShadowReceiver(
             continue;
         }
 
-        ++faces_tested;
+        ++trace->faces_tested;
 
-        /*
-         * Existing renderer contract:
-         * face vertices are GX_TRIANGLES, so each consecutive
-         * group of three is one real world triangle.
-         */
         for (
             vertex_offset = 0u;
             vertex_offset + 2u < face->vertex_count;
@@ -8562,12 +8418,12 @@ static qboolean Q2GX_FindAliasShadowReceiver(
 
             f32 candidate_z;
 
-            ++triangles_tested;
+            ++trace->triangles_tested;
 
             if (
                 !Q2GX_ShadowTriangleHeight(
-                    origin[0],
-                    origin[1],
+                    trace->x,
+                    trace->y,
                     a,
                     b,
                     c,
@@ -8578,16 +8434,10 @@ static qboolean Q2GX_FindAliasShadowReceiver(
                 continue;
             }
 
-            /*
-             * Match stock R_LightPoint's downward search extent.
-             *
-             * A quarter-unit top tolerance handles entities whose
-             * origin numerically sits fractionally inside the floor.
-             */
             if (
                 candidate_z
                 >
-                origin[2] + 0.25f
+                trace->top_z + 0.25f
             )
             {
                 continue;
@@ -8596,34 +8446,354 @@ static qboolean Q2GX_FindAliasShadowReceiver(
             if (
                 candidate_z
                 <
-                origin[2] - 2048.0f
+                trace->bottom_z
             )
             {
                 continue;
             }
 
             if (
-                !found
+                !trace->found
                 ||
-                candidate_z > best_z
+                candidate_z > trace->best_z
             )
             {
-                best_z = candidate_z;
-                found = true;
+                trace->best_z = candidate_z;
+                trace->found = true;
             }
         }
     }
+}
+
+
+static f32 Q2GX_ShadowNodeDistance(
+    const q2gx_world_node_t *node,
+    const f32 point[3])
+{
+    if (!node || !point)
+        return 0.0f;
+
+    if (
+        node->type >= 0
+        &&
+        node->type < 3
+    )
+    {
+        return
+            point[
+                node->type
+            ]
+            -
+            node->dist;
+    }
+
+    return
+        point[0] * node->normal[0]
+        +
+        point[1] * node->normal[1]
+        +
+        point[2] * node->normal[2]
+        -
+        node->dist;
+}
+
+
+/*
+ * Walk one line segment through the Quake II BSP.
+ *
+ * At a leaf, test that leaf's marksurfaces.
+ * At a node, recurse into one side or split the segment at the
+ * plane and visit both sides in ray order.
+ */
+static void Q2GX_ShadowTraceReceiverNode(
+    int node_index,
+    const f32 start[3],
+    const f32 end[3],
+    unsigned int depth,
+    q2gx_shadow_receiver_trace_t *trace)
+{
+    const q2gx_world_node_t *node;
+
+    f32 start_distance;
+    f32 end_distance;
+
+    unsigned int side;
+
+    if (
+        !trace
+        ||
+        !start
+        ||
+        !end
+    )
+    {
+        return;
+    }
+
+    if (
+        depth
+        >
+        q2gx_world_node_count + 64u
+    )
+    {
+        return;
+    }
+
+    if (node_index < 0)
+    {
+        int leaf_index;
+
+        if (node_index == INT32_MIN)
+            return;
+
+        leaf_index =
+            -1
+            -
+            node_index;
+
+        Q2GX_ShadowTestReceiverLeaf(
+            leaf_index,
+            trace
+        );
+
+        return;
+    }
+
+    if (
+        !q2gx_world_nodes
+        ||
+        (unsigned int)node_index
+        >=
+        q2gx_world_node_count
+    )
+    {
+        return;
+    }
+
+    node =
+        &q2gx_world_nodes[
+            (unsigned int)node_index
+        ];
+
+    start_distance =
+        Q2GX_ShadowNodeDistance(
+            node,
+            start
+        );
+
+    end_distance =
+        Q2GX_ShadowNodeDistance(
+            node,
+            end
+        );
+
+    if (
+        start_distance >= 0.0f
+        &&
+        end_distance >= 0.0f
+    )
+    {
+        Q2GX_ShadowTraceReceiverNode(
+            node->children[0],
+            start,
+            end,
+            depth + 1u,
+            trace
+        );
+
+        return;
+    }
+
+    if (
+        start_distance < 0.0f
+        &&
+        end_distance < 0.0f
+    )
+    {
+        Q2GX_ShadowTraceReceiverNode(
+            node->children[1],
+            start,
+            end,
+            depth + 1u,
+            trace
+        );
+
+        return;
+    }
+
+    {
+        f32 denominator =
+            start_distance
+            -
+            end_distance;
+
+        f32 fraction;
+
+        f32 mid[3];
+
+        if (
+            denominator > -0.000001f
+            &&
+            denominator < 0.000001f
+        )
+        {
+            fraction = 0.5f;
+        }
+        else
+        {
+            fraction =
+                start_distance
+                /
+                denominator;
+        }
+
+        if (fraction < 0.0f)
+            fraction = 0.0f;
+        else if (fraction > 1.0f)
+            fraction = 1.0f;
+
+        mid[0] =
+            start[0]
+            +
+            (
+                end[0] - start[0]
+            )
+            *
+            fraction;
+
+        mid[1] =
+            start[1]
+            +
+            (
+                end[1] - start[1]
+            )
+            *
+            fraction;
+
+        mid[2] =
+            start[2]
+            +
+            (
+                end[2] - start[2]
+            )
+            *
+            fraction;
+
+        side =
+            start_distance >= 0.0f
+            ?
+            0u
+            :
+            1u;
+
+        Q2GX_ShadowTraceReceiverNode(
+            node->children[side],
+            start,
+            mid,
+            depth + 1u,
+            trace
+        );
+
+        Q2GX_ShadowTraceReceiverNode(
+            node->children[side ^ 1u],
+            mid,
+            end,
+            depth + 1u,
+            trace
+        );
+    }
+}
+
+
+/*
+ * Q2GC_ALIAS_SHADOW_RECEIVER_V3
+ *
+ * Geometry-only lightspot.z lookup over a complete downward BSP
+ * segment rather than V2's origin-leaf-only marksurface search.
+ */
+static qboolean Q2GX_FindAliasShadowReceiver(
+    const f32 origin[3],
+    f32 *receiver_z_out,
+    unsigned int *leaves_visited_out,
+    unsigned int *faces_tested_out,
+    unsigned int *triangles_tested_out)
+{
+    f32 end[3];
+
+    q2gx_shadow_receiver_trace_t trace;
+
+    if (leaves_visited_out)
+        *leaves_visited_out = 0u;
 
     if (faces_tested_out)
-        *faces_tested_out = faces_tested;
+        *faces_tested_out = 0u;
 
     if (triangles_tested_out)
-        *triangles_tested_out = triangles_tested;
+        *triangles_tested_out = 0u;
 
-    if (!found)
+    if (
+        !origin
+        ||
+        !receiver_z_out
+        ||
+        !q2gx_world_nodes
+        ||
+        !q2gx_world_leaves
+        ||
+        !q2gx_world_leaffaces
+        ||
+        !q2gx_world_faces
+        ||
+        !q2gx_world_vertices
+        ||
+        q2gx_world_node_count == 0u
+    )
+    {
+        return false;
+    }
+
+    end[0] = origin[0];
+    end[1] = origin[1];
+    end[2] = origin[2] - 2048.0f;
+
+    trace.x = origin[0];
+    trace.y = origin[1];
+
+    trace.top_z = origin[2];
+    trace.bottom_z = end[2];
+
+    trace.found = false;
+    trace.best_z = -9999999.0f;
+
+    trace.leaves_visited = 0u;
+    trace.faces_tested = 0u;
+    trace.triangles_tested = 0u;
+
+    Q2GX_ShadowTraceReceiverNode(
+        0,
+        origin,
+        end,
+        0u,
+        &trace
+    );
+
+    if (leaves_visited_out)
+        *leaves_visited_out =
+            trace.leaves_visited;
+
+    if (faces_tested_out)
+        *faces_tested_out =
+            trace.faces_tested;
+
+    if (triangles_tested_out)
+        *triangles_tested_out =
+            trace.triangles_tested;
+
+    if (!trace.found)
         return false;
 
-    *receiver_z_out = best_z;
+    *receiver_z_out =
+        trace.best_z;
 
     return true;
 }
@@ -8650,6 +8820,10 @@ static void Q2GX_DrawAliasShadows(
     static unsigned int receiver_queries_window;
     static unsigned int receiver_hits_window;
     static unsigned int receiver_fallbacks_window;
+
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
+    static unsigned int receiver_leaves_visited_window;
+
     static unsigned int receiver_faces_tested_window;
     static unsigned int receiver_triangles_tested_window;
 
@@ -8671,6 +8845,10 @@ static void Q2GX_DrawAliasShadows(
     unsigned int receiver_queries = 0u;
     unsigned int receiver_hits = 0u;
     unsigned int receiver_fallbacks = 0u;
+
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
+    unsigned int receiver_leaves_visited = 0u;
+
     unsigned int receiver_faces_tested = 0u;
     unsigned int receiver_triangles_tested = 0u;
 
@@ -8733,6 +8911,9 @@ static void Q2GX_DrawAliasShadows(
             f32 receiver_z;
             f32 lheight;
             qboolean receiver_found;
+
+            /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
+            unsigned int receiver_leaves_visited_entity = 0u;
 
             unsigned int receiver_faces_tested_entity = 0u;
             unsigned int receiver_triangles_tested_entity = 0u;
@@ -8867,8 +9048,8 @@ static void Q2GX_DrawAliasShadows(
              *
              *   lheight = entity.origin.z - lightspot.z
              *
-             * Find the corresponding world-surface Z from the
-             * current BSP leaf. If this lookup fails, preserve the
+             * Find the corresponding world-surface Z by tracing the
+             * complete downward BSP segment. If this lookup fails, preserve the
              * already runtime-proven V1 result exactly.
              */
             ++receiver_queries;
@@ -8877,9 +9058,13 @@ static void Q2GX_DrawAliasShadows(
                 Q2GX_FindAliasShadowReceiver(
                     entity->origin,
                     &receiver_z,
+                    &receiver_leaves_visited_entity,
                     &receiver_faces_tested_entity,
                     &receiver_triangles_tested_entity
                 );
+
+            receiver_leaves_visited +=
+                receiver_leaves_visited_entity;
 
             receiver_faces_tested +=
                 receiver_faces_tested_entity;
@@ -8906,24 +9091,31 @@ static void Q2GX_DrawAliasShadows(
                 lheight = 0.0f;
             }
 
-            if (
-                lheight
-                <
-                receiver_min_lheight_window
-            )
+            /*
+             * Q2GC_ALIAS_SHADOW_RECEIVER_V3
+             * Receiver range describes successful BSP hits only.
+             */
+            if (receiver_found)
             {
-                receiver_min_lheight_window =
-                    lheight;
-            }
+                if (
+                    lheight
+                    <
+                    receiver_min_lheight_window
+                )
+                {
+                    receiver_min_lheight_window =
+                        lheight;
+                }
 
-            if (
-                lheight
-                >
-                receiver_max_lheight_window
-            )
-            {
-                receiver_max_lheight_window =
-                    lheight;
+                if (
+                    lheight
+                    >
+                    receiver_max_lheight_window
+                )
+                {
+                    receiver_max_lheight_window =
+                        lheight;
+                }
             }
 
             if (!changed_gx_state)
@@ -9079,11 +9271,12 @@ static void Q2GX_DrawAliasShadows(
                     "receiver_found=%u "
                     "receiver_z=%.3f "
                     "lheight=%.3f "
+                    "receiver_leaves=%u "
                     "receiver_faces=%u "
                     "receiver_tris=%u "
                     "alpha=128 "
-                    "receiver=bsp_leaf_triangles "
-                    "mode=stock_projection_receiver_v2\n",
+                    "receiver=bsp_segment_triangles "
+                    "mode=stock_projection_receiver_v3\n",
                     model->name,
                     frame_index,
                     old_frame_index,
@@ -9096,6 +9289,7 @@ static void Q2GX_DrawAliasShadows(
                     receiver_found ? 1u : 0u,
                     receiver_z,
                     lheight,
+                    receiver_leaves_visited_entity,
                     receiver_faces_tested_entity,
                     receiver_triangles_tested_entity
                 );
@@ -9134,6 +9328,10 @@ static void Q2GX_DrawAliasShadows(
     receiver_fallbacks_window +=
         receiver_fallbacks;
 
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
+    receiver_leaves_visited_window +=
+        receiver_leaves_visited;
+
     receiver_faces_tested_window +=
         receiver_faces_tested;
 
@@ -9159,14 +9357,16 @@ static void Q2GX_DrawAliasShadows(
             "queries=%u "
             "hits=%u "
             "fallbacks=%u "
+            "leaves_visited=%u "
             "faces_tested=%u "
             "triangles_tested=%u "
             "min_lheight=%.3f "
             "max_lheight=%.3f "
-            "mode=bsp_leaf_vertical_triangles_v2\n",
+            "mode=bsp_segment_vertical_triangles_v3\n",
             receiver_queries_window,
             receiver_hits_window,
             receiver_fallbacks_window,
+            receiver_leaves_visited_window,
             receiver_faces_tested_window,
             receiver_triangles_tested_window,
             (
@@ -9198,8 +9398,8 @@ static void Q2GX_DrawAliasShadows(
             "beam_skipped_total=%u "
             "invalid_frame_total=%u "
             "alpha=128 "
-            "receiver=bsp_leaf_triangles "
-            "mode=stock_projection_receiver_v2\n",
+            "receiver=bsp_segment_triangles "
+            "mode=stock_projection_receiver_v3\n",
             frames_window,
             (
                 shadow_cvar
@@ -9231,6 +9431,10 @@ static void Q2GX_DrawAliasShadows(
         receiver_queries_window = 0u;
         receiver_hits_window = 0u;
         receiver_fallbacks_window = 0u;
+
+        /* Q2GC_ALIAS_SHADOW_RECEIVER_V3 */
+        receiver_leaves_visited_window = 0u;
+
         receiver_faces_tested_window = 0u;
         receiver_triangles_tested_window = 0u;
 
