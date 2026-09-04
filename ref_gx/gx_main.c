@@ -8026,6 +8026,535 @@ static void Q2GX_LoadMirroredViewWeaponProjection(
 }
 
 
+/*
+ * Q2GC_ALIAS_SHADOW_V1
+ *
+ * Correctness-first stock Quake II alias-shadow projection.
+ *
+ * Stock GL obtains the receiver height from R_LightPoint() /
+ * lightspot. Native GX does not yet have that light-sampling
+ * path, so V1 deliberately uses the entity origin as its
+ * receiver plane:
+ *
+ *     lheight = 0
+ *     local shadow Z = 1
+ *
+ * The actual projection, interpolation, opacity, exclusions and
+ * depth/blend behavior otherwise mirror stock GL.
+ */
+static void Q2GX_SetupAliasShadow3D(void)
+{
+    GX_ClearVtxDesc();
+
+    GX_SetVtxDesc(
+        GX_VA_POS,
+        GX_DIRECT
+    );
+
+    GX_SetVtxDesc(
+        GX_VA_CLR0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_POS,
+        GX_POS_XYZ,
+        GX_F32,
+        0
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_CLR0,
+        GX_CLR_RGBA,
+        GX_RGBA8,
+        0
+    );
+
+    GX_SetNumChans(1);
+    GX_SetNumTexGens(0);
+    GX_SetNumTevStages(1);
+
+    GX_SetTevOrder(
+        GX_TEVSTAGE0,
+        GX_TEXCOORDNULL,
+        GX_TEXMAP_NULL,
+        GX_COLOR0A0
+    );
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_PASSCLR
+    );
+
+    GX_SetBlendMode(
+        GX_BM_BLEND,
+        GX_BL_SRCALPHA,
+        GX_BL_INVSRCALPHA,
+        GX_LO_CLEAR
+    );
+
+    /*
+     * Stock GL shadows are alpha blended over the world and do
+     * not need to become new depth occluders.
+     */
+    GX_SetZMode(
+        GX_TRUE,
+        GX_LEQUAL,
+        GX_FALSE
+    );
+
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetCullMode(GX_CULL_NONE);
+}
+
+
+static void Q2GX_DrawAliasShadows(
+    refdef_t *fd)
+{
+    static cvar_t *shadow_cvar;
+
+    static qboolean first_draw_logged;
+
+    static unsigned int frames_window;
+    static unsigned int entities_window;
+    static unsigned int triangles_window;
+    static unsigned int vertices_window;
+
+    static unsigned int translucent_skipped_window;
+    static unsigned int weapon_skipped_window;
+    static unsigned int beam_skipped_window;
+    static unsigned int invalid_frame_window;
+
+    unsigned int entity_index;
+
+    unsigned int entities = 0u;
+    unsigned int triangles = 0u;
+    unsigned int vertices = 0u;
+
+    unsigned int translucent_skipped = 0u;
+    unsigned int weapon_skipped = 0u;
+    unsigned int beam_skipped = 0u;
+    unsigned int invalid_frames = 0u;
+
+    qboolean changed_gx_state = false;
+
+    if (!fd)
+        return;
+
+    if (!shadow_cvar)
+    {
+        /*
+         * GameCube-facing generic name rather than borrowing the
+         * desktop GL renderer's gl_shadows namespace.
+         */
+        shadow_cvar =
+            ri.Cvar_Get(
+                "r_shadows",
+                "1",
+                CVAR_ARCHIVE
+            );
+    }
+
+    ++frames_window;
+
+    if (
+        shadow_cvar
+        &&
+        shadow_cvar->value != 0.0f
+        &&
+        fd->num_entities > 0
+        &&
+        fd->entities
+    )
+    {
+        for (
+            entity_index = 0u;
+            entity_index < (unsigned int)fd->num_entities;
+            ++entity_index
+        )
+        {
+            entity_t *entity =
+                &fd->entities[
+                    entity_index
+                ];
+
+            struct model_s *handle;
+            q2gx_alias_model_t *model;
+
+            unsigned int frame_index;
+            unsigned int old_frame_index;
+
+            q2gx_alias_lerp_t lerp;
+            q2gx_alias_transform_t transform;
+
+            f32 yaw_radians;
+            f32 shade_x;
+            f32 shade_y;
+
+            unsigned int triangle_index;
+
+            if (!entity->model)
+                continue;
+
+            handle = entity->model;
+
+            if (
+                handle->magic != Q2GX_MODEL_HANDLE_MAGIC
+                ||
+                handle->kind != Q2GX_MODEL_KIND_ALIAS_MD2
+            )
+            {
+                continue;
+            }
+
+            model = (q2gx_alias_model_t *)handle;
+
+            /*
+             * Exact stock shadow exclusions.
+             */
+            if (entity->flags & RF_TRANSLUCENT)
+            {
+                ++translucent_skipped;
+                continue;
+            }
+
+            if (entity->flags & RF_WEAPONMODEL)
+            {
+                ++weapon_skipped;
+                continue;
+            }
+
+            /*
+             * Beams are not MD2 shadow casters. This is normally
+             * redundant after the model-kind check but makes the
+             * contract explicit.
+             */
+            if (entity->flags & RF_BEAM)
+            {
+                ++beam_skipped;
+                continue;
+            }
+
+            if (
+                model->num_tris == 0u
+                ||
+                !model->triangles
+                ||
+                !model->frames
+            )
+            {
+                continue;
+            }
+
+            if (
+                entity->frame < 0
+                ||
+                (unsigned int)entity->frame >= model->num_frames
+            )
+            {
+                ++invalid_frames;
+                frame_index = 0u;
+                old_frame_index = 0u;
+            }
+            else if (
+                entity->oldframe < 0
+                ||
+                (unsigned int)entity->oldframe >= model->num_frames
+            )
+            {
+                ++invalid_frames;
+                frame_index = 0u;
+                old_frame_index = 0u;
+            }
+            else
+            {
+                frame_index =
+                    (unsigned int)entity->frame;
+
+                old_frame_index =
+                    (unsigned int)entity->oldframe;
+            }
+
+            Q2GX_InitAliasLerp(
+                model,
+                entity,
+                frame_index,
+                old_frame_index,
+                &lerp
+            );
+
+            Q2GX_InitAliasTransform(
+                entity,
+                &transform
+            );
+
+            /*
+             * Stock GL:
+             *
+             *   an = yaw / 180 * PI
+             *   shadevector = normalize(
+             *       cos(-an), sin(-an), 1
+             *   )
+             *
+             * Since cos² + sin² == 1, normalization is exactly
+             * multiplication by 1/sqrt(2).
+             */
+            yaw_radians =
+                entity->angles[1]
+                *
+                0.01745329251994329577f;
+
+            shade_x =
+                cosf(-yaw_radians)
+                *
+                0.70710678118654752440f;
+
+            shade_y =
+                sinf(-yaw_radians)
+                *
+                0.70710678118654752440f;
+
+            if (!changed_gx_state)
+            {
+                Q2GX_SetupAliasShadow3D();
+                changed_gx_state = true;
+            }
+
+            if (model->num_tris > 21845u)
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX SHADOW: "
+                    "%s too many triangles=%u\n",
+                    model->name,
+                    model->num_tris
+                );
+
+                continue;
+            }
+
+            GX_Begin(
+                GX_TRIANGLES,
+                GX_VTXFMT0,
+                (u16)(model->num_tris * 3u)
+            );
+
+            for (
+                triangle_index = 0u;
+                triangle_index < model->num_tris;
+                ++triangle_index
+            )
+            {
+                const q2gx_alias_triangle_t *triangle =
+                    &model->triangles[
+                        triangle_index
+                    ];
+
+                unsigned int corner;
+
+                for (
+                    corner = 0u;
+                    corner < 3u;
+                    ++corner
+                )
+                {
+                    unsigned int xyz_index =
+                        triangle->xyz[
+                            corner
+                        ];
+
+                    f32 local_x;
+                    f32 local_y;
+                    f32 local_z;
+
+                    f32 shadow_x;
+                    f32 shadow_y;
+                    f32 shadow_z;
+
+                    f32 world_x;
+                    f32 world_y;
+                    f32 world_z;
+
+                    Q2GX_LerpAliasVertex(
+                        &lerp,
+                        xyz_index,
+                        &local_x,
+                        &local_y,
+                        &local_z
+                    );
+
+                    /*
+                     * Stock GL_DrawAliasShadow:
+                     *
+                     * point.x -= shadevector.x *
+                     *            (point.z + lheight)
+                     *
+                     * point.y -= shadevector.y *
+                     *            (point.z + lheight)
+                     *
+                     * point.z = -lheight + 1
+                     *
+                     * V1:
+                     *     lheight = 0
+                     */
+                    shadow_x =
+                        local_x
+                        -
+                        shade_x * local_z;
+
+                    shadow_y =
+                        local_y
+                        -
+                        shade_y * local_z;
+
+                    shadow_z = 1.0f;
+
+                    Q2GX_TransformAliasPoint(
+                        &transform,
+                        shadow_x,
+                        shadow_y,
+                        shadow_z,
+                        &world_x,
+                        &world_y,
+                        &world_z
+                    );
+
+                    GX_Position3f32(
+                        world_x,
+                        world_y,
+                        world_z
+                    );
+
+                    GX_Color4u8(
+                        0u,
+                        0u,
+                        0u,
+                        128u
+                    );
+                }
+            }
+
+            GX_End();
+
+            ++entities;
+
+            triangles +=
+                model->num_tris;
+
+            vertices +=
+                model->num_tris * 3u;
+
+            if (!first_draw_logged)
+            {
+                first_draw_logged = true;
+
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX SHADOW FIRST DRAW: "
+                    "%s "
+                    "frame=%u oldframe=%u "
+                    "backlerp=%.4f "
+                    "tris=%u "
+                    "origin=%.3f,%.3f,%.3f "
+                    "yaw=%.3f "
+                    "alpha=128 "
+                    "receiver=origin_plus_1 "
+                    "mode=stock_projection_v1\n",
+                    model->name,
+                    frame_index,
+                    old_frame_index,
+                    entity->backlerp,
+                    model->num_tris,
+                    entity->origin[0],
+                    entity->origin[1],
+                    entity->origin[2],
+                    entity->angles[1]
+                );
+            }
+        }
+    }
+
+    entities_window +=
+        entities;
+
+    triangles_window +=
+        triangles;
+
+    vertices_window +=
+        vertices;
+
+    translucent_skipped_window +=
+        translucent_skipped;
+
+    weapon_skipped_window +=
+        weapon_skipped;
+
+    beam_skipped_window +=
+        beam_skipped;
+
+    invalid_frame_window +=
+        invalid_frames;
+
+    /*
+     * The shadow pass temporarily installs POS+CLR with no
+     * texture coordinate input. Restore the alias contract
+     * required by the immediately following view-weapon pass.
+     */
+    if (changed_gx_state)
+    {
+        Q2GX_RebuildAliasInputContract();
+        Q2GX_SetupAlias3D();
+    }
+
+    if (frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX SHADOW 120: "
+            "frames=%u "
+            "enabled=%u "
+            "entities_total=%u "
+            "triangles_total=%u "
+            "vertices_total=%u "
+            "translucent_skipped_total=%u "
+            "weapon_skipped_total=%u "
+            "beam_skipped_total=%u "
+            "invalid_frame_total=%u "
+            "alpha=128 "
+            "receiver=origin_plus_1 "
+            "mode=stock_projection_v1\n",
+            frames_window,
+            (
+                shadow_cvar
+                &&
+                shadow_cvar->value != 0.0f
+            )
+                ? 1u
+                : 0u,
+            entities_window,
+            triangles_window,
+            vertices_window,
+            translucent_skipped_window,
+            weapon_skipped_window,
+            beam_skipped_window,
+            invalid_frame_window
+        );
+
+        frames_window = 0u;
+        entities_window = 0u;
+        triangles_window = 0u;
+        vertices_window = 0u;
+
+        translucent_skipped_window = 0u;
+        weapon_skipped_window = 0u;
+        beam_skipped_window = 0u;
+        invalid_frame_window = 0u;
+    }
+}
+
+
 static void Q2GX_SetViewWeaponDepthRange(
     refdef_t *fd,
     f32 near_depth,
@@ -13299,6 +13828,14 @@ Q2GX_DrawBrushEntities(
     );
 
     Q2GX_DrawAliasEntities(
+        fd
+    );
+
+    /*
+     * Q2GC_ALIAS_SHADOW_V1
+     * Native GX stock-style opaque alias shadow pass.
+     */
+    Q2GX_DrawAliasShadows(
         fd
     );
 
