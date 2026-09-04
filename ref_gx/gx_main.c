@@ -88,6 +88,25 @@ static GXColor q2gx_palette[256];
 
 static qboolean q2gx_palette_loaded;
 
+/*
+ * Q2GC_PIC_CI8_V1
+ *
+ * All ordinary 2D PCX artwork already resolves through the base
+ * Quake II palette. Keep that palette in one shared hardware TLUT
+ * instead of expanding every cached picture to RGBA8.
+ *
+ * RGB5A3 preserves the existing transparent-index rule:
+ *
+ *     index 255 -> alpha 0
+ *     0..254    -> opaque RGB
+ */
+static u16 q2gx_pic_tlut_storage[256]
+    __attribute__((aligned(32)));
+
+static GXTlutObj q2gx_pic_tlut;
+static qboolean q2gx_pic_tlut_ready;
+static unsigned int q2gx_pic_tlut_loads_total;
+
 
 /*
  * Q2GC_NATIVE_DRAWCHAR_V1C
@@ -977,6 +996,120 @@ void R_GC_PurgeRegistrationResources(void)
 
 
 
+/*
+ * Q2GC_PIC_CI8_V1
+ */
+static u16 Q2GX_PicPackRGB5A3(
+    u8 r,
+    u8 g,
+    u8 b,
+    u8 a)
+{
+    /*
+     * RGB5A3:
+     *
+     *   1RRRRRGGGGGBBBBB   opaque RGB555
+     *   0AAARRRRGGGGBBBB   translucent A3RGB4
+     *
+     * PIC V1 only needs alpha 0 or 255.
+     */
+    if (a >= 224u)
+    {
+        return
+            (u16)(
+                0x8000u
+                |
+                ((u16)(r >> 3) << 10)
+                |
+                ((u16)(g >> 3) << 5)
+                |
+                (u16)(b >> 3)
+            );
+    }
+
+    return
+        (u16)(
+            ((u16)(a >> 5) << 12)
+            |
+            ((u16)(r >> 4) << 8)
+            |
+            ((u16)(g >> 4) << 4)
+            |
+            (u16)(b >> 4)
+        );
+}
+
+
+static void Q2GX_InitPicTLUT(void)
+{
+    unsigned int index;
+
+    for (index = 0u; index < 256u; ++index)
+    {
+        if (index == 255u)
+        {
+            q2gx_pic_tlut_storage[index] =
+                Q2GX_PicPackRGB5A3(
+                    0u,
+                    0u,
+                    0u,
+                    0u
+                );
+        }
+        else
+        {
+            q2gx_pic_tlut_storage[index] =
+                Q2GX_PicPackRGB5A3(
+                    q2gx_palette[index].r,
+                    q2gx_palette[index].g,
+                    q2gx_palette[index].b,
+                    255u
+                );
+        }
+    }
+
+    DCStoreRange(
+        q2gx_pic_tlut_storage,
+        sizeof(q2gx_pic_tlut_storage)
+    );
+
+    GX_InitTlutObj(
+        &q2gx_pic_tlut,
+        q2gx_pic_tlut_storage,
+        GX_TL_RGB5A3,
+        256u
+    );
+
+    q2gx_pic_tlut_ready = true;
+    q2gx_pic_tlut_loads_total = 0u;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX PIC CI8 INIT: "
+        "tlut_bytes=%u "
+        "format=rgb5a3 "
+        "transparent_index=255 "
+        "tlut=GX_TLUT0 "
+        "mode=shared_base_palette_v1\n",
+        (unsigned int)sizeof(q2gx_pic_tlut_storage)
+    );
+}
+
+
+static void Q2GX_BindPicTLUT(void)
+{
+    if (!q2gx_pic_tlut_ready)
+        return;
+
+    GX_LoadTlut(
+        &q2gx_pic_tlut,
+        GX_TLUT0
+    );
+
+    ++q2gx_pic_tlut_loads_total;
+}
+
+
 static qboolean Q2GX_LoadBasePalette(void)
 {
     void *file_data;
@@ -1068,6 +1201,8 @@ static qboolean Q2GX_LoadBasePalette(void)
 
     q2gx_palette_loaded =
         true;
+
+    Q2GX_InitPicTLUT();
 
     ri.Con_Printf(
         PRINT_ALL,
@@ -1859,6 +1994,14 @@ static void Q2GX_DrawTexturedQuad(
 
     Q2GX_SetupTextured2D();
 
+    /*
+     * Q2GC_PIC_CI8_V1
+     *
+     * GX_TLUT0 is also reused by alias skins, so restore the
+     * shared 2D picture palette immediately before the texture.
+     */
+    Q2GX_BindPicTLUT();
+
     GX_LoadTexObj(
         texture,
         GX_TEXMAP0
@@ -1951,6 +2094,14 @@ static void Q2GX_DrawTexturedQuadUV(
     }
 
     Q2GX_SetupTextured2D();
+
+    /*
+     * Q2GC_PIC_CI8_V1
+     *
+     * GX_TLUT0 is also reused by alias skins, so restore the
+     * shared 2D picture palette immediately before the texture.
+     */
+    Q2GX_BindPicTLUT();
 
     GX_LoadTexObj(
         texture,
@@ -2169,6 +2320,65 @@ static struct image_s *Q2GX_FindFreePicSlot(void)
 }
 
 
+/*
+ * Q2GC_PIC_CI8_V1
+ *
+ * GX CI8 texture storage is 8x4 texels per 32-byte block.
+ */
+static unsigned int Q2GX_PicCI8StorageBytes(
+    unsigned int width,
+    unsigned int height)
+{
+    unsigned int padded_width =
+        (width + 7u) & ~7u;
+
+    unsigned int padded_height =
+        (height + 3u) & ~3u;
+
+    return
+        padded_width
+        *
+        padded_height;
+}
+
+
+static void Q2GX_PicWriteCI8Texel(
+    byte *storage,
+    unsigned int padded_width,
+    unsigned int x,
+    unsigned int y,
+    byte palette_index)
+{
+    unsigned int tile_x =
+        x >> 3;
+
+    unsigned int tile_y =
+        y >> 2;
+
+    unsigned int tiles_per_row =
+        padded_width >> 3;
+
+    unsigned int tile_index =
+        tile_y
+        *
+        tiles_per_row
+        +
+        tile_x;
+
+    unsigned int within =
+        (y & 3u)
+        *
+        8u
+        +
+        (x & 7u);
+
+    storage[
+        tile_index * 32u + within
+    ] =
+        palette_index;
+}
+
+
 static qboolean Q2GX_LoadPCXPic(
     struct image_s *image,
     char *normalized)
@@ -2190,6 +2400,7 @@ static qboolean Q2GX_LoadPCXPic(
 
     unsigned int width;
     unsigned int height;
+    unsigned int padded_width;
 
     unsigned int planes;
     unsigned int bytes_per_line;
@@ -2342,13 +2553,13 @@ static qboolean Q2GX_LoadPCXPic(
         goto fail;
     }
 
+    padded_width =
+        (width + 7u) & ~7u;
+
     texture_bytes =
-        GX_GetTexBufferSize(
-            (u16)width,
-            (u16)height,
-            GX_TF_RGBA8,
-            GX_FALSE,
-            0
+        Q2GX_PicCI8StorageBytes(
+            width,
+            height
         );
 
     if (!texture_bytes)
@@ -2378,12 +2589,15 @@ static qboolean Q2GX_LoadPCXPic(
     }
 
     /*
-     * Any padded texels outside the real source dimensions
-     * start transparent black.
+     * Q2GC_PIC_CI8_V1
+     *
+     * Any padded texels outside the real source dimensions use
+     * palette index 255, preserving the existing transparent
+     * padding behavior.
      */
     memset(
         texture_data,
-        0,
+        255,
         texture_bytes
     );
 
@@ -2473,37 +2687,25 @@ static qboolean Q2GX_LoadPCXPic(
             {
                 if (x < width)
                 {
-                    GXColor color;
-                    u8 alpha;
-
-                    color =
-                        q2gx_palette[
-                            value
-                        ];
-
-                    if (value == 255)
+                    /*
+                     * Q2GC_PIC_CI8_V1
+                     *
+                     * Preserve the PCX byte itself. The shared
+                     * RGB5A3 TLUT resolves color and gives index
+                     * 255 alpha 0 at draw time.
+                     */
+                    if (value == 255u)
                     {
-                        alpha =
-                            0u;
-
                         has_alpha =
                             true;
                     }
-                    else
-                    {
-                        alpha =
-                            255u;
-                    }
 
-                    Q2GX_WriteRGBA8Texel(
-                        (u8 *)texture_data,
-                        width,
+                    Q2GX_PicWriteCI8Texel(
+                        (byte *)texture_data,
+                        padded_width,
                         x,
                         y,
-                        color.r,
-                        color.g,
-                        color.b,
-                        alpha
+                        value
                     );
                 }
 
@@ -2517,15 +2719,16 @@ static qboolean Q2GX_LoadPCXPic(
         texture_bytes
     );
 
-    GX_InitTexObj(
+    GX_InitTexObjCI(
         &image->texture,
         texture_data,
         (u16)width,
         (u16)height,
-        GX_TF_RGBA8,
+        GX_TF_CI8,
         GX_CLAMP,
         GX_CLAMP,
-        GX_FALSE
+        GX_FALSE,
+        GX_TLUT0
     );
 
     /*
@@ -2566,7 +2769,9 @@ static qboolean Q2GX_LoadPCXPic(
     ri.Con_Printf(
         PRINT_ALL,
         "Q2GC REF_GX PIC LOAD: "
-        "%s %ux%u bytes=%u alpha=%d\n",
+        "%s %ux%u ci8_bytes=%u alpha=%d "
+        "format=ci8 tlut=shared_rgb5a3 "
+        "mode=pcx_indices_v1\n",
         normalized,
         width,
         height,
@@ -2716,9 +2921,14 @@ static void Q2GX_ClearPicCache(void)
         ri.Con_Printf(
             PRINT_ALL,
             "Q2GC REF_GX PIC CACHE FREE: "
-            "images=%u bytes=%u\n",
+            "images=%u ci8_bytes=%u "
+            "shared_tlut_bytes=%u "
+            "tlut_loads=%u "
+            "mode=pcx_ci8_shared_rgb5a3_v1\n",
             count,
-            bytes
+            bytes,
+            (unsigned int)sizeof(q2gx_pic_tlut_storage),
+            q2gx_pic_tlut_loads_total
         );
     }
 
