@@ -197,15 +197,14 @@ include $(CARRY_ROOT)/make/image.mk
 # ------------------------------------------------------------------
 # Quake2Cube test policy.
 #
-# Preserve the established GameCube test contract:
+# Developer test loop:
 #
-#     clean
-#       -> fresh normal build
-#       -> fresh ISO
+#     incremental ISO
 #       -> Dolphin
 #
-# CarryHandle owns the generic Dolphin launch. TEST_TARGET keeps the
-# application-specific serialized build policy in Quake2Cube.
+# Do NOT force clean or a redundant full build here.  The ISO target
+# already carries the normal dependency chain and recompiles only what
+# changed.  CarryHandle remains the owner of the generic Dolphin launch.
 # ------------------------------------------------------------------
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))
@@ -215,8 +214,6 @@ Q2_TEST_TARGET := q2-test-image
 .PHONY: $(Q2_TEST_TARGET)
 
 $(Q2_TEST_TARGET):
-	$(MAKE) -f "$(PROJECT_MAKEFILE)" clean
-	$(MAKE) -f "$(PROJECT_MAKEFILE)"
 	$(MAKE) -f "$(PROJECT_MAKEFILE)" iso
 
 TEST_TARGET := $(Q2_TEST_TARGET)
