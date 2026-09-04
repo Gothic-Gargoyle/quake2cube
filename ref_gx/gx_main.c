@@ -613,6 +613,22 @@ static unsigned int q2gx_transalias_alpha_max_window;
 static qboolean q2gx_transalias_first_draw_logged;
 static qboolean q2gx_transalias_nonsmoke_first_draw_logged;
 
+/* Q2GC_PARTICLES_V1 */
+#define Q2GX_PARTICLE_POINT_SIZE_SIXTHS 18u
+
+static unsigned int q2gx_particles_frames_window;
+static unsigned int q2gx_particles_frames_with_particles_window;
+static unsigned int q2gx_particles_count_window;
+static unsigned int q2gx_particles_vertices_window;
+static unsigned int q2gx_particles_draw_calls_window;
+static unsigned int q2gx_particles_invalid_color_window;
+static unsigned int q2gx_particles_alpha_clamped_window;
+static unsigned int q2gx_particles_color_e0_window;
+static unsigned int q2gx_particles_color_d0_window;
+static unsigned int q2gx_particles_min_frame_window = 0xffffffffu;
+static unsigned int q2gx_particles_max_frame_window;
+static qboolean q2gx_particles_first_draw_logged;
+
 /* Q2GC_VIEW_WEAPON_V1 */
 static cvar_t *q2gx_viewweapon_hand;
 
@@ -6663,6 +6679,353 @@ static void Q2GX_RebuildAliasInputContract(void)
     );
 }
 
+/*
+ * Q2GC_PARTICLES_V1
+ *
+ * Stock Quake II accelerated GL path:
+ *   particle_t = origin + palette color index + alpha
+ *   GL_POINTS
+ *   SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+ *   depth writes disabled
+ *
+ * Native GX V1 deliberately uses a fixed 3-pixel point.
+ * GX point sizes are specified in 1/6-pixel units:
+ *   18 == 3 pixels.
+ *
+ * No texture is allocated or sampled.
+ */
+static void Q2GX_SetupParticles3D(refdef_t *fd)
+{
+    Q2GX_SetupWorld3D(fd);
+
+    GX_ClearVtxDesc();
+
+    GX_SetVtxDesc(
+        GX_VA_POS,
+        GX_DIRECT
+    );
+
+    GX_SetVtxDesc(
+        GX_VA_CLR0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_POS,
+        GX_POS_XYZ,
+        GX_F32,
+        0
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_CLR0,
+        GX_CLR_RGBA,
+        GX_RGBA8,
+        0
+    );
+
+    GX_SetNumChans(1);
+    GX_SetNumTexGens(0);
+    GX_SetNumTevStages(1);
+
+    GX_SetTevOrder(
+        GX_TEVSTAGE0,
+        GX_TEXCOORDNULL,
+        GX_TEXMAP_NULL,
+        GX_COLOR0A0
+    );
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_PASSCLR
+    );
+
+    GX_SetBlendMode(
+        GX_BM_BLEND,
+        GX_BL_SRCALPHA,
+        GX_BL_INVSRCALPHA,
+        GX_LO_CLEAR
+    );
+
+    GX_SetZMode(
+        GX_TRUE,
+        GX_LEQUAL,
+        GX_FALSE
+    );
+
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetCullMode(GX_CULL_NONE);
+
+    GX_SetPointSize(
+        (u8)Q2GX_PARTICLE_POINT_SIZE_SIXTHS,
+        GX_TO_ZERO
+    );
+}
+
+
+static void Q2GX_DrawParticles(refdef_t *fd)
+{
+    unsigned int particle_count = 0u;
+    unsigned int vertices = 0u;
+    unsigned int draw_calls = 0u;
+    unsigned int invalid_colors = 0u;
+    unsigned int alpha_clamped = 0u;
+    unsigned int color_e0 = 0u;
+    unsigned int color_d0 = 0u;
+
+    unsigned int first_color = 0u;
+    unsigned int first_alpha_u8 = 0u;
+    f32 first_alpha = 0.0f;
+
+    unsigned int base;
+
+    if (!fd)
+        return;
+
+    ++q2gx_particles_frames_window;
+
+    if (
+        fd->num_particles > 0
+        &&
+        fd->particles
+        &&
+        q2gx_palette_loaded
+    )
+    {
+        particle_count =
+            (unsigned int)fd->num_particles;
+
+        ++q2gx_particles_frames_with_particles_window;
+
+        if (
+            particle_count
+            <
+            q2gx_particles_min_frame_window
+        )
+        {
+            q2gx_particles_min_frame_window =
+                particle_count;
+        }
+
+        if (
+            particle_count
+            >
+            q2gx_particles_max_frame_window
+        )
+        {
+            q2gx_particles_max_frame_window =
+                particle_count;
+        }
+
+        Q2GX_SetupParticles3D(fd);
+
+        base = 0u;
+
+        while (base < particle_count)
+        {
+            unsigned int remaining =
+                particle_count - base;
+
+            unsigned int chunk =
+                remaining > 65535u
+                ?
+                65535u
+                :
+                remaining;
+
+            unsigned int i;
+
+            GX_Begin(
+                GX_POINTS,
+                GX_VTXFMT0,
+                (u16)chunk
+            );
+
+            for (i = 0u; i < chunk; ++i)
+            {
+                const particle_t *particle =
+                    &fd->particles[base + i];
+
+                unsigned int color_index;
+                f32 alpha;
+                unsigned int alpha_u8;
+
+                if (
+                    particle->color < 0
+                    ||
+                    particle->color > 255
+                )
+                {
+                    ++invalid_colors;
+                    color_index = 0u;
+                }
+                else
+                {
+                    color_index =
+                        (unsigned int)particle->color;
+                }
+
+                alpha = particle->alpha;
+
+                if (alpha < 0.0f)
+                {
+                    alpha = 0.0f;
+                    ++alpha_clamped;
+                }
+                else if (alpha > 1.0f)
+                {
+                    alpha = 1.0f;
+                    ++alpha_clamped;
+                }
+
+                /*
+                 * Match stock point path:
+                 *     color[3] = p->alpha * 255;
+                 */
+                alpha_u8 =
+                    (unsigned int)(
+                        alpha * 255.0f
+                    );
+
+                if (alpha_u8 > 255u)
+                    alpha_u8 = 255u;
+
+                if (color_index == 0xe0u)
+                    ++color_e0;
+
+                if (color_index == 0xd0u)
+                    ++color_d0;
+
+                if (base == 0u && i == 0u)
+                {
+                    first_color = color_index;
+                    first_alpha = particle->alpha;
+                    first_alpha_u8 = alpha_u8;
+                }
+
+                GX_Position3f32(
+                    particle->origin[0],
+                    particle->origin[1],
+                    particle->origin[2]
+                );
+
+                GX_Color4u8(
+                    q2gx_palette[color_index].r,
+                    q2gx_palette[color_index].g,
+                    q2gx_palette[color_index].b,
+                    (u8)alpha_u8
+                );
+            }
+
+            GX_End();
+
+            ++draw_calls;
+            vertices += chunk;
+            base += chunk;
+        }
+
+        Q2GX_SetupWorld3D(fd);
+
+        if (!q2gx_particles_first_draw_logged)
+        {
+            q2gx_particles_first_draw_logged = true;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX PARTICLES FIRST DRAW: "
+                "count=%u "
+                "first_color=%u "
+                "first_alpha=%.4f "
+                "first_alpha_u8=%u "
+                "point_sixths=%u "
+                "point_pixels=3.00 "
+                "mode=gx_points_palette_alpha_v1\n",
+                particle_count,
+                first_color,
+                first_alpha,
+                first_alpha_u8,
+                Q2GX_PARTICLE_POINT_SIZE_SIXTHS
+            );
+        }
+    }
+
+    q2gx_particles_count_window +=
+        particle_count;
+
+    q2gx_particles_vertices_window +=
+        vertices;
+
+    q2gx_particles_draw_calls_window +=
+        draw_calls;
+
+    q2gx_particles_invalid_color_window +=
+        invalid_colors;
+
+    q2gx_particles_alpha_clamped_window +=
+        alpha_clamped;
+
+    q2gx_particles_color_e0_window +=
+        color_e0;
+
+    q2gx_particles_color_d0_window +=
+        color_d0;
+
+    if (q2gx_particles_frames_window >= 120u)
+    {
+        unsigned int min_frame =
+            q2gx_particles_frames_with_particles_window > 0u
+            ?
+            q2gx_particles_min_frame_window
+            :
+            0u;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX PARTICLES 120: "
+            "frames=%u "
+            "frames_with_particles=%u "
+            "particles_total=%u "
+            "vertices_total=%u "
+            "draw_calls_total=%u "
+            "invalid_color_total=%u "
+            "alpha_clamped_total=%u "
+            "color_e0_total=%u "
+            "color_d0_total=%u "
+            "min_particles_frame=%u "
+            "max_particles_frame=%u "
+            "point_sixths=%u "
+            "mode=gx_points_palette_alpha_v1\n",
+            q2gx_particles_frames_window,
+            q2gx_particles_frames_with_particles_window,
+            q2gx_particles_count_window,
+            q2gx_particles_vertices_window,
+            q2gx_particles_draw_calls_window,
+            q2gx_particles_invalid_color_window,
+            q2gx_particles_alpha_clamped_window,
+            q2gx_particles_color_e0_window,
+            q2gx_particles_color_d0_window,
+            min_frame,
+            q2gx_particles_max_frame_window,
+            Q2GX_PARTICLE_POINT_SIZE_SIXTHS
+        );
+
+        q2gx_particles_frames_window = 0u;
+        q2gx_particles_frames_with_particles_window = 0u;
+        q2gx_particles_count_window = 0u;
+        q2gx_particles_vertices_window = 0u;
+        q2gx_particles_draw_calls_window = 0u;
+        q2gx_particles_invalid_color_window = 0u;
+        q2gx_particles_alpha_clamped_window = 0u;
+        q2gx_particles_color_e0_window = 0u;
+        q2gx_particles_color_d0_window = 0u;
+        q2gx_particles_min_frame_window = 0xffffffffu;
+        q2gx_particles_max_frame_window = 0u;
+    }
+}
+
+
 
 static void Q2GX_DrawAliasEntities(refdef_t *fd)
 {
@@ -8945,6 +9308,15 @@ Q2GX_DrawBrushEntities(
     );
 
     q2gx_alias_translucent_pass = false;
+
+    /*
+     * Q2GC_PARTICLES_V1
+     *
+     * Stock order places particles after entity rendering.
+     * Dynamic lights / alpha surfaces are not native-GX milestones yet,
+     * so particles follow the completed opaque/view/translucent entity stack.
+     */
+    Q2GX_DrawParticles(fd);
 
     ++q2gx_world_frames_window;
     q2gx_world_pvs_faces_window += pvs_faces;
