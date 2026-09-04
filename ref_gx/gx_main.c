@@ -651,6 +651,29 @@ static unsigned int q2gx_world_warp_vertices_window;
 static unsigned int q2gx_world_warp_load_fail_window;
 static qboolean q2gx_world_warp_first_draw_logged;
 
+/* Q2GC_UNDERWATER_WARP_V1 */
+#define Q2GX_UNDERWATER_COPY_WIDTH 640u
+#define Q2GX_UNDERWATER_COPY_HEIGHT 480u
+#define Q2GX_UNDERWATER_MESH_STEP 16u
+#define Q2GX_UNDERWATER_SOFT_CYCLE 128u
+#define Q2GX_UNDERWATER_SOFT_AMP2 3u
+#define Q2GX_UNDERWATER_SOFT_SPEED 20u
+
+static void *q2gx_underwater_copy_buffer;
+static u32 q2gx_underwater_copy_bytes;
+static GXTexObj q2gx_underwater_copy_texture;
+static qboolean q2gx_underwater_copy_ready;
+
+static unsigned int q2gx_underwater_warp_frames_window;
+static unsigned int q2gx_underwater_warp_active_frames_window;
+static unsigned int q2gx_underwater_warp_copies_window;
+static unsigned int q2gx_underwater_warp_quads_window;
+static unsigned int q2gx_underwater_warp_vertices_window;
+static unsigned int q2gx_underwater_warp_alloc_fail_window;
+static unsigned int q2gx_underwater_warp_bad_refdef_window;
+static qboolean q2gx_underwater_warp_first_logged;
+
+
 /* Q2GC_REFDEF_POLYBLEND_V1 */
 static unsigned int q2gx_polyblend_frames_window;
 static unsigned int q2gx_polyblend_active_frames_window;
@@ -3675,6 +3698,25 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_polyblend_alpha_min_window = 0u;
     q2gx_polyblend_alpha_max_window = 0u;
     q2gx_polyblend_underwater_first_logged = false;
+
+
+    if (q2gx_underwater_copy_buffer)
+    {
+        free(q2gx_underwater_copy_buffer);
+        q2gx_underwater_copy_buffer = NULL;
+    }
+
+    q2gx_underwater_copy_bytes = 0u;
+    q2gx_underwater_copy_ready = false;
+
+    q2gx_underwater_warp_frames_window = 0u;
+    q2gx_underwater_warp_active_frames_window = 0u;
+    q2gx_underwater_warp_copies_window = 0u;
+    q2gx_underwater_warp_quads_window = 0u;
+    q2gx_underwater_warp_vertices_window = 0u;
+    q2gx_underwater_warp_alloc_fail_window = 0u;
+    q2gx_underwater_warp_bad_refdef_window = 0u;
+    q2gx_underwater_warp_first_logged = false;
 }
 
 
@@ -10922,6 +10964,499 @@ static u8 Q2GX_Float01ToU8(f32 value)
  * after the 3D scene.  Do the same here: no contents-color recomputation
  * in the renderer.
  */
+
+
+static int Q2GX_UnderwaterSoftTurb(
+    int sample,
+    int phase)
+{
+    int index;
+    double angle;
+    double value;
+
+    index =
+        (sample + phase)
+        &
+        ((int)Q2GX_UNDERWATER_SOFT_CYCLE - 1);
+
+    angle =
+        (
+            (double)index
+            *
+            2.0
+            *
+            3.14159265358979323846
+        )
+        /
+        (double)Q2GX_UNDERWATER_SOFT_CYCLE;
+
+    value =
+        (double)Q2GX_UNDERWATER_SOFT_AMP2
+        +
+        sin(angle)
+        *
+        (double)Q2GX_UNDERWATER_SOFT_AMP2;
+
+    return (int)value;
+}
+
+
+static qboolean Q2GX_EnsureUnderwaterCopyTexture(void)
+{
+    if (
+        q2gx_underwater_copy_ready
+        &&
+        q2gx_underwater_copy_buffer
+    )
+    {
+        return true;
+    }
+
+    q2gx_underwater_copy_bytes =
+        GX_GetTexBufferSize(
+            Q2GX_UNDERWATER_COPY_WIDTH,
+            Q2GX_UNDERWATER_COPY_HEIGHT,
+            GX_TF_RGB565,
+            GX_FALSE,
+            0u
+        );
+
+    if (q2gx_underwater_copy_bytes == 0u)
+    {
+        ++q2gx_underwater_warp_alloc_fail_window;
+        return false;
+    }
+
+    q2gx_underwater_copy_buffer =
+        memalign(
+            32u,
+            q2gx_underwater_copy_bytes
+        );
+
+    if (!q2gx_underwater_copy_buffer)
+    {
+        ++q2gx_underwater_warp_alloc_fail_window;
+        q2gx_underwater_copy_bytes = 0u;
+        return false;
+    }
+
+    GX_InitTexObj(
+        &q2gx_underwater_copy_texture,
+        q2gx_underwater_copy_buffer,
+        Q2GX_UNDERWATER_COPY_WIDTH,
+        Q2GX_UNDERWATER_COPY_HEIGHT,
+        GX_TF_RGB565,
+        GX_CLAMP,
+        GX_CLAMP,
+        GX_FALSE
+    );
+
+    GX_InitTexObjFilterMode(
+        &q2gx_underwater_copy_texture,
+        GX_NEAR,
+        GX_NEAR
+    );
+
+    q2gx_underwater_copy_ready = true;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX UNDERWATER WARP ALLOC: "
+        "width=%u height=%u bytes=%u format=RGB565 "
+        "target=gamecube_flipper_gx\n",
+        Q2GX_UNDERWATER_COPY_WIDTH,
+        Q2GX_UNDERWATER_COPY_HEIGHT,
+        (unsigned int)q2gx_underwater_copy_bytes
+    );
+
+    return true;
+}
+
+
+static void Q2GX_SetupUnderwaterWarp2D(void)
+{
+    Q2GX_Setup2D();
+
+    GX_ClearVtxDesc();
+
+    GX_SetVtxDesc(
+        GX_VA_POS,
+        GX_DIRECT
+    );
+
+    GX_SetVtxDesc(
+        GX_VA_CLR0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxDesc(
+        GX_VA_TEX0,
+        GX_DIRECT
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_POS,
+        GX_POS_XY,
+        GX_F32,
+        0
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_CLR0,
+        GX_CLR_RGBA,
+        GX_RGBA8,
+        0
+    );
+
+    GX_SetVtxAttrFmt(
+        GX_VTXFMT0,
+        GX_VA_TEX0,
+        GX_TEX_ST,
+        GX_F32,
+        0
+    );
+
+    GX_SetNumChans(1);
+    GX_SetNumTexGens(1);
+
+    GX_SetTexCoordGen(
+        GX_TEXCOORD0,
+        GX_TG_MTX2x4,
+        GX_TG_TEX0,
+        GX_IDENTITY
+    );
+
+    GX_SetNumTevStages(1);
+
+    GX_SetTevOrder(
+        GX_TEVSTAGE0,
+        GX_TEXCOORD0,
+        GX_TEXMAP0,
+        GX_COLOR0A0
+    );
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_MODULATE
+    );
+
+    GX_SetCullMode(
+        GX_CULL_NONE
+    );
+
+    GX_SetZMode(
+        GX_FALSE,
+        GX_ALWAYS,
+        GX_FALSE
+    );
+
+    GX_SetBlendMode(
+        GX_BM_NONE,
+        GX_BL_ONE,
+        GX_BL_ZERO,
+        GX_LO_CLEAR
+    );
+}
+
+
+static void Q2GX_EmitUnderwaterWarpVertex(
+    f32 x,
+    f32 y,
+    int phase)
+{
+    int dx;
+    int dy;
+    f32 s;
+    f32 t;
+
+    dx =
+        Q2GX_UnderwaterSoftTurb(
+            (int)y,
+            phase
+        );
+
+    dy =
+        Q2GX_UnderwaterSoftTurb(
+            (int)x,
+            phase
+        );
+
+    s =
+        (
+            x
+            +
+            (f32)dx
+        )
+        /
+        (
+            (f32)Q2GX_UNDERWATER_COPY_WIDTH
+            +
+            (f32)(Q2GX_UNDERWATER_SOFT_AMP2 * 2u)
+        );
+
+    t =
+        (
+            y
+            +
+            (f32)dy
+        )
+        /
+        (
+            (f32)Q2GX_UNDERWATER_COPY_HEIGHT
+            +
+            (f32)(Q2GX_UNDERWATER_SOFT_AMP2 * 2u)
+        );
+
+    GX_Position2f32(x, y);
+    GX_Color4u8(255u, 255u, 255u, 255u);
+    GX_TexCoord2f32(s, t);
+}
+
+
+static void Q2GX_DrawUnderwaterWarp(
+    refdef_t *fd)
+{
+    unsigned int y;
+    unsigned int x;
+    unsigned int quads = 0u;
+    unsigned int vertices = 0u;
+    int phase;
+
+    if (!fd)
+        return;
+
+    ++q2gx_underwater_warp_frames_window;
+
+    if (
+        !(
+            fd->rdflags
+            &
+            RDF_UNDERWATER
+        )
+    )
+    {
+        goto report;
+    }
+
+    if (
+        fd->x != 0
+        ||
+        fd->y != 0
+        ||
+        fd->width
+        !=
+        (int)Q2GX_UNDERWATER_COPY_WIDTH
+        ||
+        fd->height
+        !=
+        (int)Q2GX_UNDERWATER_COPY_HEIGHT
+    )
+    {
+        ++q2gx_underwater_warp_bad_refdef_window;
+        goto report;
+    }
+
+    if (!Q2GX_EnsureUnderwaterCopyTexture())
+        goto report;
+
+    GX_SetTexCopySrc(
+        0u,
+        0u,
+        Q2GX_UNDERWATER_COPY_WIDTH,
+        Q2GX_UNDERWATER_COPY_HEIGHT
+    );
+
+    GX_SetTexCopyDst(
+        Q2GX_UNDERWATER_COPY_WIDTH,
+        Q2GX_UNDERWATER_COPY_HEIGHT,
+        GX_TF_RGB565,
+        GX_FALSE
+    );
+
+    GX_CopyTex(
+        q2gx_underwater_copy_buffer,
+        GX_FALSE
+    );
+
+    GX_PixModeSync();
+    GX_InvalidateTexAll();
+
+    ++q2gx_underwater_warp_copies_window;
+    ++q2gx_underwater_warp_active_frames_window;
+
+    Q2GX_SetupUnderwaterWarp2D();
+
+    GX_LoadTexObj(
+        &q2gx_underwater_copy_texture,
+        GX_TEXMAP0
+    );
+
+    phase =
+        (
+            (int)(
+                fd->time
+                *
+                (f32)Q2GX_UNDERWATER_SOFT_SPEED
+            )
+        )
+        &
+        ((int)Q2GX_UNDERWATER_SOFT_CYCLE - 1);
+
+    GX_Begin(
+        GX_QUADS,
+        GX_VTXFMT0,
+        (u16)(
+            (
+                Q2GX_UNDERWATER_COPY_WIDTH
+                /
+                Q2GX_UNDERWATER_MESH_STEP
+            )
+            *
+            (
+                Q2GX_UNDERWATER_COPY_HEIGHT
+                /
+                Q2GX_UNDERWATER_MESH_STEP
+            )
+            *
+            4u
+        )
+    );
+
+    for (
+        y = 0u;
+        y < Q2GX_UNDERWATER_COPY_HEIGHT;
+        y += Q2GX_UNDERWATER_MESH_STEP
+    )
+    {
+        for (
+            x = 0u;
+            x < Q2GX_UNDERWATER_COPY_WIDTH;
+            x += Q2GX_UNDERWATER_MESH_STEP
+        )
+        {
+            f32 x0 = (f32)x;
+            f32 y0 = (f32)y;
+            f32 x1 =
+                (f32)(
+                    x
+                    +
+                    Q2GX_UNDERWATER_MESH_STEP
+                );
+            f32 y1 =
+                (f32)(
+                    y
+                    +
+                    Q2GX_UNDERWATER_MESH_STEP
+                );
+
+            Q2GX_EmitUnderwaterWarpVertex(
+                x0,
+                y0,
+                phase
+            );
+
+            Q2GX_EmitUnderwaterWarpVertex(
+                x1,
+                y0,
+                phase
+            );
+
+            Q2GX_EmitUnderwaterWarpVertex(
+                x1,
+                y1,
+                phase
+            );
+
+            Q2GX_EmitUnderwaterWarpVertex(
+                x0,
+                y1,
+                phase
+            );
+
+            ++quads;
+            vertices += 4u;
+        }
+    }
+
+    GX_End();
+
+    q2gx_underwater_warp_quads_window +=
+        quads;
+
+    q2gx_underwater_warp_vertices_window +=
+        vertices;
+
+    if (!q2gx_underwater_warp_first_logged)
+    {
+        q2gx_underwater_warp_first_logged = true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX UNDERWATER WARP FIRST: "
+            "copy=%ux%u "
+            "bytes=%u "
+            "mesh_step=%u "
+            "quads=%u "
+            "vertices=%u "
+            "cycle=%u "
+            "amp2=%u "
+            "speed=%u "
+            "phase=%d "
+            "format=RGB565 "
+            "target=gamecube_flipper_gx "
+            "mode=efb_copy_softwarp_mesh_v1\n",
+            Q2GX_UNDERWATER_COPY_WIDTH,
+            Q2GX_UNDERWATER_COPY_HEIGHT,
+            (unsigned int)q2gx_underwater_copy_bytes,
+            Q2GX_UNDERWATER_MESH_STEP,
+            quads,
+            vertices,
+            Q2GX_UNDERWATER_SOFT_CYCLE,
+            Q2GX_UNDERWATER_SOFT_AMP2,
+            Q2GX_UNDERWATER_SOFT_SPEED,
+            phase
+        );
+    }
+
+report:
+    if (q2gx_underwater_warp_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX UNDERWATER WARP 120: "
+            "frames=%u "
+            "underwater_frames=%u "
+            "copies=%u "
+            "quads=%u "
+            "vertices=%u "
+            "alloc_fail=%u "
+            "bad_refdef=%u "
+            "bytes=%u "
+            "target=gamecube_flipper_gx "
+            "mode=efb_copy_softwarp_mesh_v1\n",
+            q2gx_underwater_warp_frames_window,
+            q2gx_underwater_warp_active_frames_window,
+            q2gx_underwater_warp_copies_window,
+            q2gx_underwater_warp_quads_window,
+            q2gx_underwater_warp_vertices_window,
+            q2gx_underwater_warp_alloc_fail_window,
+            q2gx_underwater_warp_bad_refdef_window,
+            (unsigned int)q2gx_underwater_copy_bytes
+        );
+
+        q2gx_underwater_warp_frames_window = 0u;
+        q2gx_underwater_warp_active_frames_window = 0u;
+        q2gx_underwater_warp_copies_window = 0u;
+        q2gx_underwater_warp_quads_window = 0u;
+        q2gx_underwater_warp_vertices_window = 0u;
+        q2gx_underwater_warp_alloc_fail_window = 0u;
+        q2gx_underwater_warp_bad_refdef_window = 0u;
+    }
+}
+
+
 static void Q2GX_DrawRefdefPolyBlend(refdef_t *fd)
 {
     u8 r;
@@ -12002,6 +12537,8 @@ q2gx_world_frames_window = 0u;
         q2gx_brush_vertices_window = 0u;
 
     }
+
+    Q2GX_DrawUnderwaterWarp(fd);
 
     Q2GX_DrawRefdefPolyBlend(fd);
 
