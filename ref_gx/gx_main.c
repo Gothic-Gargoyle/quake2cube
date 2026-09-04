@@ -629,6 +629,82 @@ static unsigned int q2gx_particles_min_frame_window = 0xffffffffu;
 static unsigned int q2gx_particles_max_frame_window;
 static qboolean q2gx_particles_first_draw_logged;
 
+/* Q2GC_WORLD_SKY_V1 */
+#define Q2GX_SKY_FACE_COUNT 6u
+#define Q2GX_SKY_MAX_CLIP_VERTS 64u
+#define Q2GX_SKY_ON_EPSILON 0.1f
+#define Q2GX_SKY_DISTANCE 2300.0f
+
+static struct image_s *q2gx_sky_images[Q2GX_SKY_FACE_COUNT];
+static char q2gx_sky_name[MAX_QPATH];
+static f32 q2gx_sky_rotate;
+static f32 q2gx_sky_axis[3];
+static qboolean q2gx_sky_ready;
+static qboolean q2gx_sky_first_draw_logged;
+
+static f32 q2gx_sky_mins[2][Q2GX_SKY_FACE_COUNT];
+static f32 q2gx_sky_maxs[2][Q2GX_SKY_FACE_COUNT];
+
+static unsigned int q2gx_sky_frames_window;
+static unsigned int q2gx_sky_frames_with_sky_window;
+static unsigned int q2gx_sky_source_faces_window;
+static unsigned int q2gx_sky_box_faces_window;
+static unsigned int q2gx_sky_vertices_window;
+
+static const char *q2gx_sky_suffix[Q2GX_SKY_FACE_COUNT] =
+{
+    "rt",
+    "bk",
+    "lf",
+    "ft",
+    "up",
+    "dn"
+};
+
+static const int q2gx_sky_st_to_vec[6][3] =
+{
+	{3,-1,2},
+	{-3,1,2},
+
+	{1,3,2},
+	{-1,-3,2},
+
+	{-2,-1,3},		// 0 degrees yaw, look straight up
+	{2,-1,-3}		// look straight down
+
+//	{-1,2,3},
+//	{1,2,-3}
+};
+
+static const int q2gx_sky_vec_to_st[6][3] =
+{
+	{-2,3,1},
+	{2,3,-1},
+
+	{1,3,2},
+	{-1,3,-2},
+
+	{-2,-1,3},
+	{-2,1,-3}
+
+//	{-1,2,3},
+//	{1,2,-3}
+};
+
+static const int q2gx_sky_tex_order[6] =
+{0,2,1,3,4,5};
+
+static const f32 q2gx_sky_clip[6][3] =
+{
+	{1,1,0},
+	{1,-1,0},
+	{0,-1,1},
+	{0,1,1},
+	{1,0,1},
+	{-1,0,1}
+};
+
+
 /* Q2GC_VIEW_WEAPON_V1 */
 static cvar_t *q2gx_viewweapon_hand;
 
@@ -8661,6 +8737,680 @@ static void Q2GX_DrawBrushEntities(
 }
 
 
+
+
+static void Q2GX_ClearSkyBounds(void)
+{
+    unsigned int i;
+
+    for (i = 0u; i < Q2GX_SKY_FACE_COUNT; ++i)
+    {
+        q2gx_sky_mins[0][i] = 9999.0f;
+        q2gx_sky_mins[1][i] = 9999.0f;
+        q2gx_sky_maxs[0][i] = -9999.0f;
+        q2gx_sky_maxs[1][i] = -9999.0f;
+    }
+}
+
+
+static void Q2GX_DrawSkyPolygon(
+    unsigned int nump,
+    const f32 vecs[][3])
+{
+    f32 v[3] = {0.0f, 0.0f, 0.0f};
+    f32 av[3];
+    unsigned int i;
+    int axis;
+
+    for (i = 0u; i < nump; ++i)
+    {
+        v[0] += vecs[i][0];
+        v[1] += vecs[i][1];
+        v[2] += vecs[i][2];
+    }
+
+    av[0] = fabsf(v[0]);
+    av[1] = fabsf(v[1]);
+    av[2] = fabsf(v[2]);
+
+    if (av[0] > av[1] && av[0] > av[2])
+        axis = v[0] < 0.0f ? 1 : 0;
+    else if (av[1] > av[2] && av[1] > av[0])
+        axis = v[1] < 0.0f ? 3 : 2;
+    else
+        axis = v[2] < 0.0f ? 5 : 4;
+
+    for (i = 0u; i < nump; ++i)
+    {
+        int j;
+        f32 dv;
+        f32 sky_s;
+        f32 sky_t;
+
+        j = q2gx_sky_vec_to_st[axis][2];
+
+        if (j > 0)
+            dv = vecs[i][j - 1];
+        else
+            dv = -vecs[i][-j - 1];
+
+        if (dv < 0.001f)
+            continue;
+
+        j = q2gx_sky_vec_to_st[axis][0];
+
+        if (j < 0)
+            sky_s = -vecs[i][-j - 1] / dv;
+        else
+            sky_s = vecs[i][j - 1] / dv;
+
+        j = q2gx_sky_vec_to_st[axis][1];
+
+        if (j < 0)
+            sky_t = -vecs[i][-j - 1] / dv;
+        else
+            sky_t = vecs[i][j - 1] / dv;
+
+        if (sky_s < q2gx_sky_mins[0][axis])
+            q2gx_sky_mins[0][axis] = sky_s;
+        if (sky_t < q2gx_sky_mins[1][axis])
+            q2gx_sky_mins[1][axis] = sky_t;
+        if (sky_s > q2gx_sky_maxs[0][axis])
+            q2gx_sky_maxs[0][axis] = sky_s;
+        if (sky_t > q2gx_sky_maxs[1][axis])
+            q2gx_sky_maxs[1][axis] = sky_t;
+    }
+}
+
+
+static void Q2GX_ClipSkyPolygon(
+    unsigned int nump,
+    const f32 vecs[][3],
+    unsigned int stage)
+{
+    f32 dists[Q2GX_SKY_MAX_CLIP_VERTS];
+    int sides[Q2GX_SKY_MAX_CLIP_VERTS];
+    f32 looped[Q2GX_SKY_MAX_CLIP_VERTS][3];
+    f32 newv[2][Q2GX_SKY_MAX_CLIP_VERTS][3];
+    unsigned int newc[2] = {0u, 0u};
+    unsigned int i;
+    unsigned int j;
+    qboolean front = false;
+    qboolean back = false;
+
+    if (nump > Q2GX_SKY_MAX_CLIP_VERTS - 2u)
+        return;
+
+    if (stage == 6u)
+    {
+        Q2GX_DrawSkyPolygon(nump, vecs);
+        return;
+    }
+
+    for (i = 0u; i < nump; ++i)
+    {
+        f32 d =
+            vecs[i][0] * q2gx_sky_clip[stage][0]
+            +
+            vecs[i][1] * q2gx_sky_clip[stage][1]
+            +
+            vecs[i][2] * q2gx_sky_clip[stage][2];
+
+        dists[i] = d;
+
+        if (d > Q2GX_SKY_ON_EPSILON)
+        {
+            front = true;
+            sides[i] = 1;
+        }
+        else if (d < -Q2GX_SKY_ON_EPSILON)
+        {
+            back = true;
+            sides[i] = -1;
+        }
+        else
+        {
+            sides[i] = 0;
+        }
+
+        looped[i][0] = vecs[i][0];
+        looped[i][1] = vecs[i][1];
+        looped[i][2] = vecs[i][2];
+    }
+
+    if (!front || !back)
+    {
+        Q2GX_ClipSkyPolygon(nump, vecs, stage + 1u);
+        return;
+    }
+
+    sides[nump] = sides[0];
+    dists[nump] = dists[0];
+
+    looped[nump][0] = looped[0][0];
+    looped[nump][1] = looped[0][1];
+    looped[nump][2] = looped[0][2];
+
+    for (i = 0u; i < nump; ++i)
+    {
+        const f32 *v = looped[i];
+
+        if (sides[i] >= 0)
+        {
+            newv[0][newc[0]][0] = v[0];
+            newv[0][newc[0]][1] = v[1];
+            newv[0][newc[0]][2] = v[2];
+            ++newc[0];
+        }
+
+        if (sides[i] <= 0)
+        {
+            newv[1][newc[1]][0] = v[0];
+            newv[1][newc[1]][1] = v[1];
+            newv[1][newc[1]][2] = v[2];
+            ++newc[1];
+        }
+
+        if (
+            sides[i] == 0
+            ||
+            sides[i + 1u] == 0
+            ||
+            sides[i + 1u] == sides[i]
+        )
+        {
+            continue;
+        }
+
+        {
+            f32 d =
+                dists[i]
+                /
+                (dists[i] - dists[i + 1u]);
+
+            for (j = 0u; j < 3u; ++j)
+            {
+                f32 e =
+                    v[j]
+                    +
+                    d
+                    *
+                    (
+                        looped[i + 1u][j]
+                        -
+                        v[j]
+                    );
+
+                newv[0][newc[0]][j] = e;
+                newv[1][newc[1]][j] = e;
+            }
+        }
+
+        ++newc[0];
+        ++newc[1];
+    }
+
+    if (newc[0] > 0u)
+        Q2GX_ClipSkyPolygon(newc[0], newv[0], stage + 1u);
+
+    if (newc[1] > 0u)
+        Q2GX_ClipSkyPolygon(newc[1], newv[1], stage + 1u);
+}
+
+
+static void Q2GX_RotateSkyPoint(
+    const refdef_t *fd,
+    const f32 in[3],
+    f32 out[3])
+{
+    f32 ax;
+    f32 ay;
+    f32 az;
+    f32 len;
+
+    if (!fd || q2gx_sky_rotate == 0.0f)
+    {
+        out[0] = in[0];
+        out[1] = in[1];
+        out[2] = in[2];
+        return;
+    }
+
+    ax = q2gx_sky_axis[0];
+    ay = q2gx_sky_axis[1];
+    az = q2gx_sky_axis[2];
+
+    len = sqrtf(ax * ax + ay * ay + az * az);
+
+    if (len <= 0.0001f)
+    {
+        out[0] = in[0];
+        out[1] = in[1];
+        out[2] = in[2];
+        return;
+    }
+
+    ax /= len;
+    ay /= len;
+    az /= len;
+
+    {
+        f32 radians =
+            fd->time
+            *
+            q2gx_sky_rotate
+            *
+            (3.14159265358979323846f / 180.0f);
+
+        f32 c = cosf(radians);
+        f32 sn = sinf(radians);
+
+        f32 dot =
+            ax * in[0]
+            +
+            ay * in[1]
+            +
+            az * in[2];
+
+        f32 cross_x =
+            ay * in[2] - az * in[1];
+
+        f32 cross_y =
+            az * in[0] - ax * in[2];
+
+        f32 cross_z =
+            ax * in[1] - ay * in[0];
+
+        out[0] =
+            in[0] * c
+            +
+            cross_x * sn
+            +
+            ax * dot * (1.0f - c);
+
+        out[1] =
+            in[1] * c
+            +
+            cross_y * sn
+            +
+            ay * dot * (1.0f - c);
+
+        out[2] =
+            in[2] * c
+            +
+            cross_z * sn
+            +
+            az * dot * (1.0f - c);
+    }
+}
+
+
+static void Q2GX_EmitSkyVertex(
+    refdef_t *fd,
+    f32 sky_s,
+    f32 sky_t,
+    unsigned int axis,
+    const struct image_s *image)
+{
+    f32 b[3];
+    f32 local[3];
+    f32 rotated[3];
+
+    f32 tex_s;
+    f32 tex_t;
+    f32 min_s;
+    f32 max_s;
+    f32 min_t;
+    f32 max_t;
+
+    unsigned int j;
+
+    b[0] = sky_s * Q2GX_SKY_DISTANCE;
+    b[1] = sky_t * Q2GX_SKY_DISTANCE;
+    b[2] = Q2GX_SKY_DISTANCE;
+
+    for (j = 0u; j < 3u; ++j)
+    {
+        int k =
+            q2gx_sky_st_to_vec[axis][j];
+
+        if (k < 0)
+            local[j] = -b[-k - 1];
+        else
+            local[j] = b[k - 1];
+    }
+
+    Q2GX_RotateSkyPoint(fd, local, rotated);
+
+    tex_s = (sky_s + 1.0f) * 0.5f;
+    tex_t = (sky_t + 1.0f) * 0.5f;
+
+    min_s =
+        image && image->width > 0
+        ?
+        1.0f / (f32)image->width
+        :
+        1.0f / 256.0f;
+
+    max_s =
+        image && image->width > 0
+        ?
+        ((f32)image->width - 1.0f) / (f32)image->width
+        :
+        255.0f / 256.0f;
+
+    min_t =
+        image && image->height > 0
+        ?
+        1.0f / (f32)image->height
+        :
+        1.0f / 256.0f;
+
+    max_t =
+        image && image->height > 0
+        ?
+        ((f32)image->height - 1.0f) / (f32)image->height
+        :
+        255.0f / 256.0f;
+
+    if (tex_s < min_s)
+        tex_s = min_s;
+    else if (tex_s > max_s)
+        tex_s = max_s;
+
+    if (tex_t < min_t)
+        tex_t = min_t;
+    else if (tex_t > max_t)
+        tex_t = max_t;
+
+    tex_t = 1.0f - tex_t;
+
+    GX_Position3f32(
+        fd->vieworg[0] + rotated[0],
+        fd->vieworg[1] + rotated[1],
+        fd->vieworg[2] + rotated[2]
+    );
+
+    GX_Color4u8(255u, 255u, 255u, 255u);
+
+    GX_TexCoord2f32(tex_s, tex_t);
+}
+
+
+static void Q2GX_SetupSky3D(refdef_t *fd)
+{
+    Q2GX_SetupTexturedWorld3D(fd);
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_REPLACE
+    );
+
+    GX_SetBlendMode(
+        GX_BM_NONE,
+        GX_BL_ONE,
+        GX_BL_ZERO,
+        GX_LO_CLEAR
+    );
+
+    GX_SetZMode(
+        GX_TRUE,
+        GX_LEQUAL,
+        GX_TRUE
+    );
+
+    GX_SetCullMode(GX_CULL_NONE);
+}
+
+
+static void Q2GX_DrawSkyBox(refdef_t *fd)
+{
+    unsigned int face_index;
+    unsigned int source_faces = 0u;
+    unsigned int box_faces = 0u;
+    unsigned int vertices = 0u;
+    unsigned int axis;
+
+    if (
+        !fd
+        ||
+        !q2gx_sky_ready
+        ||
+        !q2gx_world_faces
+        ||
+        !q2gx_world_vertices
+    )
+    {
+        return;
+    }
+
+    ++q2gx_sky_frames_window;
+
+    Q2GX_ClearSkyBounds();
+
+    for (
+        face_index = q2gx_world_static_first_face;
+        face_index
+        <
+        q2gx_world_static_first_face
+        +
+        q2gx_world_static_face_count;
+        ++face_index
+    )
+    {
+        q2gx_world_face_t *face =
+            &q2gx_world_faces[face_index];
+
+        unsigned int tri;
+
+        if (!face->visible_this_frame)
+            continue;
+
+        if (!(face->surface_flags & Q2GX_SURF_SKY))
+            continue;
+
+        ++source_faces;
+
+        for (
+            tri = 0u;
+            tri + 2u < face->vertex_count;
+            tri += 3u
+        )
+        {
+            f32 vecs[3][3];
+            unsigned int corner;
+
+            for (corner = 0u; corner < 3u; ++corner)
+            {
+                const q2gx_world_vertex_t *vertex =
+                    &q2gx_world_vertices[
+                        face->first_vertex
+                        +
+                        tri
+                        +
+                        corner
+                    ];
+
+                vecs[corner][0] =
+                    vertex->x - fd->vieworg[0];
+
+                vecs[corner][1] =
+                    vertex->y - fd->vieworg[1];
+
+                vecs[corner][2] =
+                    vertex->z - fd->vieworg[2];
+            }
+
+            Q2GX_ClipSkyPolygon(
+                3u,
+                vecs,
+                0u
+            );
+        }
+    }
+
+    if (source_faces == 0u)
+        goto sky_stats;
+
+    if (q2gx_sky_rotate != 0.0f)
+    {
+        for (axis = 0u; axis < 6u; ++axis)
+        {
+            q2gx_sky_mins[0][axis] = -1.0f;
+            q2gx_sky_mins[1][axis] = -1.0f;
+            q2gx_sky_maxs[0][axis] = 1.0f;
+            q2gx_sky_maxs[1][axis] = 1.0f;
+        }
+    }
+
+    Q2GX_SetupSky3D(fd);
+
+    for (axis = 0u; axis < 6u; ++axis)
+    {
+        unsigned int image_index;
+        struct image_s *image;
+
+        if (
+            q2gx_sky_mins[0][axis]
+            >=
+            q2gx_sky_maxs[0][axis]
+            ||
+            q2gx_sky_mins[1][axis]
+            >=
+            q2gx_sky_maxs[1][axis]
+        )
+        {
+            continue;
+        }
+
+        image_index =
+            (unsigned int)
+            q2gx_sky_tex_order[axis];
+
+        if (image_index >= 6u)
+            continue;
+
+        image = q2gx_sky_images[image_index];
+
+        if (!image)
+            continue;
+
+        GX_LoadTexObj(
+            &image->texture,
+            GX_TEXMAP0
+        );
+
+        GX_Begin(
+            GX_QUADS,
+            GX_VTXFMT0,
+            4u
+        );
+
+        Q2GX_EmitSkyVertex(
+            fd,
+            q2gx_sky_mins[0][axis],
+            q2gx_sky_mins[1][axis],
+            axis,
+            image
+        );
+
+        Q2GX_EmitSkyVertex(
+            fd,
+            q2gx_sky_mins[0][axis],
+            q2gx_sky_maxs[1][axis],
+            axis,
+            image
+        );
+
+        Q2GX_EmitSkyVertex(
+            fd,
+            q2gx_sky_maxs[0][axis],
+            q2gx_sky_maxs[1][axis],
+            axis,
+            image
+        );
+
+        Q2GX_EmitSkyVertex(
+            fd,
+            q2gx_sky_maxs[0][axis],
+            q2gx_sky_mins[1][axis],
+            axis,
+            image
+        );
+
+        GX_End();
+
+        ++box_faces;
+        vertices += 4u;
+    }
+
+    Q2GX_SetupTexturedWorld3D(fd);
+
+sky_stats:
+
+    if (source_faces > 0u)
+        ++q2gx_sky_frames_with_sky_window;
+
+    q2gx_sky_source_faces_window += source_faces;
+    q2gx_sky_box_faces_window += box_faces;
+    q2gx_sky_vertices_window += vertices;
+
+    if (
+        source_faces > 0u
+        &&
+        !q2gx_sky_first_draw_logged
+    )
+    {
+        q2gx_sky_first_draw_logged = true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX SKY FIRST DRAW: "
+            "name=%s "
+            "source_faces=%u "
+            "box_faces=%u "
+            "vertices=%u "
+            "rotate=%.4f "
+            "mode=stock_clip_pcx_cube_v1\n",
+            q2gx_sky_name,
+            source_faces,
+            box_faces,
+            vertices,
+            q2gx_sky_rotate
+        );
+    }
+
+    if (q2gx_sky_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX SKY 120: "
+            "frames=%u "
+            "frames_with_sky=%u "
+            "source_faces_total=%u "
+            "box_faces_total=%u "
+            "vertices_total=%u "
+            "name=%s "
+            "ready=%u "
+            "mode=stock_clip_pcx_cube_v1\n",
+            q2gx_sky_frames_window,
+            q2gx_sky_frames_with_sky_window,
+            q2gx_sky_source_faces_window,
+            q2gx_sky_box_faces_window,
+            q2gx_sky_vertices_window,
+            q2gx_sky_name,
+            q2gx_sky_ready ? 1u : 0u
+        );
+
+        q2gx_sky_frames_window = 0u;
+        q2gx_sky_frames_with_sky_window = 0u;
+        q2gx_sky_source_faces_window = 0u;
+        q2gx_sky_box_faces_window = 0u;
+        q2gx_sky_vertices_window = 0u;
+    }
+}
+
+
 static void Q2GX_DrawFlatWorld(
     refdef_t *fd)
 {
@@ -8784,6 +9534,7 @@ int leaf_index = -1;
 
         unsigned int wal_animated_flat_faces = 0u;
         unsigned int wal_special_flat_faces = 0u;
+        unsigned int wal_sky_faces = 0u;
 
         unsigned int wal_visible_textures = 0u;
         unsigned int wal_texture_binds = 0u;
@@ -9079,6 +9830,16 @@ int leaf_index = -1;
             if (!face->visible_this_frame)
                 continue;
 
+            if (
+                face->surface_flags
+                &
+                Q2GX_SURF_SKY
+            )
+            {
+                ++wal_sky_faces;
+                continue;
+            }
+
             texinfo =
                 &q2gx_world_texinfos[
                     face->texinfo_index
@@ -9173,6 +9934,8 @@ int leaf_index = -1;
             wal_animated_flat_faces
             +
             wal_special_flat_faces
+            +
+            wal_sky_faces
             !=
             submitted_faces
         )
@@ -9286,6 +10049,8 @@ int leaf_index = -1;
         q2gx_world_wal_batch_vertices_window +=
             wal_textured_vertices;
     }
+
+Q2GX_DrawSkyBox(fd);
 
 Q2GX_DrawBrushEntities(
         fd
@@ -9970,9 +10735,95 @@ static void Q2GX_SetSky(
     float rotate,
     vec3_t axis)
 {
-    (void)name;
-    (void)rotate;
-    (void)axis;
+    unsigned int i;
+    unsigned int loaded = 0u;
+
+    if (!name)
+        name = "";
+
+    strncpy(
+        q2gx_sky_name,
+        name,
+        sizeof(q2gx_sky_name) - 1u
+    );
+
+    q2gx_sky_name[
+        sizeof(q2gx_sky_name) - 1u
+    ] = '\0';
+
+    q2gx_sky_rotate = (f32)rotate;
+
+    if (axis)
+    {
+        q2gx_sky_axis[0] = axis[0];
+        q2gx_sky_axis[1] = axis[1];
+        q2gx_sky_axis[2] = axis[2];
+    }
+    else
+    {
+        q2gx_sky_axis[0] = 0.0f;
+        q2gx_sky_axis[1] = 0.0f;
+        q2gx_sky_axis[2] = 1.0f;
+    }
+
+    q2gx_sky_ready = false;
+    q2gx_sky_first_draw_logged = false;
+
+    for (i = 0u; i < Q2GX_SKY_FACE_COUNT; ++i)
+    {
+        char image_path[MAX_QPATH + 16];
+        int written;
+
+        q2gx_sky_images[i] = NULL;
+
+        written =
+            snprintf(
+                image_path,
+                sizeof(image_path),
+                "/env/%s%s.pcx",
+                q2gx_sky_name,
+                q2gx_sky_suffix[i]
+            );
+
+        if (
+            written <= 0
+            ||
+            (size_t)written >= sizeof(image_path)
+        )
+        {
+            continue;
+        }
+
+        q2gx_sky_images[i] =
+            Q2GX_FindPic(
+                image_path
+            );
+
+        if (q2gx_sky_images[i])
+            ++loaded;
+    }
+
+    q2gx_sky_ready =
+        loaded == Q2GX_SKY_FACE_COUNT;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX SKY SET: "
+        "name=%s "
+        "rotate=%.4f "
+        "axis=%.3f,%.3f,%.3f "
+        "loaded=%u/6 "
+        "ready=%u "
+        "source=env_pcx "
+        "mode=stock_clip_pcx_cube_v1\n",
+        q2gx_sky_name,
+        q2gx_sky_rotate,
+        q2gx_sky_axis[0],
+        q2gx_sky_axis[1],
+        q2gx_sky_axis[2],
+        loaded,
+        q2gx_sky_ready ? 1u : 0u
+    );
 }
 
 
