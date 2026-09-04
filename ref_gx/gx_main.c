@@ -8110,6 +8110,525 @@ static void Q2GX_SetupAliasShadow3D(void)
 }
 
 
+/*
+ * Q2GC_ALIAS_SHADOW_RECEIVER_V2
+ *
+ * Traverse the already-retained native GX BSP node tree and
+ * return the leaf containing a world-space point.
+ *
+ * Quake II BSP child convention:
+ *   >= 0 : node index
+ *   <  0 : leaf index encoded as -1-child
+ */
+static int Q2GX_ShadowFindPointLeaf(
+    const f32 point[3])
+{
+    int node_index = 0;
+    unsigned int safety = 0u;
+
+    if (
+        !point
+        ||
+        !q2gx_world_nodes
+        ||
+        !q2gx_world_leaves
+        ||
+        q2gx_world_node_count == 0u
+        ||
+        q2gx_world_leaf_count == 0u
+    )
+    {
+        return -1;
+    }
+
+    for (;;)
+    {
+        const q2gx_world_node_t *node;
+        f32 dot;
+        int child;
+        int leaf_index;
+
+        ++safety;
+
+        if (
+            safety
+            >
+            q2gx_world_node_count + 64u
+        )
+        {
+            return -1;
+        }
+
+        if (
+            node_index < 0
+            ||
+            (unsigned int)node_index
+            >=
+            q2gx_world_node_count
+        )
+        {
+            return -1;
+        }
+
+        node =
+            &q2gx_world_nodes[
+                (unsigned int)node_index
+            ];
+
+        if (
+            node->type >= 0
+            &&
+            node->type < 3
+        )
+        {
+            dot =
+                point[
+                    node->type
+                ]
+                -
+                node->dist;
+        }
+        else
+        {
+            dot =
+                point[0] * node->normal[0]
+                +
+                point[1] * node->normal[1]
+                +
+                point[2] * node->normal[2]
+                -
+                node->dist;
+        }
+
+        child =
+            node->children[
+                dot > 0.0f ? 0 : 1
+            ];
+
+        if (child >= 0)
+        {
+            node_index = child;
+            continue;
+        }
+
+        if (child == INT32_MIN)
+            return -1;
+
+        leaf_index =
+            -1
+            -
+            child;
+
+        if (
+            leaf_index < 0
+            ||
+            (unsigned int)leaf_index
+            >=
+            q2gx_world_leaf_count
+        )
+        {
+            return -1;
+        }
+
+        return leaf_index;
+    }
+}
+
+
+/*
+ * Test a vertical world-space line at (x,y) against one triangle.
+ *
+ * Native GX world faces are already stored as triangle-list
+ * vertices. Barycentric coordinates in XY give us both:
+ *
+ *   - point-inside-triangle
+ *   - interpolated surface Z
+ *
+ * Returns false for triangles that are vertical/degenerate when
+ * projected onto XY.
+ */
+static qboolean Q2GX_ShadowTriangleHeight(
+    f32 x,
+    f32 y,
+    const q2gx_world_vertex_t *a,
+    const q2gx_world_vertex_t *b,
+    const q2gx_world_vertex_t *c,
+    f32 *z_out)
+{
+    f32 denominator;
+    f32 wa;
+    f32 wb;
+    f32 wc;
+
+    const f32 epsilon = 0.0001f;
+
+    if (!a || !b || !c || !z_out)
+        return false;
+
+    denominator =
+        (
+            (b->y - c->y)
+            *
+            (a->x - c->x)
+        )
+        +
+        (
+            (c->x - b->x)
+            *
+            (a->y - c->y)
+        );
+
+    if (
+        denominator > -epsilon
+        &&
+        denominator < epsilon
+    )
+    {
+        return false;
+    }
+
+    wa =
+        (
+            (
+                (b->y - c->y)
+                *
+                (x - c->x)
+            )
+            +
+            (
+                (c->x - b->x)
+                *
+                (y - c->y)
+            )
+        )
+        /
+        denominator;
+
+    wb =
+        (
+            (
+                (c->y - a->y)
+                *
+                (x - c->x)
+            )
+            +
+            (
+                (a->x - c->x)
+                *
+                (y - c->y)
+            )
+        )
+        /
+        denominator;
+
+    wc =
+        1.0f
+        -
+        wa
+        -
+        wb;
+
+    /*
+     * Tiny tolerance avoids dropping a receiver exactly on a
+     * shared triangle edge.
+     */
+    if (
+        wa < -0.001f
+        ||
+        wb < -0.001f
+        ||
+        wc < -0.001f
+    )
+    {
+        return false;
+    }
+
+    *z_out =
+        wa * a->z
+        +
+        wb * b->z
+        +
+        wc * c->z;
+
+    return true;
+}
+
+
+/*
+ * Q2GC_ALIAS_SHADOW_RECEIVER_V2
+ *
+ * Geometry-only equivalent of the part of stock R_LightPoint()
+ * shadows actually need: lightspot.z.
+ *
+ * We intentionally do NOT sample lightmaps here.
+ *
+ * Search only the point's leaf marksurfaces, only static world
+ * faces, and only ordinary non-special surfaces. Pick the highest
+ * vertical triangle hit below the entity within stock's 2048-unit
+ * downward search range.
+ */
+static qboolean Q2GX_FindAliasShadowReceiver(
+    const f32 origin[3],
+    f32 *receiver_z_out,
+    unsigned int *faces_tested_out,
+    unsigned int *triangles_tested_out)
+{
+    int leaf_index;
+    const q2gx_world_leaf_t *leaf;
+
+    unsigned int mark_index;
+    unsigned int mark_end;
+
+    qboolean found = false;
+    f32 best_z = -9999999.0f;
+
+    unsigned int faces_tested = 0u;
+    unsigned int triangles_tested = 0u;
+
+    if (faces_tested_out)
+        *faces_tested_out = 0u;
+
+    if (triangles_tested_out)
+        *triangles_tested_out = 0u;
+
+    if (
+        !origin
+        ||
+        !receiver_z_out
+        ||
+        !q2gx_world_faces
+        ||
+        !q2gx_world_vertices
+        ||
+        !q2gx_world_leaffaces
+    )
+    {
+        return false;
+    }
+
+    leaf_index =
+        Q2GX_ShadowFindPointLeaf(
+            origin
+        );
+
+    if (
+        leaf_index < 0
+        ||
+        (unsigned int)leaf_index
+        >=
+        q2gx_world_leaf_count
+    )
+    {
+        return false;
+    }
+
+    leaf =
+        &q2gx_world_leaves[
+            (unsigned int)leaf_index
+        ];
+
+    if (
+        leaf->first_leafface
+        >
+        q2gx_world_leafface_count
+        ||
+        leaf->num_leaffaces
+        >
+        q2gx_world_leafface_count
+        -
+        leaf->first_leafface
+    )
+    {
+        return false;
+    }
+
+    mark_end =
+        leaf->first_leafface
+        +
+        leaf->num_leaffaces;
+
+    for (
+        mark_index = leaf->first_leafface;
+        mark_index < mark_end;
+        ++mark_index
+    )
+    {
+        unsigned int face_index =
+            (unsigned int)
+            q2gx_world_leaffaces[
+                mark_index
+            ];
+
+        const q2gx_world_face_t *face;
+
+        unsigned int vertex_offset;
+
+        if (
+            face_index
+            >=
+            q2gx_world_face_count
+        )
+        {
+            continue;
+        }
+
+        if (
+            !Q2GX_IsStaticWorldFaceIndex(
+                face_index
+            )
+        )
+        {
+            continue;
+        }
+
+        face =
+            &q2gx_world_faces[
+                face_index
+            ];
+
+        /*
+         * Stock R_LightPoint is looking for an ordinary BSP
+         * receiving surface, not sky/turbulent/alpha specials.
+         *
+         * Also reject vertical/downward planes: they cannot be a
+         * sensible floor receiver for our vertical shadow ray.
+         */
+        if (
+            face->surface_flags
+            &
+            Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+        )
+        {
+            continue;
+        }
+
+        if (face->normal[2] < 0.001f)
+            continue;
+
+        if (
+            face->vertex_count < 3u
+            ||
+            face->first_vertex
+            >
+            q2gx_world_vertex_count
+            ||
+            face->vertex_count
+            >
+            q2gx_world_vertex_count
+            -
+            face->first_vertex
+        )
+        {
+            continue;
+        }
+
+        ++faces_tested;
+
+        /*
+         * Existing renderer contract:
+         * face vertices are GX_TRIANGLES, so each consecutive
+         * group of three is one real world triangle.
+         */
+        for (
+            vertex_offset = 0u;
+            vertex_offset + 2u < face->vertex_count;
+            vertex_offset += 3u
+        )
+        {
+            const q2gx_world_vertex_t *a =
+                &q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    vertex_offset
+                ];
+
+            const q2gx_world_vertex_t *b =
+                &q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    vertex_offset
+                    +
+                    1u
+                ];
+
+            const q2gx_world_vertex_t *c =
+                &q2gx_world_vertices[
+                    face->first_vertex
+                    +
+                    vertex_offset
+                    +
+                    2u
+                ];
+
+            f32 candidate_z;
+
+            ++triangles_tested;
+
+            if (
+                !Q2GX_ShadowTriangleHeight(
+                    origin[0],
+                    origin[1],
+                    a,
+                    b,
+                    c,
+                    &candidate_z
+                )
+            )
+            {
+                continue;
+            }
+
+            /*
+             * Match stock R_LightPoint's downward search extent.
+             *
+             * A quarter-unit top tolerance handles entities whose
+             * origin numerically sits fractionally inside the floor.
+             */
+            if (
+                candidate_z
+                >
+                origin[2] + 0.25f
+            )
+            {
+                continue;
+            }
+
+            if (
+                candidate_z
+                <
+                origin[2] - 2048.0f
+            )
+            {
+                continue;
+            }
+
+            if (
+                !found
+                ||
+                candidate_z > best_z
+            )
+            {
+                best_z = candidate_z;
+                found = true;
+            }
+        }
+    }
+
+    if (faces_tested_out)
+        *faces_tested_out = faces_tested;
+
+    if (triangles_tested_out)
+        *triangles_tested_out = triangles_tested;
+
+    if (!found)
+        return false;
+
+    *receiver_z_out = best_z;
+
+    return true;
+}
+
+
 static void Q2GX_DrawAliasShadows(
     refdef_t *fd)
 {
@@ -8127,6 +8646,16 @@ static void Q2GX_DrawAliasShadows(
     static unsigned int beam_skipped_window;
     static unsigned int invalid_frame_window;
 
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V2 */
+    static unsigned int receiver_queries_window;
+    static unsigned int receiver_hits_window;
+    static unsigned int receiver_fallbacks_window;
+    static unsigned int receiver_faces_tested_window;
+    static unsigned int receiver_triangles_tested_window;
+
+    static f32 receiver_min_lheight_window = 9999999.0f;
+    static f32 receiver_max_lheight_window = -9999999.0f;
+
     unsigned int entity_index;
 
     unsigned int entities = 0u;
@@ -8137,6 +8666,13 @@ static void Q2GX_DrawAliasShadows(
     unsigned int weapon_skipped = 0u;
     unsigned int beam_skipped = 0u;
     unsigned int invalid_frames = 0u;
+
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V2 */
+    unsigned int receiver_queries = 0u;
+    unsigned int receiver_hits = 0u;
+    unsigned int receiver_fallbacks = 0u;
+    unsigned int receiver_faces_tested = 0u;
+    unsigned int receiver_triangles_tested = 0u;
 
     qboolean changed_gx_state = false;
 
@@ -8192,6 +8728,14 @@ static void Q2GX_DrawAliasShadows(
             f32 yaw_radians;
             f32 shade_x;
             f32 shade_y;
+
+            /* Q2GC_ALIAS_SHADOW_RECEIVER_V2 */
+            f32 receiver_z;
+            f32 lheight;
+            qboolean receiver_found;
+
+            unsigned int receiver_faces_tested_entity = 0u;
+            unsigned int receiver_triangles_tested_entity = 0u;
 
             unsigned int triangle_index;
 
@@ -8316,6 +8860,72 @@ static void Q2GX_DrawAliasShadows(
                 *
                 0.70710678118654752440f;
 
+            /*
+             * Q2GC_ALIAS_SHADOW_RECEIVER_V2
+             *
+             * Stock GL computes:
+             *
+             *   lheight = entity.origin.z - lightspot.z
+             *
+             * Find the corresponding world-surface Z from the
+             * current BSP leaf. If this lookup fails, preserve the
+             * already runtime-proven V1 result exactly.
+             */
+            ++receiver_queries;
+
+            receiver_found =
+                Q2GX_FindAliasShadowReceiver(
+                    entity->origin,
+                    &receiver_z,
+                    &receiver_faces_tested_entity,
+                    &receiver_triangles_tested_entity
+                );
+
+            receiver_faces_tested +=
+                receiver_faces_tested_entity;
+
+            receiver_triangles_tested +=
+                receiver_triangles_tested_entity;
+
+            if (receiver_found)
+            {
+                ++receiver_hits;
+
+                lheight =
+                    entity->origin[2]
+                    -
+                    receiver_z;
+            }
+            else
+            {
+                ++receiver_fallbacks;
+
+                receiver_z =
+                    entity->origin[2];
+
+                lheight = 0.0f;
+            }
+
+            if (
+                lheight
+                <
+                receiver_min_lheight_window
+            )
+            {
+                receiver_min_lheight_window =
+                    lheight;
+            }
+
+            if (
+                lheight
+                >
+                receiver_max_lheight_window
+            )
+            {
+                receiver_max_lheight_window =
+                    lheight;
+            }
+
             if (!changed_gx_state)
             {
                 Q2GX_SetupAliasShadow3D();
@@ -8386,30 +8996,37 @@ static void Q2GX_DrawAliasShadows(
                     );
 
                     /*
-                     * Stock GL_DrawAliasShadow:
+                     * Q2GC_ALIAS_SHADOW_RECEIVER_V2
                      *
-                     * point.x -= shadevector.x *
-                     *            (point.z + lheight)
-                     *
-                     * point.y -= shadevector.y *
-                     *            (point.z + lheight)
-                     *
-                     * point.z = -lheight + 1
-                     *
-                     * V1:
-                     *     lheight = 0
+                     * Exact stock projection equation, now using
+                     * BSP-derived lheight instead of V1's zero.
                      */
                     shadow_x =
                         local_x
                         -
-                        shade_x * local_z;
+                        shade_x
+                        *
+                        (
+                            local_z
+                            +
+                            lheight
+                        );
 
                     shadow_y =
                         local_y
                         -
-                        shade_y * local_z;
+                        shade_y
+                        *
+                        (
+                            local_z
+                            +
+                            lheight
+                        );
 
-                    shadow_z = 1.0f;
+                    shadow_z =
+                        -lheight
+                        +
+                        1.0f;
 
                     Q2GX_TransformAliasPoint(
                         &transform,
@@ -8459,9 +9076,14 @@ static void Q2GX_DrawAliasShadows(
                     "tris=%u "
                     "origin=%.3f,%.3f,%.3f "
                     "yaw=%.3f "
+                    "receiver_found=%u "
+                    "receiver_z=%.3f "
+                    "lheight=%.3f "
+                    "receiver_faces=%u "
+                    "receiver_tris=%u "
                     "alpha=128 "
-                    "receiver=origin_plus_1 "
-                    "mode=stock_projection_v1\n",
+                    "receiver=bsp_leaf_triangles "
+                    "mode=stock_projection_receiver_v2\n",
                     model->name,
                     frame_index,
                     old_frame_index,
@@ -8470,7 +9092,12 @@ static void Q2GX_DrawAliasShadows(
                     entity->origin[0],
                     entity->origin[1],
                     entity->origin[2],
-                    entity->angles[1]
+                    entity->angles[1],
+                    receiver_found ? 1u : 0u,
+                    receiver_z,
+                    lheight,
+                    receiver_faces_tested_entity,
+                    receiver_triangles_tested_entity
                 );
             }
         }
@@ -8497,6 +9124,22 @@ static void Q2GX_DrawAliasShadows(
     invalid_frame_window +=
         invalid_frames;
 
+    /* Q2GC_ALIAS_SHADOW_RECEIVER_V2 */
+    receiver_queries_window +=
+        receiver_queries;
+
+    receiver_hits_window +=
+        receiver_hits;
+
+    receiver_fallbacks_window +=
+        receiver_fallbacks;
+
+    receiver_faces_tested_window +=
+        receiver_faces_tested;
+
+    receiver_triangles_tested_window +=
+        receiver_triangles_tested;
+
     /*
      * The shadow pass temporarily installs POS+CLR with no
      * texture coordinate input. Restore the alias contract
@@ -8512,6 +9155,38 @@ static void Q2GX_DrawAliasShadows(
     {
         ri.Con_Printf(
             PRINT_ALL,
+            "Q2GC REF_GX SHADOW RECEIVER 120: "
+            "queries=%u "
+            "hits=%u "
+            "fallbacks=%u "
+            "faces_tested=%u "
+            "triangles_tested=%u "
+            "min_lheight=%.3f "
+            "max_lheight=%.3f "
+            "mode=bsp_leaf_vertical_triangles_v2\n",
+            receiver_queries_window,
+            receiver_hits_window,
+            receiver_fallbacks_window,
+            receiver_faces_tested_window,
+            receiver_triangles_tested_window,
+            (
+                receiver_hits_window > 0u
+                ?
+                receiver_min_lheight_window
+                :
+                0.0f
+            ),
+            (
+                receiver_hits_window > 0u
+                ?
+                receiver_max_lheight_window
+                :
+                0.0f
+            )
+        );
+
+        ri.Con_Printf(
+            PRINT_ALL,
             "Q2GC REF_GX SHADOW 120: "
             "frames=%u "
             "enabled=%u "
@@ -8523,8 +9198,8 @@ static void Q2GX_DrawAliasShadows(
             "beam_skipped_total=%u "
             "invalid_frame_total=%u "
             "alpha=128 "
-            "receiver=origin_plus_1 "
-            "mode=stock_projection_v1\n",
+            "receiver=bsp_leaf_triangles "
+            "mode=stock_projection_receiver_v2\n",
             frames_window,
             (
                 shadow_cvar
@@ -8551,6 +9226,16 @@ static void Q2GX_DrawAliasShadows(
         weapon_skipped_window = 0u;
         beam_skipped_window = 0u;
         invalid_frame_window = 0u;
+
+        /* Q2GC_ALIAS_SHADOW_RECEIVER_V2 */
+        receiver_queries_window = 0u;
+        receiver_hits_window = 0u;
+        receiver_fallbacks_window = 0u;
+        receiver_faces_tested_window = 0u;
+        receiver_triangles_tested_window = 0u;
+
+        receiver_min_lheight_window = 9999999.0f;
+        receiver_max_lheight_window = -9999999.0f;
     }
 }
 
