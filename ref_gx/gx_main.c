@@ -511,6 +511,11 @@ static unsigned int q2gx_world_wal_texture_bytes;
 static qboolean q2gx_world_wal_first_draw_logged;
 static unsigned int q2gx_world_wal_textured_faces_window;
 static unsigned int q2gx_world_wal_animated_flat_faces_window;
+
+/* Q2GC_WORLD_ANIMATED_WAL_V1 */
+static unsigned int q2gx_world_wal_animated_textured_faces_window;
+static unsigned int q2gx_world_wal_animated_texture_binds_window;
+
 static unsigned int q2gx_world_wal_special_flat_faces_window;
 static unsigned int q2gx_world_wal_texture_binds_window;
 
@@ -3169,14 +3174,19 @@ static void Q2GX_ComputeWorldDiagnosticST(
         return;
     }
 
+    /*
+     * Q2GC_WORLD_ANIMATED_WAL_V1
+     *
+     * Animated ordinary surfaces use the same base texture
+     * coordinates as static ordinary surfaces. Quake II WAL
+     * animation frames are selected at draw time.
+     *
+     * Only genuinely special surfaces retain diagnostic ST here.
+     */
     if (
-        (
-            texinfo->flags
-            &
-            Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
-        )
-        ||
-        texinfo->next_texinfo >= 0
+        texinfo->flags
+        &
+        Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
     )
     {
         *s_out = 0.03125f;
@@ -3623,6 +3633,8 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_world_wal_first_draw_logged = false;
     q2gx_world_wal_textured_faces_window = 0u;
     q2gx_world_wal_animated_flat_faces_window = 0u;
+    q2gx_world_wal_animated_textured_faces_window = 0u;
+    q2gx_world_wal_animated_texture_binds_window = 0u;
     q2gx_world_wal_special_flat_faces_window = 0u;
     q2gx_world_wal_texture_binds_window = 0u;
 
@@ -10505,6 +10517,100 @@ static q2gx_world_wal_texture_t *Q2GX_GetWorldWarpTexture(
 }
 
 
+/*
+ * Q2GC_WORLD_ANIMATED_WAL_V1
+ *
+ * Resolve a Quake II nexttexinfo animation chain without altering
+ * the BSP data. This mirrors stock R_TextureAnimation semantics
+ * for the world entity:
+ *
+ *     frame = time * 2
+ *
+ * Valid chains may either loop to the base texinfo or terminate
+ * with -1.
+ */
+static unsigned int Q2GX_SelectAnimatedWorldTexinfo(
+    unsigned int base_texinfo,
+    int frame)
+{
+    unsigned int count;
+    unsigned int index;
+    unsigned int step;
+    int next;
+
+    if (
+        base_texinfo >= q2gx_world_texinfo_count
+        ||
+        q2gx_world_texinfo_count == 0u
+    )
+    {
+        return base_texinfo;
+    }
+
+    count = 1u;
+    index = base_texinfo;
+
+    next =
+        q2gx_world_texinfos[
+            index
+        ].next_texinfo;
+
+    while (
+        next >= 0
+        &&
+        (unsigned int)next < q2gx_world_texinfo_count
+        &&
+        (unsigned int)next != base_texinfo
+        &&
+        count < q2gx_world_texinfo_count
+    )
+    {
+        index = (unsigned int)next;
+        ++count;
+
+        next =
+            q2gx_world_texinfos[
+                index
+            ].next_texinfo;
+    }
+
+    if (count <= 1u)
+        return base_texinfo;
+
+    if (frame < 0)
+        frame = 0;
+
+    step =
+        (unsigned int)frame
+        %
+        count;
+
+    index = base_texinfo;
+
+    while (step > 0u)
+    {
+        next =
+            q2gx_world_texinfos[
+                index
+            ].next_texinfo;
+
+        if (
+            next < 0
+            ||
+            (unsigned int)next >= q2gx_world_texinfo_count
+        )
+        {
+            return base_texinfo;
+        }
+
+        index = (unsigned int)next;
+        --step;
+    }
+
+    return index;
+}
+
+
 static void Q2GX_SetupOpaqueWarp3D(
     refdef_t *fd)
 {
@@ -12474,6 +12580,11 @@ int leaf_index = -1;
         unsigned int wal_textured_vertices = 0u;
 
         unsigned int wal_animated_flat_faces = 0u;
+
+/* Q2GC_WORLD_ANIMATED_WAL_V1 */
+        unsigned int wal_animated_textured_faces = 0u;
+        unsigned int wal_animated_texture_binds = 0u;
+
         unsigned int wal_special_flat_faces = 0u;
         unsigned int wal_sky_faces = 0u;
         unsigned int wal_opaque_warp_faces = 0u;
@@ -12827,19 +12938,42 @@ int leaf_index = -1;
                 continue;
             }
 
-            Q2GX_BindWorldFlatFallback();
-
             if (
                 face->surface_flags
                 &
                 Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
             )
             {
+                Q2GX_BindWorldFlatFallback();
                 ++wal_special_flat_faces;
             }
             else
             {
-                ++wal_animated_flat_faces;
+                unsigned int animated_texinfo_index =
+                    Q2GX_SelectAnimatedWorldTexinfo(
+                        face->texinfo_index,
+                        (int)(fd->time * 2.0f)
+                    );
+
+                q2gx_world_wal_texture_t *animated_texture =
+                    Q2GX_GetWorldWarpTexture(
+                        animated_texinfo_index
+                    );
+
+                if (animated_texture)
+                {
+                    Q2GX_BindWorldWALTexture(
+                        animated_texture
+                    );
+
+                    ++wal_animated_textured_faces;
+                    ++wal_animated_texture_binds;
+                }
+                else
+                {
+                    Q2GX_BindWorldFlatFallback();
+                    ++wal_animated_flat_faces;
+                }
             }
 
             if (face->vertex_count > 65535u)
@@ -12900,6 +13034,8 @@ int leaf_index = -1;
         if (
             wal_textured_faces
             +
+            wal_animated_textured_faces
+            +
             wal_animated_flat_faces
             +
             wal_special_flat_faces
@@ -12916,8 +13052,10 @@ int leaf_index = -1;
             ri.Con_Printf(
                 PRINT_ALL,
                 "Q2GC REF_GX BATCH: draw accounting mismatch "
-                "textured=%u animated=%u special=%u submitted=%u\n",
+                "textured=%u anim_textured=%u "
+                "anim_fallback=%u special=%u submitted=%u\n",
                 wal_textured_faces,
+                wal_animated_textured_faces,
                 wal_animated_flat_faces,
                 wal_special_flat_faces,
                 submitted_faces
@@ -13006,6 +13144,12 @@ int leaf_index = -1;
 
         q2gx_world_wal_animated_flat_faces_window +=
             wal_animated_flat_faces;
+
+        q2gx_world_wal_animated_textured_faces_window +=
+            wal_animated_textured_faces;
+
+        q2gx_world_wal_animated_texture_binds_window +=
+            wal_animated_texture_binds;
 
         q2gx_world_wal_special_flat_faces_window +=
             wal_special_flat_faces;
@@ -13206,6 +13350,22 @@ ri.Con_Printf(
 
 ri.Con_Printf(
             PRINT_ALL,
+            "Q2GC REF_GX ANIMWAL 120: "
+            "frames=%u "
+            "textured_faces_total=%u "
+            "fallback_faces_total=%u "
+            "texture_binds_total=%u "
+            "world_frame=%d "
+            "mode=nexttexinfo_time2_v1\n",
+            q2gx_world_frames_window,
+            q2gx_world_wal_animated_textured_faces_window,
+            q2gx_world_wal_animated_flat_faces_window,
+            q2gx_world_wal_animated_texture_binds_window,
+            (int)(fd->time * 2.0f)
+        );
+
+ri.Con_Printf(
+            PRINT_ALL,
             "Q2GC REF_GX TEXCOORD 120: "
             "frames=%u "
             "streamed_vertices_total=%u "
@@ -13254,6 +13414,8 @@ q2gx_world_frames_window = 0u;
 
         q2gx_world_wal_textured_faces_window = 0u;
         q2gx_world_wal_animated_flat_faces_window = 0u;
+        q2gx_world_wal_animated_textured_faces_window = 0u;
+        q2gx_world_wal_animated_texture_binds_window = 0u;
         q2gx_world_wal_special_flat_faces_window = 0u;
         q2gx_world_wal_texture_binds_window = 0u;
 
