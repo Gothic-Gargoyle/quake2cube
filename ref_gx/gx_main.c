@@ -572,6 +572,14 @@ static unsigned int q2gx_brush_backface_rejected_window;
 static unsigned int q2gx_brush_visible_faces_window;
 static unsigned int q2gx_brush_textured_faces_window;
 static unsigned int q2gx_brush_fallback_faces_window;
+
+/* Q2GC_BRUSH_ANIMATED_WAL_V1 */
+static unsigned int q2gx_brush_animated_textured_faces_window;
+static unsigned int q2gx_brush_animated_fallback_faces_window;
+static unsigned int q2gx_brush_special_fallback_faces_window;
+static unsigned int q2gx_brush_cache_fallback_faces_window;
+static unsigned int q2gx_brush_animated_wal_binds_window;
+
 static unsigned int q2gx_brush_wal_binds_window;
 static unsigned int q2gx_brush_vertices_window;
 
@@ -3672,6 +3680,11 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_brush_visible_faces_window = 0u;
     q2gx_brush_textured_faces_window = 0u;
     q2gx_brush_fallback_faces_window = 0u;
+    q2gx_brush_animated_textured_faces_window = 0u;
+    q2gx_brush_animated_fallback_faces_window = 0u;
+    q2gx_brush_special_fallback_faces_window = 0u;
+    q2gx_brush_cache_fallback_faces_window = 0u;
+    q2gx_brush_animated_wal_binds_window = 0u;
     q2gx_brush_wal_binds_window = 0u;
     q2gx_brush_vertices_window = 0u;
 
@@ -8680,6 +8693,20 @@ static qboolean Q2GX_IsPlainTranslucentBrushFace(
 }
 
 
+/*
+ * Q2GC_BRUSH_ANIMATED_WAL_V1
+ *
+ * The opaque brush pass occurs before the proven lazy per-texinfo
+ * WAL loader and nexttexinfo selector definitions.
+ */
+static q2gx_world_wal_texture_t *Q2GX_GetWorldWarpTexture(
+    unsigned int texinfo_index);
+
+static unsigned int Q2GX_SelectAnimatedWorldTexinfo(
+    unsigned int base_texinfo,
+    int frame);
+
+
 static void Q2GX_DrawBrushEntities(
     refdef_t *fd)
 {
@@ -8691,6 +8718,14 @@ static void Q2GX_DrawBrushEntities(
     unsigned int visible_faces = 0u;
     unsigned int textured_faces = 0u;
     unsigned int fallback_faces = 0u;
+
+/* Q2GC_BRUSH_ANIMATED_WAL_V1 */
+    unsigned int animated_textured_faces = 0u;
+    unsigned int animated_fallback_faces = 0u;
+    unsigned int special_fallback_faces = 0u;
+    unsigned int cache_fallback_faces = 0u;
+    unsigned int animated_wal_binds = 0u;
+
     unsigned int deferred_trans_faces = 0u;
     unsigned int wal_binds = 0u;
     unsigned int vertices_drawn = 0u;
@@ -8808,6 +8843,10 @@ static void Q2GX_DrawBrushEntities(
             unsigned int vertex_index;
             qboolean use_wal;
 
+/* Q2GC_BRUSH_ANIMATED_WAL_V1 */
+            qboolean animated_face;
+            qboolean drew_wal;
+
             if (face_index >= q2gx_world_face_count)
             {
                 ri.Con_Printf(
@@ -8847,6 +8886,21 @@ static void Q2GX_DrawBrushEntities(
                 continue;
             }
 
+            /*
+             * Q2GC_BRUSH_ANIMATED_WAL_V1
+             *
+             * Stock R_TextureAnimation uses currententity->frame
+             * for brush entities.
+             */
+            animated_face =
+                !(
+                    face->surface_flags
+                    &
+                    Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+                )
+                &&
+                texinfo->next_texinfo >= 0;
+
             use_wal =
                 !(
                     face->surface_flags
@@ -8854,7 +8908,7 @@ static void Q2GX_DrawBrushEntities(
                     Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
                 )
                 &&
-                texinfo->next_texinfo < 0
+                !animated_face
                 &&
                 texinfo->wal_cache_index >= 0
                 &&
@@ -8862,7 +8916,44 @@ static void Q2GX_DrawBrushEntities(
                 <
                 q2gx_world_wal_texture_count;
 
-            if (use_wal)
+            drew_wal = false;
+
+            if (animated_face)
+            {
+                unsigned int animated_texinfo_index =
+                    Q2GX_SelectAnimatedWorldTexinfo(
+                        face->texinfo_index,
+                        entity->frame
+                    );
+
+                q2gx_world_wal_texture_t *animated_texture =
+                    Q2GX_GetWorldWarpTexture(
+                        animated_texinfo_index
+                    );
+
+                if (animated_texture)
+                {
+                    Q2GX_BindWorldWALTexture(
+                        animated_texture
+                    );
+
+                    ++textured_faces;
+                    ++wal_binds;
+
+                    ++animated_textured_faces;
+                    ++animated_wal_binds;
+
+                    drew_wal = true;
+                }
+                else
+                {
+                    Q2GX_BindWorldFlatFallback();
+
+                    ++fallback_faces;
+                    ++animated_fallback_faces;
+                }
+            }
+            else if (use_wal)
             {
                 Q2GX_BindWorldWALTexture(
                     &q2gx_world_wal_textures[
@@ -8873,11 +8964,26 @@ static void Q2GX_DrawBrushEntities(
 
                 ++textured_faces;
                 ++wal_binds;
+
+                drew_wal = true;
             }
             else
             {
                 Q2GX_BindWorldFlatFallback();
                 ++fallback_faces;
+
+                if (
+                    face->surface_flags
+                    &
+                    Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+                )
+                {
+                    ++special_fallback_faces;
+                }
+                else
+                {
+                    ++cache_fallback_faces;
+                }
             }
 
             if (face->vertex_count > 65535u)
@@ -8971,7 +9077,7 @@ static void Q2GX_DrawBrushEntities(
                     entity->angles[0],
                     entity->angles[1],
                     entity->angles[2],
-                    use_wal ? 1u : 0u
+                    drew_wal ? 1u : 0u
                 );
             }
         }
@@ -9040,6 +9146,23 @@ static void Q2GX_DrawBrushEntities(
     q2gx_brush_visible_faces_window += visible_faces;
     q2gx_brush_textured_faces_window += textured_faces;
     q2gx_brush_fallback_faces_window += fallback_faces;
+
+/* Q2GC_BRUSH_ANIMATED_WAL_V1 */
+    q2gx_brush_animated_textured_faces_window +=
+        animated_textured_faces;
+
+    q2gx_brush_animated_fallback_faces_window +=
+        animated_fallback_faces;
+
+    q2gx_brush_special_fallback_faces_window +=
+        special_fallback_faces;
+
+    q2gx_brush_cache_fallback_faces_window +=
+        cache_fallback_faces;
+
+    q2gx_brush_animated_wal_binds_window +=
+        animated_wal_binds;
+
     q2gx_brush_deferred_trans_faces_window += deferred_trans_faces;
     q2gx_brush_wal_binds_window += wal_binds;
     q2gx_brush_vertices_window += vertices_drawn;
@@ -13380,6 +13503,24 @@ ri.Con_Printf(
 
         ri.Con_Printf(
             PRINT_ALL,
+            "Q2GC REF_GX BRUSHANIM 120: "
+            "frames=%u "
+            "animated_textured_total=%u "
+            "animated_fallback_total=%u "
+            "animated_wal_binds_total=%u "
+            "special_fallback_total=%u "
+            "cache_fallback_total=%u "
+            "mode=nexttexinfo_entity_frame_v1\n",
+            q2gx_world_frames_window,
+            q2gx_brush_animated_textured_faces_window,
+            q2gx_brush_animated_fallback_faces_window,
+            q2gx_brush_animated_wal_binds_window,
+            q2gx_brush_special_fallback_faces_window,
+            q2gx_brush_cache_fallback_faces_window
+        );
+
+ri.Con_Printf(
+            PRINT_ALL,
             "Q2GC REF_GX BRUSH 120: "
             "frames=%u "
             "entities_total=%u "
@@ -13445,6 +13586,11 @@ q2gx_world_frames_window = 0u;
         q2gx_brush_visible_faces_window = 0u;
         q2gx_brush_textured_faces_window = 0u;
         q2gx_brush_fallback_faces_window = 0u;
+        q2gx_brush_animated_textured_faces_window = 0u;
+        q2gx_brush_animated_fallback_faces_window = 0u;
+        q2gx_brush_special_fallback_faces_window = 0u;
+        q2gx_brush_cache_fallback_faces_window = 0u;
+        q2gx_brush_animated_wal_binds_window = 0u;
         q2gx_brush_deferred_trans_faces_window = 0u;
         q2gx_brush_wal_binds_window = 0u;
         q2gx_brush_vertices_window = 0u;
