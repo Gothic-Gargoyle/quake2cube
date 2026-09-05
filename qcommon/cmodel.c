@@ -485,8 +485,16 @@ void CMod_LoadAreaPortals (lump_t *l)
 		Com_Error (ERR_DROP, "MOD_LoadBmodel: funny lump size");
 	count = l->filelen / sizeof(*in);
 
-	if (count > MAX_MAP_AREAS)
-		Com_Error (ERR_DROP, "Map has too many areas");
+	/*
+	 * Q2GC_CM_AREAPORTAL_LIMIT_FIX_V1
+	 *
+	 * This function counts dareaportal_t records, not darea_t records.
+	 * The original comparison against MAX_MAP_AREAS was harmless while
+	 * that limit was large, but the GameCube memory-tuned limits expose
+	 * the typo on stock maps such as bunk1 (47 portals, 16 areas).
+	 */
+	if (count > MAX_MAP_AREAPORTALS)
+		Com_Error (ERR_DROP, "Map has too many areaportals");
 
 	out = map_areaportals;
 	numareaportals = count;
