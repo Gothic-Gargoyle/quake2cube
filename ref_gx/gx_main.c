@@ -45,6 +45,23 @@
  */
 refimport_t ri;
 
+/*
+ * Q2GC_BLACK_CLEAR_V1
+ *
+ * Bootstrap magenta was useful only while proving that GX could
+ * present a frame. Normal Quake2Cube presentation clears black.
+ */
+static GXColor q2gx_black_clear_color =
+{
+    0u,
+    0u,
+    0u,
+    255u
+};
+
+
+
+
 
 static GXRModeObj *q2gx_mode;
 
@@ -105,6 +122,32 @@ static u16 q2gx_pic_tlut_storage[256]
 
 static GXTlutObj q2gx_pic_tlut;
 static qboolean q2gx_pic_tlut_ready;
+
+/*
+ * Q2GC_GX_CINEMATIC_CI8_V1
+ *
+ * Quake II .cin frames reach DrawStretchRaw as 8-bit palette
+ * indices. Keep them indexed all the way into GX.
+ */
+static u16 q2gx_cinematic_tlut_storage[256]
+    __attribute__((aligned(32)));
+static GXTlutObj q2gx_cinematic_tlut;
+static qboolean q2gx_cinematic_palette_ready;
+
+static byte *q2gx_cinematic_texture_data;
+static unsigned int q2gx_cinematic_texture_bytes;
+static unsigned int q2gx_cinematic_padded_width;
+static int q2gx_cinematic_cols;
+static int q2gx_cinematic_rows;
+static GXTexObj q2gx_cinematic_texture;
+static qboolean q2gx_cinematic_texture_ready;
+
+static unsigned int q2gx_cinematic_frames_total;
+static unsigned int q2gx_cinematic_frames_window;
+static unsigned int q2gx_cinematic_palette_updates_total;
+static unsigned int q2gx_cinematic_allocations_total;
+static qboolean q2gx_cinematic_first_frame_logged;
+
 static unsigned int q2gx_pic_tlut_loads_total;
 
 
@@ -497,6 +540,25 @@ typedef struct q2gx_world_wal_texture_s
 } q2gx_world_wal_texture_t;
 
 
+/*
+ * Q2GC_STATIC_LIGHTMAPS_V2
+ *
+ * Packed static-lightmap architecture.
+ */
+#define Q2GX_LIGHTMAP_ATLAS_SIZE 128u
+#define Q2GX_LIGHTMAP_MAX_ATLASES 128u
+
+typedef struct q2gx_lightmap_atlas_s
+{
+    void *allocation;
+    u8 *texture_data;
+    unsigned int texture_bytes;
+    unsigned int allocated[Q2GX_LIGHTMAP_ATLAS_SIZE];
+    GXTexObj texture;
+    qboolean ready;
+} q2gx_lightmap_atlas_t;
+
+
 typedef struct q2gx_world_face_s
 {
     unsigned int first_vertex;
@@ -511,6 +573,16 @@ typedef struct q2gx_world_face_s
 
     unsigned int texinfo_index;
     unsigned int surface_flags;
+
+    /* Q2GC_STATIC_LIGHTMAPS_V2 */
+    int texturemins[2];
+    int extents[2];
+    u8 styles[4];
+    int32_t lightofs;
+
+    int lightmap_atlas;
+    unsigned int light_s;
+    unsigned int light_t;
 
     qboolean plane_back;
     qboolean pvs_visible_this_frame;
@@ -544,6 +616,27 @@ static unsigned int q2gx_world_wal_batch_vertices_window;
 
 static qboolean q2gx_world_texcoord_first_draw_logged;
 static unsigned int q2gx_world_texcoord_vertices_window;
+
+/* Q2GC_STATIC_LIGHTMAPS_V2 */
+static q2gx_lightmap_atlas_t
+    q2gx_lightmap_atlases[Q2GX_LIGHTMAP_MAX_ATLASES];
+
+static unsigned int q2gx_lightmap_atlas_count;
+static unsigned int q2gx_lightmap_atlas_bytes;
+static unsigned int q2gx_lightmap_faces_ready;
+static unsigned int q2gx_lightmap_faces_sampled;
+static unsigned int q2gx_lightmap_faces_fullbright;
+
+static unsigned int q2gx_lightmap_frames_window;
+static unsigned int q2gx_lightmap_faces_window;
+static unsigned int q2gx_lightmap_vertices_window;
+static unsigned int q2gx_lightmap_binds_window;
+static qboolean q2gx_lightmap_first_draw_logged;
+
+/*
+ * Q2GC_STATIC_LIGHTMAP_STATE_RESTORE_V2e
+ */
+static qboolean q2gx_lightmap_state_restore_logged;
 
 #define Q2GX_WORLD_CHECKER_SIZE 64u
 
@@ -601,6 +694,16 @@ static unsigned int q2gx_brush_animated_wal_binds_window;
 
 static unsigned int q2gx_brush_wal_binds_window;
 static unsigned int q2gx_brush_vertices_window;
+
+/*
+ * Q2GC_BRUSH_STATIC_LIGHTMAPS_V1
+ */
+static unsigned int q2gx_brush_lightmap_frames_window;
+static unsigned int q2gx_brush_lightmap_faces_window;
+static unsigned int q2gx_brush_lightmap_vertices_window;
+static unsigned int q2gx_brush_lightmap_binds_window;
+static unsigned int q2gx_brush_lightmap_missing_window;
+static qboolean q2gx_brush_lightmap_first_draw_logged;
 
 static q2gx_alias_model_t *q2gx_alias_models;
 static q2gx_alias_skin_t *q2gx_alias_skins;
@@ -2379,6 +2482,246 @@ static void Q2GX_PicWriteCI8Texel(
 }
 
 
+/*
+ * Q2GC_GX_CINEMATIC_CI8_V1
+ */
+static void Q2GX_FreeCinematicTexture(void)
+{
+    if (q2gx_cinematic_texture_data)
+    {
+        free(q2gx_cinematic_texture_data);
+        q2gx_cinematic_texture_data = NULL;
+    }
+
+    q2gx_cinematic_texture_bytes = 0u;
+    q2gx_cinematic_padded_width = 0u;
+    q2gx_cinematic_cols = 0;
+    q2gx_cinematic_rows = 0;
+    q2gx_cinematic_texture_ready = false;
+}
+
+
+static qboolean Q2GX_EnsureCinematicTexture(
+    int cols,
+    int rows)
+{
+    unsigned int bytes;
+    unsigned int padded_width;
+    byte *storage;
+
+    if (
+        cols <= 0
+        ||
+        rows <= 0
+        ||
+        cols > 4096
+        ||
+        rows > 4096
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CIN invalid source geometry: %dx%d\n",
+            cols,
+            rows
+        );
+        return false;
+    }
+
+    if (
+        q2gx_cinematic_texture_ready
+        &&
+        q2gx_cinematic_texture_data
+        &&
+        q2gx_cinematic_cols == cols
+        &&
+        q2gx_cinematic_rows == rows
+    )
+    {
+        return true;
+    }
+
+    Q2GX_FreeCinematicTexture();
+
+    bytes =
+        Q2GX_PicCI8StorageBytes(
+            (unsigned int)cols,
+            (unsigned int)rows
+        );
+
+    padded_width =
+        ((unsigned int)cols + 7u) & ~7u;
+
+    if (!bytes)
+        return false;
+
+    storage = memalign(32, bytes);
+
+    if (!storage)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CIN texture allocation failed: "
+            "%dx%d bytes=%u\n",
+            cols,
+            rows,
+            bytes
+        );
+        return false;
+    }
+
+    memset(storage, 0, bytes);
+    DCStoreRange(storage, bytes);
+
+    GX_InitTexObjCI(
+        &q2gx_cinematic_texture,
+        storage,
+        (u16)cols,
+        (u16)rows,
+        GX_TF_CI8,
+        GX_CLAMP,
+        GX_CLAMP,
+        GX_FALSE,
+        GX_TLUT0
+    );
+
+    GX_InitTexObjFilterMode(
+        &q2gx_cinematic_texture,
+        GX_LINEAR,
+        GX_LINEAR
+    );
+
+    q2gx_cinematic_texture_data = storage;
+    q2gx_cinematic_texture_bytes = bytes;
+    q2gx_cinematic_padded_width = padded_width;
+    q2gx_cinematic_cols = cols;
+    q2gx_cinematic_rows = rows;
+    q2gx_cinematic_texture_ready = true;
+
+    ++q2gx_cinematic_allocations_total;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX CIN ALLOC: "
+        "src=%dx%d ci8_bytes=%u allocations=%u "
+        "mode=reuse_ci8_rgb5a3_v1\n",
+        cols,
+        rows,
+        bytes,
+        q2gx_cinematic_allocations_total
+    );
+
+    return true;
+}
+
+
+static void Q2GX_BuildCinematicTLUT(
+    const unsigned char *palette)
+{
+    unsigned int index;
+
+    for (index = 0u; index < 256u; ++index)
+    {
+        u8 r;
+        u8 g;
+        u8 b;
+
+        if (palette)
+        {
+            r = palette[index * 3u + 0u];
+            g = palette[index * 3u + 1u];
+            b = palette[index * 3u + 2u];
+        }
+        else
+        {
+            r = q2gx_palette[index].r;
+            g = q2gx_palette[index].g;
+            b = q2gx_palette[index].b;
+        }
+
+        q2gx_cinematic_tlut_storage[index] =
+            Q2GX_PicPackRGB5A3(
+                r,
+                g,
+                b,
+                255u
+            );
+    }
+
+    DCStoreRange(
+        q2gx_cinematic_tlut_storage,
+        sizeof(q2gx_cinematic_tlut_storage)
+    );
+
+    GX_InitTlutObj(
+        &q2gx_cinematic_tlut,
+        q2gx_cinematic_tlut_storage,
+        GX_TL_RGB5A3,
+        256u
+    );
+
+    q2gx_cinematic_palette_ready = true;
+}
+
+
+static void Q2GX_DrawCinematicQuad(
+    f32 x,
+    f32 y,
+    f32 width,
+    f32 height)
+{
+    if (
+        !q2gx_cinematic_texture_ready
+        ||
+        !q2gx_cinematic_palette_ready
+    )
+    {
+        return;
+    }
+
+    Q2GX_SetupTextured2D();
+
+    GX_LoadTlut(
+        &q2gx_cinematic_tlut,
+        GX_TLUT0
+    );
+
+    GX_LoadTexObj(
+        &q2gx_cinematic_texture,
+        GX_TEXMAP0
+    );
+
+    GX_Begin(
+        GX_QUADS,
+        GX_VTXFMT0,
+        4
+    );
+
+    GX_Position2f32(x, y);
+    GX_TexCoord2f32(0.0f, 0.0f);
+
+    GX_Position2f32(x + width, y);
+    GX_TexCoord2f32(1.0f, 0.0f);
+
+    GX_Position2f32(x + width, y + height);
+    GX_TexCoord2f32(1.0f, 1.0f);
+
+    GX_Position2f32(x, y + height);
+    GX_TexCoord2f32(0.0f, 1.0f);
+
+    GX_End();
+
+    ++q2gx_texture_draws_window;
+
+    /*
+     * HUD/menu CI8 also uses GX_TLUT0.
+     * Put the ordinary picture palette back immediately.
+     */
+    Q2GX_BindPicTLUT();
+    Q2GX_Setup2D();
+}
+
+
 static qboolean Q2GX_LoadPCXPic(
     struct image_s *image,
     char *normalized)
@@ -2954,6 +3297,7 @@ static void Q2GX_ClearPicCache(void)
 #define Q2GX_BSP_LUMP_VISIBILITY   3
 #define Q2GX_BSP_LUMP_NODES        4
 #define Q2GX_BSP_LUMP_FACES        6
+#define Q2GX_BSP_LUMP_LIGHTING     7
 #define Q2GX_BSP_LUMP_LEAFS        8
 #define Q2GX_BSP_LUMP_LEAFFACES    9
 #define Q2GX_BSP_LUMP_EDGES       11
@@ -3092,6 +3436,128 @@ static qboolean Q2GX_BSPGetLump(
 
     return true;
 }
+
+
+/*
+ * Q2GC_GX_BSP_DETACH_STREAM_V1
+ *
+ * Read one BSP lump from an already-open Quake filesystem FILE.
+ * file_base preserves PAK-entry offsets exactly like CM streaming.
+ */
+static qboolean Q2GX_BSPStreamReadLump(
+    FILE *stream,
+    long file_base,
+    const byte *header,
+    unsigned int file_length,
+    unsigned int lump_index,
+    unsigned int stride,
+    byte **storage_out,
+    const byte **data_out,
+    unsigned int *bytes_out,
+    unsigned int *count_out)
+{
+    const byte *lump;
+    uint32_t file_offset;
+    uint32_t file_bytes;
+    byte *storage;
+
+    if (
+        !stream
+        ||
+        !header
+        ||
+        !storage_out
+        ||
+        !data_out
+        ||
+        !bytes_out
+        ||
+        !count_out
+        ||
+        lump_index >= Q2GX_BSP_HEADER_LUMPS
+        ||
+        stride == 0u
+    )
+    {
+        return false;
+    }
+
+    lump =
+        header
+        +
+        8u
+        +
+        lump_index * 8u;
+
+    file_offset =
+        Q2GX_BSPReadLE32(
+            lump + 0u
+        );
+
+    file_bytes =
+        Q2GX_BSPReadLE32(
+            lump + 4u
+        );
+
+    if (
+        file_offset > file_length
+        ||
+        file_bytes > file_length - file_offset
+        ||
+        file_bytes % stride
+    )
+    {
+        return false;
+    }
+
+    storage =
+        malloc(
+            file_bytes
+                ? (size_t)file_bytes
+                : 1u
+        );
+
+    if (!storage)
+        return false;
+
+    if (
+        fseek(
+            stream,
+            file_base + (long)file_offset,
+            SEEK_SET
+        ) != 0
+    )
+    {
+        free(storage);
+        return false;
+    }
+
+    if (file_bytes > 0u)
+        FS_Read(storage, (int)file_bytes, stream);
+
+    *storage_out = storage;
+    *data_out = storage;
+    *bytes_out = (unsigned int)file_bytes;
+    *count_out = (unsigned int)(file_bytes / stride);
+
+    return true;
+}
+
+
+static void Q2GX_BSPStreamFree(
+    byte **storage)
+{
+    if (
+        storage
+        &&
+        *storage
+    )
+    {
+        free(*storage);
+        *storage = NULL;
+    }
+}
+
 
 
 static qboolean Q2GX_BSPResolveVertex(
@@ -3233,21 +3699,77 @@ static void Q2GX_SetupWorld3D(
      Q2GX_SURF_TRANS66 | Q2GX_SURF_FLOWING | Q2GX_SURF_NODRAW)
 
 
+/*
+ * Q2GC_WAL_DIM_CACHE_V1
+ *
+ * A Quake II WAL stores width/height in the fixed header at offsets
+ * 32 and 36. The old loader FS_LoadFile()ed the entire WAL each time
+ * a referenced texinfo first needed dimensions.
+ *
+ * Keep one renderer-lifetime name->dimensions cache and, on a miss,
+ * read only the first 40 bytes. Asset dimensions are immutable, so
+ * retaining this cache across map transitions is safe.
+ */
+#define Q2GX_WAL_DIM_CACHE_MAX 512u
+
+typedef struct q2gx_wal_dim_cache_entry_s
+{
+    char name[MAX_QPATH];
+    unsigned int width;
+    unsigned int height;
+} q2gx_wal_dim_cache_entry_t;
+
+static q2gx_wal_dim_cache_entry_t
+    q2gx_wal_dim_cache[Q2GX_WAL_DIM_CACHE_MAX];
+
+static unsigned int q2gx_wal_dim_cache_count;
+static unsigned int q2gx_wal_dim_cache_hits_total;
+static unsigned int q2gx_wal_dim_cache_misses_total;
+static unsigned int q2gx_wal_dim_header_bytes_total;
+
+
 static qboolean Q2GX_ReadWALDimensions(
     const char *texture,
     unsigned int *width_out,
     unsigned int *height_out)
 {
     char path[MAX_QPATH];
+    byte header[40];
+
     size_t texture_length;
-    void *file_buffer;
+    unsigned int index;
+
+    FILE *file = NULL;
     int file_length;
-    const byte *data;
+
     uint32_t width;
     uint32_t height;
 
     if (!texture || !texture[0] || !width_out || !height_out)
         return false;
+
+    for (index = 0u; index < q2gx_wal_dim_cache_count; ++index)
+    {
+        if (
+            strcmp(
+                q2gx_wal_dim_cache[index].name,
+                texture
+            ) == 0
+        )
+        {
+            *width_out =
+                q2gx_wal_dim_cache[index].width;
+
+            *height_out =
+                q2gx_wal_dim_cache[index].height;
+
+            ++q2gx_wal_dim_cache_hits_total;
+
+            return true;
+        }
+    }
+
+    ++q2gx_wal_dim_cache_misses_total;
 
     texture_length = strlen(texture);
 
@@ -3258,32 +3780,96 @@ static qboolean Q2GX_ReadWALDimensions(
     memcpy(path + 9u, texture, texture_length);
     memcpy(path + 9u + texture_length, ".wal", 5u);
 
-    file_buffer = NULL;
-    file_length = ri.FS_LoadFile(path, &file_buffer);
+    file_length =
+        FS_FOpenFile(
+            path,
+            &file
+        );
 
-    if (file_length < 100 || !file_buffer)
+    if (
+        file_length < 100
+        ||
+        !file
+    )
     {
-        if (file_buffer)
-            ri.FS_FreeFile(file_buffer);
+        if (file)
+            FS_FCloseFile(file);
 
         return false;
     }
 
-    data = (const byte *)file_buffer;
+    FS_Read(
+        header,
+        (int)sizeof(header),
+        file
+    );
 
-    width = Q2GX_BSPReadLE32(data + 32u);
-    height = Q2GX_BSPReadLE32(data + 36u);
+    FS_FCloseFile(file);
+    file = NULL;
 
-    ri.FS_FreeFile(file_buffer);
+    q2gx_wal_dim_header_bytes_total +=
+        (unsigned int)sizeof(header);
 
-    if (width == 0u || height == 0u ||
-        width > 4096u || height > 4096u)
+    width =
+        Q2GX_BSPReadLE32(
+            header + 32u
+        );
+
+    height =
+        Q2GX_BSPReadLE32(
+            header + 36u
+        );
+
+    if (
+        width == 0u
+        ||
+        height == 0u
+        ||
+        width > 4096u
+        ||
+        height > 4096u
+    )
     {
         return false;
     }
 
-    *width_out = (unsigned int)width;
-    *height_out = (unsigned int)height;
+    *width_out =
+        (unsigned int)width;
+
+    *height_out =
+        (unsigned int)height;
+
+    if (
+        q2gx_wal_dim_cache_count <
+        Q2GX_WAL_DIM_CACHE_MAX
+    )
+    {
+        q2gx_wal_dim_cache_entry_t *entry =
+            &q2gx_wal_dim_cache[
+                q2gx_wal_dim_cache_count++
+            ];
+
+        memset(
+            entry,
+            0,
+            sizeof(*entry)
+        );
+
+        memcpy(
+            entry->name,
+            texture,
+            texture_length
+        );
+
+        entry->name[texture_length] =
+            '\0';
+
+        entry->width =
+            (unsigned int)width;
+
+        entry->height =
+            (unsigned int)height;
+    }
 
     return true;
 }
@@ -3435,6 +4021,596 @@ static void Q2GX_ComputeWorldDiagnosticST(
 }
 
 
+/*
+ * Q2GC_STATIC_LIGHTMAPS_V2
+ */
+static void Q2GX_FreeLightmapAtlases(void)
+{
+    unsigned int i;
+
+    for (i = 0u; i < Q2GX_LIGHTMAP_MAX_ATLASES; ++i)
+    {
+        if (q2gx_lightmap_atlases[i].allocation)
+        {
+            free(q2gx_lightmap_atlases[i].allocation);
+            q2gx_lightmap_atlases[i].allocation = NULL;
+            q2gx_lightmap_atlases[i].texture_data = NULL;
+            q2gx_lightmap_atlases[i].ready = false;
+        }
+
+        memset(
+            q2gx_lightmap_atlases[i].allocated,
+            0,
+            sizeof(q2gx_lightmap_atlases[i].allocated)
+        );
+    }
+
+    q2gx_lightmap_atlas_count = 0u;
+    q2gx_lightmap_atlas_bytes = 0u;
+}
+
+
+static qboolean Q2GX_InitLightmapAtlas(
+    q2gx_lightmap_atlas_t *atlas)
+{
+    uintptr_t aligned;
+    unsigned int bytes =
+        Q2GX_LIGHTMAP_ATLAS_SIZE
+        *
+        Q2GX_LIGHTMAP_ATLAS_SIZE
+        *
+        2u;
+
+    if (!atlas)
+        return false;
+
+    memset(atlas, 0, sizeof(*atlas));
+
+    atlas->allocation = calloc(1u, bytes + 31u);
+
+    if (!atlas->allocation)
+        return false;
+
+    aligned =
+        ((uintptr_t)atlas->allocation + 31u)
+        &
+        ~(uintptr_t)31u;
+
+    atlas->texture_data = (u8 *)aligned;
+    atlas->texture_bytes = bytes;
+
+    memset(atlas->texture_data, 0xff, bytes);
+
+    return true;
+}
+
+
+static qboolean Q2GX_LightmapAllocBlock(
+    q2gx_lightmap_atlas_t *atlas,
+    unsigned int w,
+    unsigned int h,
+    unsigned int *x_out,
+    unsigned int *y_out)
+{
+    unsigned int best = Q2GX_LIGHTMAP_ATLAS_SIZE;
+    unsigned int best_x = 0u;
+    unsigned int i;
+
+    if (
+        !atlas ||
+        !x_out ||
+        !y_out ||
+        w == 0u ||
+        h == 0u ||
+        w > Q2GX_LIGHTMAP_ATLAS_SIZE ||
+        h > Q2GX_LIGHTMAP_ATLAS_SIZE
+    )
+    {
+        return false;
+    }
+
+    for (i = 0u; i + w <= Q2GX_LIGHTMAP_ATLAS_SIZE; ++i)
+    {
+        unsigned int best2 = 0u;
+        unsigned int j;
+
+        for (j = 0u; j < w; ++j)
+        {
+            if (atlas->allocated[i + j] >= best)
+                break;
+
+            if (atlas->allocated[i + j] > best2)
+                best2 = atlas->allocated[i + j];
+        }
+
+        if (j == w)
+        {
+            best_x = i;
+            best = best2;
+        }
+    }
+
+    if (best + h > Q2GX_LIGHTMAP_ATLAS_SIZE)
+        return false;
+
+    for (i = 0u; i < w; ++i)
+        atlas->allocated[best_x + i] = best + h;
+
+    *x_out = best_x;
+    *y_out = best;
+
+    return true;
+}
+
+
+static qboolean Q2GX_CalcStaticLightmapExtents(
+    const byte *vertex_data,
+    unsigned int vertex_count,
+    const byte *edge_data,
+    unsigned int edge_count,
+    const byte *surfedge_data,
+    unsigned int surfedge_count,
+    unsigned int firstedge,
+    unsigned int numedges,
+    const q2gx_world_texinfo_t *texinfo,
+    int texturemins[2],
+    int extents[2])
+{
+    f32 mins[2] = {999999.0f, 999999.0f};
+    f32 maxs[2] = {-99999.0f, -99999.0f};
+    unsigned int local_edge;
+    unsigned int axis;
+
+    if (
+        !vertex_data ||
+        !edge_data ||
+        !surfedge_data ||
+        !texinfo ||
+        !texturemins ||
+        !extents ||
+        numedges < 3u
+    )
+    {
+        return false;
+    }
+
+    for (local_edge = 0u; local_edge < numedges; ++local_edge)
+    {
+        f32 position[3];
+
+        if (
+            !Q2GX_BSPResolveVertex(
+                vertex_data,
+                vertex_count,
+                edge_data,
+                edge_count,
+                surfedge_data,
+                surfedge_count,
+                firstedge,
+                local_edge,
+                position
+            )
+        )
+        {
+            return false;
+        }
+
+        for (axis = 0u; axis < 2u; ++axis)
+        {
+            f32 value =
+                position[0] * texinfo->vecs[axis][0]
+                +
+                position[1] * texinfo->vecs[axis][1]
+                +
+                position[2] * texinfo->vecs[axis][2]
+                +
+                texinfo->vecs[axis][3];
+
+            if (value < mins[axis]) mins[axis] = value;
+            if (value > maxs[axis]) maxs[axis] = value;
+        }
+    }
+
+    for (axis = 0u; axis < 2u; ++axis)
+    {
+        int bmin =
+            (int)floor((double)mins[axis] / 16.0);
+
+        int bmax =
+            (int)ceil((double)maxs[axis] / 16.0);
+
+        texturemins[axis] = bmin * 16;
+        extents[axis] = (bmax - bmin) * 16;
+
+        if (extents[axis] < 0)
+            return false;
+    }
+
+    return true;
+}
+
+
+static void Q2GX_StoreLightmapRGB565(
+    u8 *texture_data,
+    unsigned int x,
+    unsigned int y,
+    u8 r,
+    u8 g,
+    u8 b)
+{
+    unsigned int tile_x = x >> 2;
+    unsigned int tile_y = y >> 2;
+    unsigned int local_x = x & 3u;
+    unsigned int local_y = y & 3u;
+
+    unsigned int tiles_per_row =
+        Q2GX_LIGHTMAP_ATLAS_SIZE >> 2;
+
+    unsigned int tile_offset =
+        (tile_y * tiles_per_row + tile_x) * 32u;
+
+    unsigned int pixel_offset =
+        (local_y * 4u + local_x) * 2u;
+
+    u16 packed =
+        (u16)(
+            ((u16)(r >> 3) << 11)
+            |
+            ((u16)(g >> 2) << 5)
+            |
+            ((u16)(b >> 3))
+        );
+
+    texture_data[tile_offset + pixel_offset + 0u] =
+        (u8)(packed >> 8);
+
+    texture_data[tile_offset + pixel_offset + 1u] =
+        (u8)(packed & 0xffu);
+}
+
+
+static qboolean Q2GX_AllocFaceLightmapSlot(
+    q2gx_world_face_t *face,
+    unsigned int w,
+    unsigned int h)
+{
+    unsigned int atlas_index;
+
+    if (!face)
+        return false;
+
+    for (
+        atlas_index = 0u;
+        atlas_index < q2gx_lightmap_atlas_count;
+        ++atlas_index
+    )
+    {
+        unsigned int x;
+        unsigned int y;
+
+        if (
+            Q2GX_LightmapAllocBlock(
+                &q2gx_lightmap_atlases[atlas_index],
+                w,
+                h,
+                &x,
+                &y
+            )
+        )
+        {
+            face->lightmap_atlas = (int)atlas_index;
+            face->light_s = x;
+            face->light_t = y;
+            return true;
+        }
+    }
+
+    if (q2gx_lightmap_atlas_count >= Q2GX_LIGHTMAP_MAX_ATLASES)
+        return false;
+
+    atlas_index = q2gx_lightmap_atlas_count;
+
+    if (
+        !Q2GX_InitLightmapAtlas(
+            &q2gx_lightmap_atlases[atlas_index]
+        )
+    )
+    {
+        return false;
+    }
+
+    ++q2gx_lightmap_atlas_count;
+
+    {
+        unsigned int x;
+        unsigned int y;
+
+        if (
+            !Q2GX_LightmapAllocBlock(
+                &q2gx_lightmap_atlases[atlas_index],
+                w,
+                h,
+                &x,
+                &y
+            )
+        )
+        {
+            return false;
+        }
+
+        face->lightmap_atlas = (int)atlas_index;
+        face->light_s = x;
+        face->light_t = y;
+    }
+
+    return true;
+}
+
+
+static qboolean Q2GX_BuildStaticFaceLightmapAtlas(
+    q2gx_world_face_t *face,
+    const byte *lighting_data,
+    unsigned int lighting_bytes)
+{
+    unsigned int smax;
+    unsigned int tmax;
+    unsigned int sample_count;
+    unsigned int style_count = 0u;
+    unsigned int style_index;
+    unsigned int x;
+    unsigned int y;
+
+    q2gx_lightmap_atlas_t *atlas;
+
+    if (!face)
+        return false;
+
+    face->lightmap_atlas = -1;
+    face->light_s = 0u;
+    face->light_t = 0u;
+
+    smax = ((unsigned int)face->extents[0] >> 4) + 1u;
+    tmax = ((unsigned int)face->extents[1] >> 4) + 1u;
+
+    if (
+        smax == 0u ||
+        tmax == 0u ||
+        smax > Q2GX_LIGHTMAP_ATLAS_SIZE ||
+        tmax > Q2GX_LIGHTMAP_ATLAS_SIZE
+    )
+    {
+        return false;
+    }
+
+    sample_count = smax * tmax;
+
+    while (
+        style_count < 4u
+        &&
+        face->styles[style_count] != 255u
+    )
+    {
+        ++style_count;
+    }
+
+    if (!Q2GX_AllocFaceLightmapSlot(face, smax, tmax))
+        return false;
+
+    atlas =
+        &q2gx_lightmap_atlases[
+            (unsigned int)face->lightmap_atlas
+        ];
+
+    if (
+        face->lightofs < 0
+        ||
+        style_count == 0u
+    )
+    {
+        ++q2gx_lightmap_faces_fullbright;
+        ++q2gx_lightmap_faces_ready;
+        return true;
+    }
+
+    {
+        uint64_t needed =
+            (uint64_t)(uint32_t)face->lightofs
+            +
+            (uint64_t)style_count
+            *
+            (uint64_t)sample_count
+            *
+            3u;
+
+        if (
+            !lighting_data
+            ||
+            needed > (uint64_t)lighting_bytes
+        )
+        {
+            return false;
+        }
+    }
+
+    for (y = 0u; y < tmax; ++y)
+    {
+        for (x = 0u; x < smax; ++x)
+        {
+            unsigned int pixel = y * smax + x;
+            unsigned int r = 0u;
+            unsigned int g = 0u;
+            unsigned int b = 0u;
+            unsigned int max_component;
+
+            for (
+                style_index = 0u;
+                style_index < style_count;
+                ++style_index
+            )
+            {
+                const byte *sample =
+                    lighting_data
+                    +
+                    (unsigned int)face->lightofs
+                    +
+                    (
+                        style_index * sample_count + pixel
+                    )
+                    *
+                    3u;
+
+                r += (unsigned int)sample[0];
+                g += (unsigned int)sample[1];
+                b += (unsigned int)sample[2];
+            }
+
+            max_component = r;
+            if (g > max_component) max_component = g;
+            if (b > max_component) max_component = b;
+
+            if (max_component > 255u)
+            {
+                r = (r * 255u + max_component / 2u) / max_component;
+                g = (g * 255u + max_component / 2u) / max_component;
+                b = (b * 255u + max_component / 2u) / max_component;
+            }
+
+            if (r > 255u) r = 255u;
+            if (g > 255u) g = 255u;
+            if (b > 255u) b = 255u;
+
+            Q2GX_StoreLightmapRGB565(
+                atlas->texture_data,
+                face->light_s + x,
+                face->light_t + y,
+                (u8)r,
+                (u8)g,
+                (u8)b
+            );
+        }
+    }
+
+    ++q2gx_lightmap_faces_sampled;
+    ++q2gx_lightmap_faces_ready;
+
+    return true;
+}
+
+
+static void Q2GX_FinalizeLightmapAtlases(void)
+{
+    unsigned int atlas_index;
+
+    q2gx_lightmap_atlas_bytes = 0u;
+
+    for (
+        atlas_index = 0u;
+        atlas_index < q2gx_lightmap_atlas_count;
+        ++atlas_index
+    )
+    {
+        q2gx_lightmap_atlas_t *atlas =
+            &q2gx_lightmap_atlases[atlas_index];
+
+        if (!atlas->texture_data || atlas->texture_bytes == 0u)
+            continue;
+
+        DCStoreRange(
+            atlas->texture_data,
+            atlas->texture_bytes
+        );
+
+        GX_InitTexObj(
+            &atlas->texture,
+            atlas->texture_data,
+            (u16)Q2GX_LIGHTMAP_ATLAS_SIZE,
+            (u16)Q2GX_LIGHTMAP_ATLAS_SIZE,
+            GX_TF_RGB565,
+            GX_CLAMP,
+            GX_CLAMP,
+            GX_FALSE
+        );
+
+        GX_InitTexObjFilterMode(
+            &atlas->texture,
+            GX_LINEAR,
+            GX_LINEAR
+        );
+
+        atlas->ready = true;
+
+        q2gx_lightmap_atlas_bytes +=
+            atlas->texture_bytes;
+    }
+}
+
+
+static void Q2GX_ComputeAtlasLightmapST(
+    const q2gx_world_face_t *face,
+    const q2gx_world_texinfo_t *texinfo,
+    const q2gx_world_vertex_t *vertex,
+    f32 *s_out,
+    f32 *t_out)
+{
+    f32 raw_s;
+    f32 raw_t;
+
+    if (
+        !face ||
+        !texinfo ||
+        !vertex ||
+        !s_out ||
+        !t_out ||
+        face->lightmap_atlas < 0
+    )
+    {
+        if (s_out) *s_out = 0.0f;
+        if (t_out) *t_out = 0.0f;
+        return;
+    }
+
+    raw_s =
+        vertex->x * texinfo->vecs[0][0]
+        +
+        vertex->y * texinfo->vecs[0][1]
+        +
+        vertex->z * texinfo->vecs[0][2]
+        +
+        texinfo->vecs[0][3];
+
+    raw_t =
+        vertex->x * texinfo->vecs[1][0]
+        +
+        vertex->y * texinfo->vecs[1][1]
+        +
+        vertex->z * texinfo->vecs[1][2]
+        +
+        texinfo->vecs[1][3];
+
+    *s_out =
+        (
+            (f32)face->light_s
+            +
+            (raw_s - (f32)face->texturemins[0]) / 16.0f
+            +
+            0.5f
+        )
+        /
+        (f32)Q2GX_LIGHTMAP_ATLAS_SIZE;
+
+    *t_out =
+        (
+            (f32)face->light_t
+            +
+            (raw_t - (f32)face->texturemins[1]) / 16.0f
+            +
+            0.5f
+        )
+        /
+        (f32)Q2GX_LIGHTMAP_ATLAS_SIZE;
+}
+
+
 static void Q2GX_SetupTexturedWorld3D(
     refdef_t *fd)
 {
@@ -3540,6 +4716,114 @@ static int Q2GX_FindWorldWALTexture(
 }
 
 
+
+/*
+ * Q2GC_WORLD_WAL_CI8_V1
+ *
+ * Quake II WAL mip0 is already an 8-bit palette-indexed image.
+ * Keep those indices instead of expanding every texel to RGBA8.
+ *
+ * GX CI8 uses 8x4 / 32-byte tiles. A single RGB565 TLUT derived
+ * from the common Quake II palette is restored before every world
+ * WAL bind because pictures and alias skins also reuse GX_TLUT0.
+ */
+static u16 q2gx_world_wal_tlut_storage[256]
+    __attribute__((aligned(32)));
+
+static GXTlutObj q2gx_world_wal_tlut;
+static qboolean q2gx_world_wal_tlut_ready;
+static unsigned int q2gx_world_wal_tlut_loads_total;
+
+
+static u16 Q2GX_WorldWALPackRGB565(
+    u8 r,
+    u8 g,
+    u8 b)
+{
+    return
+        (u16)
+        (
+            ((u16)(r >> 3) << 11)
+            |
+            ((u16)(g >> 2) << 5)
+            |
+            (u16)(b >> 3)
+        );
+}
+
+
+static void Q2GX_InitWorldWALTLUT(void)
+{
+    unsigned int index;
+
+    if (
+        q2gx_world_wal_tlut_ready
+        ||
+        !q2gx_palette_loaded
+    )
+    {
+        return;
+    }
+
+    for (index = 0u; index < 256u; ++index)
+    {
+        q2gx_world_wal_tlut_storage[index] =
+            Q2GX_WorldWALPackRGB565(
+                q2gx_palette[index].r,
+                q2gx_palette[index].g,
+                q2gx_palette[index].b
+            );
+    }
+
+    DCStoreRange(
+        q2gx_world_wal_tlut_storage,
+        sizeof(q2gx_world_wal_tlut_storage)
+    );
+
+    GX_InitTlutObj(
+        &q2gx_world_wal_tlut,
+        q2gx_world_wal_tlut_storage,
+        GX_TL_RGB565,
+        256u
+    );
+
+    q2gx_world_wal_tlut_ready = true;
+    q2gx_world_wal_tlut_loads_total = 0u;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX WORLD WAL CI8 INIT: "
+        "tlut_bytes=%u format=rgb565 tlut=GX_TLUT0 "
+        "mode=wal_indices_direct_v1\n",
+        (unsigned int)sizeof(q2gx_world_wal_tlut_storage)
+    );
+}
+
+
+static void Q2GX_WorldWALWriteCI8Texel(
+    u8 *storage,
+    unsigned int tile_columns,
+    unsigned int x,
+    unsigned int y,
+    u8 palette_index)
+{
+    unsigned int tile_x = x >> 3;
+    unsigned int tile_y = y >> 2;
+    unsigned int local_x = x & 7u;
+    unsigned int local_y = y & 3u;
+    unsigned int block_offset =
+        (tile_y * tile_columns + tile_x) * 32u;
+
+    storage[
+        block_offset
+        +
+        local_y * 8u
+        +
+        local_x
+    ] = palette_index;
+}
+
+
 static qboolean Q2GX_LoadWorldWALTexture(
     const char *name,
     q2gx_world_wal_texture_t *texture)
@@ -3570,6 +4854,11 @@ static qboolean Q2GX_LoadWorldWALTexture(
     if (!name || !name[0] || !texture || !q2gx_palette_loaded)
         return false;
 
+    Q2GX_InitWorldWALTLUT();
+
+    if (!q2gx_world_wal_tlut_ready)
+        return false;
+
     name_length = strlen(name);
 
     if (name_length + 14u > sizeof(path))
@@ -3585,6 +4874,7 @@ static qboolean Q2GX_LoadWorldWALTexture(
     {
         if (file_buffer)
             ri.FS_FreeFile(file_buffer);
+
         return false;
     }
 
@@ -3595,11 +4885,16 @@ static qboolean Q2GX_LoadWorldWALTexture(
     offset0 = Q2GX_BSPReadLE32(data + 40u);
 
     if (
-        width == 0u ||
-        height == 0u ||
-        width > 1024u ||
-        height > 1024u ||
-        offset0 > (uint32_t)file_length ||
+        width == 0u
+        ||
+        height == 0u
+        ||
+        width > 1024u
+        ||
+        height > 1024u
+        ||
+        offset0 > (uint32_t)file_length
+        ||
         (uint64_t)width * (uint64_t)height >
             (uint64_t)file_length - (uint64_t)offset0
     )
@@ -3608,16 +4903,32 @@ static qboolean Q2GX_LoadWorldWALTexture(
         return false;
     }
 
-    tile_columns = ((unsigned int)width + 3u) >> 2;
-    tile_rows = ((unsigned int)height + 3u) >> 2;
+    tile_columns =
+        ((unsigned int)width + 7u) >> 3;
 
-    if ((uint64_t)tile_columns * (uint64_t)tile_rows * 64u > 0xffffffffu)
+    tile_rows =
+        ((unsigned int)height + 3u) >> 2;
+
+    if (
+        (uint64_t)tile_columns
+        *
+        (uint64_t)tile_rows
+        *
+        32u
+        >
+        0xffffffffu
+    )
     {
         ri.FS_FreeFile(file_buffer);
         return false;
     }
 
-    texture_bytes = tile_columns * tile_rows * 64u;
+    texture_bytes =
+        tile_columns
+        *
+        tile_rows
+        *
+        32u;
 
     texture->allocation =
         calloc(
@@ -3650,27 +4961,17 @@ static qboolean Q2GX_LoadWorldWALTexture(
     {
         for (x = 0u; x < (unsigned int)width; ++x)
         {
-            unsigned int tile_x = x >> 2;
-            unsigned int tile_y = y >> 2;
-            unsigned int local_x = x & 3u;
-            unsigned int local_y = y & 3u;
-            unsigned int block_offset =
-                (tile_y * tile_columns + tile_x) * 64u;
-            unsigned int texel = local_y * 4u + local_x;
-            unsigned int ar_offset = block_offset + texel * 2u;
-            unsigned int gb_offset = block_offset + 32u + texel * 2u;
-
-            GXColor color =
-                q2gx_palette[
-                    indexed[
-                        y * (unsigned int)width + x
-                    ]
-                ];
-
-            texture->texture_data[ar_offset + 0u] = 255u;
-            texture->texture_data[ar_offset + 1u] = color.r;
-            texture->texture_data[gb_offset + 0u] = color.g;
-            texture->texture_data[gb_offset + 1u] = color.b;
+            Q2GX_WorldWALWriteCI8Texel(
+                texture->texture_data,
+                tile_columns,
+                x,
+                y,
+                indexed[
+                    y * (unsigned int)width
+                    +
+                    x
+                ]
+            );
         }
     }
 
@@ -3688,15 +4989,16 @@ static qboolean Q2GX_LoadWorldWALTexture(
         texture_bytes
     );
 
-    GX_InitTexObj(
+    GX_InitTexObjCI(
         &texture->texture,
         texture->texture_data,
         (u16)texture->width,
         (u16)texture->height,
-        GX_TF_RGBA8,
+        GX_TF_CI8,
         GX_REPEAT,
         GX_REPEAT,
-        GX_FALSE
+        GX_FALSE,
+        GX_TLUT0
     );
 
     GX_InitTexObjFilterMode(
@@ -3716,6 +5018,16 @@ static void Q2GX_BindWorldWALTexture(
         GX_TEVSTAGE0,
         GX_REPLACE
     );
+
+    if (q2gx_world_wal_tlut_ready)
+    {
+        GX_LoadTlut(
+            &q2gx_world_wal_tlut,
+            GX_TLUT0
+        );
+
+        ++q2gx_world_wal_tlut_loads_total;
+    }
 
     GX_LoadTexObj(
         &texture->texture,
@@ -3772,6 +5084,8 @@ static void Q2GX_FreeWorldGeometry(void)
 
     if (q2gx_world_vertices) free(q2gx_world_vertices);
     if (q2gx_world_faces) free(q2gx_world_faces);
+
+    Q2GX_FreeLightmapAtlases();
     if (q2gx_world_nodes) free(q2gx_world_nodes);
     if (q2gx_world_leaves) free(q2gx_world_leaves);
     if (q2gx_world_leaffaces) free(q2gx_world_leaffaces);
@@ -3838,6 +5152,17 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_world_texcoord_first_draw_logged = false;
     q2gx_world_texcoord_vertices_window = 0u;
 
+    /* Q2GC_STATIC_LIGHTMAPS_V2 */
+    q2gx_lightmap_faces_ready = 0u;
+    q2gx_lightmap_faces_sampled = 0u;
+    q2gx_lightmap_faces_fullbright = 0u;
+    q2gx_lightmap_frames_window = 0u;
+    q2gx_lightmap_faces_window = 0u;
+    q2gx_lightmap_vertices_window = 0u;
+    q2gx_lightmap_binds_window = 0u;
+    q2gx_lightmap_first_draw_logged = false;
+    q2gx_lightmap_state_restore_logged = false;
+
 
     Q2GX_FreeWorldWALTextureArray(
         q2gx_world_wal_textures,
@@ -3897,6 +5222,13 @@ static void Q2GX_FreeWorldGeometry(void)
     q2gx_brush_animated_wal_binds_window = 0u;
     q2gx_brush_wal_binds_window = 0u;
     q2gx_brush_vertices_window = 0u;
+
+    q2gx_brush_lightmap_frames_window = 0u;
+    q2gx_brush_lightmap_faces_window = 0u;
+    q2gx_brush_lightmap_vertices_window = 0u;
+    q2gx_brush_lightmap_binds_window = 0u;
+    q2gx_brush_lightmap_missing_window = 0u;
+    q2gx_brush_lightmap_first_draw_logged = false;
 
 
     Q2GX_FreeWorldWALTextureArray(
@@ -4047,11 +5379,59 @@ static qboolean Q2GX_LoadWorldGeometry(
     int file_length_int;
     unsigned int file_length;
 
+    /*
+     * Q2GC_GX_BSP_DETACH_STREAM_V1
+     */
+    byte bsp_header[
+        8u
+        +
+        Q2GX_BSP_HEADER_LUMPS * 8u
+    ];
+
+    FILE *bsp_stream = NULL;
+    long bsp_stream_base = 0;
+
+    byte *stream_plane_storage = NULL;
+    byte *stream_vertex_storage = NULL;
+    byte *stream_visibility_storage = NULL;
+    byte *stream_node_storage = NULL;
+    byte *stream_face_storage = NULL;
+    byte *stream_lighting_storage = NULL;
+    byte *stream_leaf_storage = NULL;
+    byte *stream_leafface_storage = NULL;
+    byte *stream_edge_storage = NULL;
+    byte *stream_surfedge_storage = NULL;
+
+    unsigned int streamed_raw_bytes = 0u;
+
+    /*
+     * Q2GC_GX_BSP_PREFLIGHT_STREAM_V2
+     *
+     * Temporary independent lump allocations replace the old
+     * single whole-BSP FS_LoadFile allocation.
+     */
+    byte *preflight_plane_storage = NULL;
+    byte *preflight_vertex_storage = NULL;
+    byte *preflight_visibility_storage = NULL;
+    byte *preflight_node_storage = NULL;
+    byte *preflight_texinfo_storage = NULL;
+    byte *preflight_face_storage = NULL;
+    byte *preflight_lighting_storage = NULL;
+    byte *preflight_leaf_storage = NULL;
+    byte *preflight_leafface_storage = NULL;
+    byte *preflight_edge_storage = NULL;
+    byte *preflight_surfedge_storage = NULL;
+    byte *preflight_model_storage = NULL;
+
     const byte *plane_data;
     const byte *vertex_data;
     const byte *visibility_data;
     const byte *node_data;
     const byte *face_data;
+
+    /* Q2GC_STATIC_LIGHTMAPS_V2 */
+    const byte *lighting_data;
+
     const byte *leaf_data;
     const byte *leafface_data;
     const byte *edge_data;
@@ -4059,6 +5439,9 @@ static qboolean Q2GX_LoadWorldGeometry(
 
     unsigned int plane_bytes, vertex_bytes, visibility_bytes, node_bytes;
     unsigned int face_bytes, leaf_bytes, leafface_bytes, edge_bytes, surfedge_bytes;
+
+    /* Q2GC_STATIC_LIGHTMAPS_V2 */
+    unsigned int lighting_bytes, lighting_count;
     unsigned int plane_count, vertex_count, visibility_count, node_count;
     unsigned int face_count, leaf_count, leafface_count, edge_count, surfedge_count;
     unsigned int vis_numclusters = 0u;
@@ -4104,59 +5487,141 @@ static qboolean Q2GX_LoadWorldGeometry(
     memcpy(path + 5 + map_length, ".bsp", 5);
 
     file_buffer = NULL;
-    file_length_int = ri.FS_LoadFile(path, &file_buffer);
+    file_data = NULL;
 
-    if (file_length_int <= 0 || !file_buffer)
+    file_length_int =
+        FS_FOpenFile(
+            path,
+            &bsp_stream
+        );
+
+    if (
+        file_length_int <= 0
+        ||
+        !bsp_stream
+    )
     {
-        if (file_buffer) ri.FS_FreeFile(file_buffer);
-        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: failed to load %s\n", path);
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BSP PREFLIGHT: open failed %s length=%d\n",
+            path,
+            file_length_int
+        );
+
         return false;
     }
 
-    file_data = (byte *)file_buffer;
-    file_length = (unsigned int)file_length_int;
+    file_length =
+        (unsigned int)file_length_int;
 
-    if (file_length < 8u + Q2GX_BSP_HEADER_LUMPS * 8u)
+    bsp_stream_base =
+        ftell(
+            bsp_stream
+        );
+
+    if (bsp_stream_base < 0)
     {
-        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: short BSP header %s\n", path);
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BSP PREFLIGHT: ftell failed %s\n",
+            path
+        );
+
         goto fail;
     }
 
-    if (file_data[0] != 'I' || file_data[1] != 'B' ||
-        file_data[2] != 'S' || file_data[3] != 'P')
+    if (file_length < sizeof(bsp_header))
     {
-        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: bad BSP magic %s\n", path);
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX WORLD: short BSP header %s\n",
+            path
+        );
+
         goto fail;
     }
 
-    if (Q2GX_BSPReadLE32(file_data + 4) != Q2GX_BSP_VERSION)
+    if (
+        fseek(
+            bsp_stream,
+            bsp_stream_base,
+            SEEK_SET
+        ) != 0
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BSP PREFLIGHT: header seek failed %s\n",
+            path
+        );
+
+        goto fail;
+    }
+
+    FS_Read(
+        bsp_header,
+        (int)sizeof(bsp_header),
+        bsp_stream
+    );
+
+    if (
+        bsp_header[0] != 'I'
+        ||
+        bsp_header[1] != 'B'
+        ||
+        bsp_header[2] != 'S'
+        ||
+        bsp_header[3] != 'P'
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX WORLD: bad BSP magic %s\n",
+            path
+        );
+
+        goto fail;
+    }
+
+    if (
+        Q2GX_BSPReadLE32(
+            bsp_header + 4
+        ) !=
+        Q2GX_BSP_VERSION
+    )
     {
         ri.Con_Printf(
             PRINT_ALL,
             "Q2GC REF_GX WORLD: unsupported BSP version %u in %s\n",
-            (unsigned int)Q2GX_BSPReadLE32(file_data + 4),
-            path);
+            (unsigned int)Q2GX_BSPReadLE32(
+                bsp_header + 4
+            ),
+            path
+        );
+
         goto fail;
     }
 
-    if (!Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_PLANES, 20u,
-                         &plane_data, &plane_bytes, &plane_count) ||
-        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_VERTEXES, 12u,
-                         &vertex_data, &vertex_bytes, &vertex_count) ||
-        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_VISIBILITY, 1u,
-                         &visibility_data, &visibility_bytes, &visibility_count) ||
-        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_NODES, 28u,
-                         &node_data, &node_bytes, &node_count) ||
-        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_FACES, 20u,
-                         &face_data, &face_bytes, &face_count) ||
-        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_LEAFS, 28u,
-                         &leaf_data, &leaf_bytes, &leaf_count) ||
-        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_LEAFFACES, 2u,
-                         &leafface_data, &leafface_bytes, &leafface_count) ||
-        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_EDGES, 4u,
-                         &edge_data, &edge_bytes, &edge_count) ||
-        !Q2GX_BSPGetLump(file_data, file_length, Q2GX_BSP_LUMP_SURFEDGES, 4u,
-                         &surfedge_data, &surfedge_bytes, &surfedge_count))
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX BSP PREFLIGHT BEGIN: "
+        "path=%s file_bytes=%u header_bytes=%u "
+        "mode=streamed_lumps_no_whole_file_v2\n",
+        path,
+        file_length,
+        (unsigned int)sizeof(bsp_header)
+    );
+
+    if (!Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_PLANES, 20u, &preflight_plane_storage, &plane_data, &plane_bytes, &plane_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_VERTEXES, 12u, &preflight_vertex_storage, &vertex_data, &vertex_bytes, &vertex_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_VISIBILITY, 1u, &preflight_visibility_storage, &visibility_data, &visibility_bytes, &visibility_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_NODES, 28u, &preflight_node_storage, &node_data, &node_bytes, &node_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_FACES, 20u, &preflight_face_storage, &face_data, &face_bytes, &face_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_LIGHTING, 1u, &preflight_lighting_storage, &lighting_data, &lighting_bytes, &lighting_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_LEAFS, 28u, &preflight_leaf_storage, &leaf_data, &leaf_bytes, &leaf_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_LEAFFACES, 2u, &preflight_leafface_storage, &leafface_data, &leafface_bytes, &leafface_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_EDGES, 4u, &preflight_edge_storage, &edge_data, &edge_bytes, &edge_count) ||
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_SURFEDGES, 4u, &preflight_surfedge_storage, &surfedge_data, &surfedge_bytes, &surfedge_count))
     {
         ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: invalid BSP lumps in %s\n", path);
         goto fail;
@@ -4164,15 +5629,7 @@ static qboolean Q2GX_LoadWorldGeometry(
 
     (void)visibility_count;
     if (
-        !Q2GX_BSPGetLump(
-            file_data,
-            file_length,
-            Q2GX_BSP_LUMP_MODELS,
-            48u,
-            &model_data,
-            &model_bytes,
-            &model_count
-        )
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_MODELS, 48u, &preflight_model_storage, &model_data, &model_bytes, &model_count)
     )
     {
         ri.Con_Printf(
@@ -4404,15 +5861,7 @@ static qboolean Q2GX_LoadWorldGeometry(
 
 
     if (
-        !Q2GX_BSPGetLump(
-            file_data,
-            file_length,
-            Q2GX_BSP_LUMP_TEXINFO,
-            76u,
-            &texinfo_data,
-            &texinfo_bytes,
-            &texinfo_count
-        )
+        !Q2GX_BSPStreamReadLump(bsp_stream, bsp_stream_base, bsp_header, file_length, Q2GX_BSP_LUMP_TEXINFO, 76u, &preflight_texinfo_storage, &texinfo_data, &texinfo_bytes, &texinfo_count)
         ||
         texinfo_count == 0u
     )
@@ -4609,6 +6058,65 @@ triangle_count = 0u;
             (size_t)vis_numclusters * sizeof(*world_vis_pvs_offsets);
     }
 
+    if (bsp_stream)
+    {
+        FS_FCloseFile(
+            bsp_stream
+        );
+
+        bsp_stream = NULL;
+    }
+
+    Q2GX_BSPStreamFree(&preflight_plane_storage);
+    Q2GX_BSPStreamFree(&preflight_vertex_storage);
+    Q2GX_BSPStreamFree(&preflight_visibility_storage);
+    Q2GX_BSPStreamFree(&preflight_node_storage);
+    Q2GX_BSPStreamFree(&preflight_texinfo_storage);
+    Q2GX_BSPStreamFree(&preflight_face_storage);
+    Q2GX_BSPStreamFree(&preflight_lighting_storage);
+    Q2GX_BSPStreamFree(&preflight_leaf_storage);
+    Q2GX_BSPStreamFree(&preflight_leafface_storage);
+    Q2GX_BSPStreamFree(&preflight_edge_storage);
+    Q2GX_BSPStreamFree(&preflight_surfedge_storage);
+    Q2GX_BSPStreamFree(&preflight_model_storage);
+
+    model_data = NULL;
+    texinfo_data = NULL;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX BSP PREFLIGHT END: "
+        "path=%s file_bytes=%u "
+        "whole_file_allocation=0 "
+        "mode=streamed_lumps_no_whole_file_v2\n",
+        path,
+        file_length
+    );
+
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX BSP DETACH BEGIN: "
+        "path=%s whole_file_bytes=%u "
+        "world_vertices_bytes=%u world_faces_bytes=%u "
+        "mode=stream_preflight_before_permanent_v2\n",
+        path,
+        file_length,
+        (unsigned int)allocation_bytes,
+        (unsigned int)face_allocation_bytes
+    );
+
+    if (file_buffer)
+    {
+        if (file_buffer)
+    {
+        ri.FS_FreeFile(file_buffer);
+        file_buffer = NULL;
+    }
+        file_buffer = NULL;
+        file_data = NULL;
+    }
+
     world_vertices = memalign(32, allocation_bytes);
     world_faces = memalign(32, face_allocation_bytes);
     world_nodes = malloc(node_allocation_bytes);
@@ -4618,9 +6126,178 @@ triangle_count = 0u;
     if (!world_vertices || !world_faces || !world_nodes ||
         !world_leaves || !world_leaffaces)
     {
-        ri.Con_Printf(PRINT_ALL, "Q2GC REF_GX WORLD: allocation failure while loading %s\n", path);
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX WORLD: allocation failure after BSP detach "
+            "while loading %s\n",
+            path
+        );
+
         goto fail;
     }
+
+    file_length_int =
+        FS_FOpenFile(
+            path,
+            &bsp_stream
+        );
+
+    if (
+        file_length_int <= 0
+        ||
+        !bsp_stream
+        ||
+        (unsigned int)file_length_int != file_length
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BSP DETACH: reopen failed %s "
+            "expected=%u actual=%d\n",
+            path,
+            file_length,
+            file_length_int
+        );
+
+        goto fail;
+    }
+
+    bsp_stream_base =
+        ftell(
+            bsp_stream
+        );
+
+    if (bsp_stream_base < 0)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BSP DETACH: ftell failed %s\n",
+            path
+        );
+
+        goto fail;
+    }
+
+    if (
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_PLANES, 20u,
+            &stream_plane_storage, &plane_data,
+            &plane_bytes, &plane_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_VERTEXES, 12u,
+            &stream_vertex_storage, &vertex_data,
+            &vertex_bytes, &vertex_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_VISIBILITY, 1u,
+            &stream_visibility_storage, &visibility_data,
+            &visibility_bytes, &visibility_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_NODES, 28u,
+            &stream_node_storage, &node_data,
+            &node_bytes, &node_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_FACES, 20u,
+            &stream_face_storage, &face_data,
+            &face_bytes, &face_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_LIGHTING, 1u,
+            &stream_lighting_storage, &lighting_data,
+            &lighting_bytes, &lighting_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_LEAFS, 28u,
+            &stream_leaf_storage, &leaf_data,
+            &leaf_bytes, &leaf_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_LEAFFACES, 2u,
+            &stream_leafface_storage, &leafface_data,
+            &leafface_bytes, &leafface_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_EDGES, 4u,
+            &stream_edge_storage, &edge_data,
+            &edge_bytes, &edge_count
+        )
+        ||
+        !Q2GX_BSPStreamReadLump(
+            bsp_stream, bsp_stream_base, bsp_header, file_length,
+            Q2GX_BSP_LUMP_SURFEDGES, 4u,
+            &stream_surfedge_storage, &surfedge_data,
+            &surfedge_bytes, &surfedge_count
+        )
+    )
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BSP DETACH: streamed lump load failed %s\n",
+            path
+        );
+
+        goto fail;
+    }
+
+    streamed_raw_bytes =
+        plane_bytes
+        +
+        vertex_bytes
+        +
+        visibility_bytes
+        +
+        node_bytes
+        +
+        face_bytes
+        +
+        lighting_bytes
+        +
+        leaf_bytes
+        +
+        leafface_bytes
+        +
+        edge_bytes
+        +
+        surfedge_bytes;
+
+    FS_FCloseFile(
+        bsp_stream
+    );
+
+    bsp_stream = NULL;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX BSP DETACH READY: "
+        "path=%s whole_file_bytes=%u streamed_raw_bytes=%u "
+        "world_vertices_bytes=%u world_faces_bytes=%u "
+        "mode=stream_preflight_before_permanent_v2\n",
+        path,
+        file_length,
+        streamed_raw_bytes,
+        (unsigned int)allocation_bytes,
+        (unsigned int)face_allocation_bytes
+    );
 
     memset(world_faces, 0, face_allocation_bytes);
 
@@ -4941,6 +6618,85 @@ triangle_count = 0u;
             }
         }
 
+        /*
+         * Q2GC_STATIC_LIGHTMAPS_V2
+         */
+        world_face->styles[0] = face[12u];
+        world_face->styles[1] = face[13u];
+        world_face->styles[2] = face[14u];
+        world_face->styles[3] = face[15u];
+
+        world_face->lightofs =
+            (int32_t)
+            Q2GX_BSPReadLE32(
+                face + 16u
+            );
+
+        world_face->lightmap_atlas = -1;
+        world_face->light_s = 0u;
+        world_face->light_t = 0u;
+
+        if (
+            !Q2GX_CalcStaticLightmapExtents(
+                vertex_data,
+                vertex_count,
+                edge_data,
+                edge_count,
+                surfedge_data,
+                surfedge_count,
+                firstedge,
+                numedges,
+                &world_texinfos[
+                    world_face->texinfo_index
+                ],
+                world_face->texturemins,
+                world_face->extents
+            )
+        )
+        {
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX LIGHTMAP: "
+                "face %u extent calculation failed\n",
+                face_index
+            );
+
+            goto fail;
+        }
+
+        if (
+            !(
+                world_face->surface_flags
+                &
+                Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+            )
+        )
+        {
+            if (
+                !Q2GX_BuildStaticFaceLightmapAtlas(
+                    world_face,
+                    lighting_data,
+                    lighting_bytes
+                )
+            )
+            {
+                ri.Con_Printf(
+                    PRINT_ALL,
+                    "Q2GC REF_GX LIGHTMAP: "
+                    "face %u atlas build failed "
+                    "extents=%d,%d lightofs=%d "
+                    "atlases=%u\n",
+                    face_index,
+                    world_face->extents[0],
+                    world_face->extents[1],
+                    (int)world_face->lightofs,
+                    q2gx_lightmap_atlas_count
+                );
+
+                goto fail;
+            }
+        }
+
         unsigned int triangle;
         f32 fan_origin[3];
         u8 red, green, blue;
@@ -5046,6 +6802,40 @@ triangle_count = 0u;
 
     if (output_index != gx_vertex_count)
         goto fail;
+
+
+    Q2GX_BSPStreamFree(&stream_visibility_storage);
+    Q2GX_BSPStreamFree(&stream_leaf_storage);
+    Q2GX_BSPStreamFree(&stream_leafface_storage);
+    Q2GX_BSPStreamFree(&stream_node_storage);
+    Q2GX_BSPStreamFree(&stream_plane_storage);
+    Q2GX_BSPStreamFree(&stream_vertex_storage);
+    Q2GX_BSPStreamFree(&stream_face_storage);
+    Q2GX_BSPStreamFree(&stream_lighting_storage);
+    Q2GX_BSPStreamFree(&stream_edge_storage);
+    Q2GX_BSPStreamFree(&stream_surfedge_storage);
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX WAL DIM CACHE: "
+        "path=%s entries=%u hits_total=%u misses_total=%u "
+        "header_bytes_total=%u mode=name_cache_header40_v1\n",
+        path,
+        q2gx_wal_dim_cache_count,
+        q2gx_wal_dim_cache_hits_total,
+        q2gx_wal_dim_cache_misses_total,
+        q2gx_wal_dim_header_bytes_total
+    );
+
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX BSP DETACH END: "
+        "path=%s streamed_raw_freed=%u "
+        "mode=stream_preflight_before_permanent_v2\n",
+        path,
+        streamed_raw_bytes
+    );
 
 
     /*
@@ -5441,7 +7231,33 @@ q2gx_world_vertices = world_vertices;
     world_pvs_row = NULL;
     world_pvs_row2 = NULL;
 
-    ri.FS_FreeFile(file_buffer);
+    Q2GX_FinalizeLightmapAtlases();
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX LIGHTMAP ATLAS LOAD: "
+        "lighting_bytes=%u "
+        "ready_faces=%u "
+        "sampled_faces=%u "
+        "fullbright_faces=%u "
+        "atlases=%u "
+        "atlas_bytes=%u "
+        "atlas_size=128 "
+        "format=rgb565 "
+        "styles=frozen_sum_scale1_v2\n",
+        lighting_bytes,
+        q2gx_lightmap_faces_ready,
+        q2gx_lightmap_faces_sampled,
+        q2gx_lightmap_faces_fullbright,
+        q2gx_lightmap_atlas_count,
+        q2gx_lightmap_atlas_bytes
+    );
+
+    if (file_buffer)
+    {
+        ri.FS_FreeFile(file_buffer);
+        file_buffer = NULL;
+    }
 
     world_texinfos = NULL;
 
@@ -5470,7 +7286,7 @@ q2gx_world_vertices = world_vertices;
         "Q2GC REF_GX WAL LOAD: "
         "%s "
         "cached_textures=%u "
-        "rgba8_bytes=%u "
+        "ci8_bytes=%u "
         "textured_faces=%u "
         "animated_flat_faces=%u "
         "special_flat_faces=%u "
@@ -5531,6 +7347,40 @@ return true;
 
 fail:
 
+    Q2GX_BSPStreamFree(&preflight_plane_storage);
+    Q2GX_BSPStreamFree(&preflight_vertex_storage);
+    Q2GX_BSPStreamFree(&preflight_visibility_storage);
+    Q2GX_BSPStreamFree(&preflight_node_storage);
+    Q2GX_BSPStreamFree(&preflight_texinfo_storage);
+    Q2GX_BSPStreamFree(&preflight_face_storage);
+    Q2GX_BSPStreamFree(&preflight_lighting_storage);
+    Q2GX_BSPStreamFree(&preflight_leaf_storage);
+    Q2GX_BSPStreamFree(&preflight_leafface_storage);
+    Q2GX_BSPStreamFree(&preflight_edge_storage);
+    Q2GX_BSPStreamFree(&preflight_surfedge_storage);
+    Q2GX_BSPStreamFree(&preflight_model_storage);
+
+
+    if (bsp_stream)
+    {
+        FS_FCloseFile(
+            bsp_stream
+        );
+
+        bsp_stream = NULL;
+    }
+
+    Q2GX_BSPStreamFree(&stream_plane_storage);
+    Q2GX_BSPStreamFree(&stream_vertex_storage);
+    Q2GX_BSPStreamFree(&stream_visibility_storage);
+    Q2GX_BSPStreamFree(&stream_node_storage);
+    Q2GX_BSPStreamFree(&stream_face_storage);
+    Q2GX_BSPStreamFree(&stream_lighting_storage);
+    Q2GX_BSPStreamFree(&stream_leaf_storage);
+    Q2GX_BSPStreamFree(&stream_leafface_storage);
+    Q2GX_BSPStreamFree(&stream_edge_storage);
+    Q2GX_BSPStreamFree(&stream_surfedge_storage);
+
     if (world_brush_models)
     {
         free(
@@ -5568,6 +7418,8 @@ fail:
 
     if (world_vertices) free(world_vertices);
     if (world_faces) free(world_faces);
+    Q2GX_FreeLightmapAtlases();
+
     if (world_nodes) free(world_nodes);
     if (world_leaves) free(world_leaves);
     if (world_leaffaces) free(world_leaffaces);
@@ -5575,7 +7427,11 @@ fail:
     if (world_vis_pvs_offsets) free(world_vis_pvs_offsets);
     if (world_pvs_row) free(world_pvs_row);
     if (world_pvs_row2) free(world_pvs_row2);
-    ri.FS_FreeFile(file_buffer);
+    if (file_buffer)
+    {
+        ri.FS_FreeFile(file_buffer);
+        file_buffer = NULL;
+    }
     Q2GX_FreeWorldGeometry();
     return false;
 }
@@ -10391,6 +12247,16 @@ static void Q2GX_DrawBrushEntities(
     unsigned int wal_binds = 0u;
     unsigned int vertices_drawn = 0u;
 
+    /*
+     * Q2GC_BRUSH_STATIC_LIGHTMAPS_V1
+     */
+    unsigned int lightmap_faces_drawn = 0u;
+    unsigned int lightmap_vertices_drawn = 0u;
+    unsigned int lightmap_binds = 0u;
+    unsigned int lightmap_missing = 0u;
+
+    ++q2gx_brush_lightmap_frames_window;
+
     if (
         !fd
         ||
@@ -10715,6 +12581,161 @@ static void Q2GX_DrawBrushEntities(
             vertices_drawn +=
                 face->vertex_count;
 
+            /*
+             * Q2GC_BRUSH_STATIC_LIGHTMAPS_V1
+             *
+             * Stock ref_gl lightmaps ordinary inline-bmodel
+             * surfaces as well as world surfaces.
+             */
+            if (
+                face->lightmap_atlas >= 0
+                &&
+                (unsigned int)face->lightmap_atlas
+                <
+                q2gx_lightmap_atlas_count
+                &&
+                q2gx_lightmap_atlases[
+                    (unsigned int)face->lightmap_atlas
+                ].ready
+            )
+            {
+                unsigned int lm_vertex_index;
+
+                Q2GX_SetupTexturedWorld3D(fd);
+
+                GX_SetTevOp(
+                    GX_TEVSTAGE0,
+                    GX_REPLACE
+                );
+
+                GX_SetBlendMode(
+                    GX_BM_BLEND,
+                    GX_BL_ZERO,
+                    GX_BL_SRCCLR,
+                    GX_LO_CLEAR
+                );
+
+                GX_SetZMode(
+                    GX_TRUE,
+                    GX_LEQUAL,
+                    GX_FALSE
+                );
+
+                GX_SetCullMode(
+                    GX_CULL_NONE
+                );
+
+                GX_SetColorUpdate(
+                    GX_TRUE
+                );
+
+                GX_LoadTexObj(
+                    &q2gx_lightmap_atlases[
+                        (unsigned int)face->lightmap_atlas
+                    ].texture,
+                    GX_TEXMAP0
+                );
+
+                ++lightmap_binds;
+
+                GX_Begin(
+                    GX_TRIANGLES,
+                    GX_VTXFMT0,
+                    (u16)face->vertex_count
+                );
+
+                for (
+                    lm_vertex_index = 0u;
+                    lm_vertex_index < face->vertex_count;
+                    ++lm_vertex_index
+                )
+                {
+                    const q2gx_world_vertex_t *lm_vertex =
+                        &q2gx_world_vertices[
+                            face->first_vertex
+                            +
+                            lm_vertex_index
+                        ];
+
+                    f32 lm_world_x;
+                    f32 lm_world_y;
+                    f32 lm_world_z;
+                    f32 lm_s;
+                    f32 lm_t;
+
+                    Q2GX_TransformBrushPoint(
+                        &transform,
+                        lm_vertex,
+                        &lm_world_x,
+                        &lm_world_y,
+                        &lm_world_z
+                    );
+
+                    Q2GX_ComputeAtlasLightmapST(
+                        face,
+                        texinfo,
+                        lm_vertex,
+                        &lm_s,
+                        &lm_t
+                    );
+
+                    GX_Position3f32(
+                        lm_world_x,
+                        lm_world_y,
+                        lm_world_z
+                    );
+
+                    GX_Color4u8(
+                        255u,
+                        255u,
+                        255u,
+                        255u
+                    );
+
+                    GX_TexCoord2f32(
+                        lm_s,
+                        lm_t
+                    );
+                }
+
+                GX_End();
+
+                ++lightmap_faces_drawn;
+                lightmap_vertices_drawn +=
+                    face->vertex_count;
+
+                if (!q2gx_brush_lightmap_first_draw_logged)
+                {
+                    q2gx_brush_lightmap_first_draw_logged = true;
+
+                    ri.Con_Printf(
+                        PRINT_ALL,
+                        "Q2GC REF_GX BRUSH LIGHTMAP FIRST DRAW: "
+                        "model=*%u face=%u atlas=%d "
+                        "light_s=%u light_t=%u vertices=%u "
+                        "mode=inline_bsp_static_multiply_v1\n",
+                        handle->model_index,
+                        face_index,
+                        face->lightmap_atlas,
+                        face->light_s,
+                        face->light_t,
+                        face->vertex_count
+                    );
+                }
+
+                Q2GX_SetupTexturedWorld3D(fd);
+            }
+            else if (
+                !(
+                    face->surface_flags
+                    &
+                    Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+                )
+            )
+            {
+                ++lightmap_missing;
+            }
+
             if (!q2gx_brush_first_draw_logged)
             {
                 q2gx_brush_first_draw_logged = true;
@@ -10827,6 +12848,43 @@ static void Q2GX_DrawBrushEntities(
     q2gx_brush_deferred_trans_faces_window += deferred_trans_faces;
     q2gx_brush_wal_binds_window += wal_binds;
     q2gx_brush_vertices_window += vertices_drawn;
+
+    q2gx_brush_lightmap_faces_window +=
+        lightmap_faces_drawn;
+
+    q2gx_brush_lightmap_vertices_window +=
+        lightmap_vertices_drawn;
+
+    q2gx_brush_lightmap_binds_window +=
+        lightmap_binds;
+
+    q2gx_brush_lightmap_missing_window +=
+        lightmap_missing;
+
+    if (q2gx_brush_lightmap_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX BRUSH LIGHTMAP 120: "
+            "frames=%u faces_total=%u vertices_total=%u "
+            "binds_total=%u missing_total=%u "
+            "atlases=%u atlas_bytes=%u "
+            "mode=inline_bsp_static_multiply_v1\n",
+            q2gx_brush_lightmap_frames_window,
+            q2gx_brush_lightmap_faces_window,
+            q2gx_brush_lightmap_vertices_window,
+            q2gx_brush_lightmap_binds_window,
+            q2gx_brush_lightmap_missing_window,
+            q2gx_lightmap_atlas_count,
+            q2gx_lightmap_atlas_bytes
+        );
+
+        q2gx_brush_lightmap_frames_window = 0u;
+        q2gx_brush_lightmap_faces_window = 0u;
+        q2gx_brush_lightmap_vertices_window = 0u;
+        q2gx_brush_lightmap_binds_window = 0u;
+        q2gx_brush_lightmap_missing_window = 0u;
+    }
 }
 
 
@@ -14242,6 +16300,278 @@ static void Q2GX_DrawRefdefPolyBlend(refdef_t *fd)
 }
 
 
+/*
+ * Q2GC_STATIC_LIGHTMAPS_V2
+ *
+ * Correctness-first atlas second pass:
+ *     dst = dst * src(lightmap)
+ */
+static void Q2GX_SetupStaticLightmapPassV2(
+    refdef_t *fd)
+{
+    Q2GX_SetupTexturedWorld3D(fd);
+
+    GX_SetTevOp(
+        GX_TEVSTAGE0,
+        GX_REPLACE
+    );
+
+    GX_SetBlendMode(
+        GX_BM_BLEND,
+        GX_BL_ZERO,
+        GX_BL_SRCCLR,
+        GX_LO_CLEAR
+    );
+
+    GX_SetZMode(
+        GX_TRUE,
+        GX_LEQUAL,
+        GX_FALSE
+    );
+
+    GX_SetCullMode(
+        GX_CULL_NONE
+    );
+
+    GX_SetColorUpdate(
+        GX_TRUE
+    );
+}
+
+
+static void Q2GX_DrawStaticLightmapsV2(
+    refdef_t *fd)
+{
+    unsigned int local_face;
+    int current_atlas = -1;
+    unsigned int drawn_faces = 0u;
+    unsigned int vertices_drawn = 0u;
+    unsigned int binds = 0u;
+
+    /*
+     * Q2GC_STATIC_LIGHTMAP_STATE_RESTORE_V2e
+     */
+    qboolean lightmap_state_active = false;
+
+    ++q2gx_lightmap_frames_window;
+
+    if (
+        !fd ||
+        !q2gx_world_faces ||
+        !q2gx_world_vertices ||
+        !q2gx_world_texinfos ||
+        q2gx_world_static_face_count == 0u ||
+        q2gx_lightmap_atlas_count == 0u
+    )
+    {
+        goto stats;
+    }
+
+    Q2GX_SetupStaticLightmapPassV2(fd);
+    lightmap_state_active = true;
+
+    for (
+        local_face = 0u;
+        local_face < q2gx_world_static_face_count;
+        ++local_face
+    )
+    {
+        unsigned int face_index =
+            q2gx_world_static_first_face + local_face;
+
+        q2gx_world_face_t *face;
+        const q2gx_world_texinfo_t *texinfo;
+        unsigned int vertex_index;
+
+        if (face_index >= q2gx_world_face_count)
+            break;
+
+        face = &q2gx_world_faces[face_index];
+
+        if (!face->visible_this_frame)
+            continue;
+
+        if (
+            face->surface_flags
+            &
+            Q2GX_WORLD_TEXCOORD_SPECIAL_MASK
+        )
+        {
+            continue;
+        }
+
+        if (
+            face->lightmap_atlas < 0
+            ||
+            (unsigned int)face->lightmap_atlas
+            >=
+            q2gx_lightmap_atlas_count
+        )
+        {
+            continue;
+        }
+
+        texinfo =
+            &q2gx_world_texinfos[
+                face->texinfo_index
+            ];
+
+        if (current_atlas != face->lightmap_atlas)
+        {
+            q2gx_lightmap_atlas_t *atlas =
+                &q2gx_lightmap_atlases[
+                    (unsigned int)face->lightmap_atlas
+                ];
+
+            if (!atlas->ready)
+                continue;
+
+            GX_LoadTexObj(
+                &atlas->texture,
+                GX_TEXMAP0
+            );
+
+            current_atlas = face->lightmap_atlas;
+            ++binds;
+        }
+
+        if (face->vertex_count > 65535u)
+            continue;
+
+        GX_Begin(
+            GX_TRIANGLES,
+            GX_VTXFMT0,
+            (u16)face->vertex_count
+        );
+
+        for (
+            vertex_index = 0u;
+            vertex_index < face->vertex_count;
+            ++vertex_index
+        )
+        {
+            const q2gx_world_vertex_t *vertex =
+                &q2gx_world_vertices[
+                    face->first_vertex + vertex_index
+                ];
+
+            f32 lm_s;
+            f32 lm_t;
+
+            Q2GX_ComputeAtlasLightmapST(
+                face,
+                texinfo,
+                vertex,
+                &lm_s,
+                &lm_t
+            );
+
+            GX_Position3f32(
+                vertex->x,
+                vertex->y,
+                vertex->z
+            );
+
+            GX_Color4u8(
+                255u,
+                255u,
+                255u,
+                255u
+            );
+
+            GX_TexCoord2f32(
+                lm_s,
+                lm_t
+            );
+        }
+
+        GX_End();
+
+        ++drawn_faces;
+        vertices_drawn += face->vertex_count;
+
+        if (!q2gx_lightmap_first_draw_logged)
+        {
+            q2gx_lightmap_first_draw_logged = true;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX LIGHTMAP FIRST DRAW: "
+                "face=%u atlas=%d "
+                "light_s=%u light_t=%u "
+                "vertices=%u "
+                "mode=atlas_rgb565_multiply_v2\n",
+                face_index,
+                face->lightmap_atlas,
+                face->light_s,
+                face->light_t,
+                face->vertex_count
+            );
+        }
+    }
+
+    /*
+     * Q2GC_STATIC_LIGHTMAP_STATE_RESTORE_V2e
+     *
+     * Do not leak multiplicative blend state or disabled Z writes
+     * into later world / brush / entity passes.
+     */
+    if (lightmap_state_active)
+    {
+        Q2GX_SetupTexturedWorld3D(fd);
+
+        if (!q2gx_lightmap_state_restore_logged)
+        {
+            q2gx_lightmap_state_restore_logged = true;
+
+            ri.Con_Printf(
+                PRINT_ALL,
+                "Q2GC REF_GX LIGHTMAP STATE RESTORE: "
+                "blend=opaque zwrite=1 "
+                "mode=post_multiply_world_state_v2e\n"
+            );
+        }
+    }
+
+stats:
+    q2gx_lightmap_faces_window += drawn_faces;
+    q2gx_lightmap_vertices_window += vertices_drawn;
+    q2gx_lightmap_binds_window += binds;
+
+    if (q2gx_lightmap_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX LIGHTMAP 120: "
+            "frames=%u "
+            "ready_faces=%u "
+            "sampled_faces=%u "
+            "fullbright_faces=%u "
+            "atlases=%u "
+            "atlas_bytes=%u "
+            "drawn_faces_total=%u "
+            "vertices_total=%u "
+            "atlas_binds_total=%u "
+            "mode=static_atlas_rgb565_second_pass_v2\n",
+            q2gx_lightmap_frames_window,
+            q2gx_lightmap_faces_ready,
+            q2gx_lightmap_faces_sampled,
+            q2gx_lightmap_faces_fullbright,
+            q2gx_lightmap_atlas_count,
+            q2gx_lightmap_atlas_bytes,
+            q2gx_lightmap_faces_window,
+            q2gx_lightmap_vertices_window,
+            q2gx_lightmap_binds_window
+        );
+
+        q2gx_lightmap_frames_window = 0u;
+        q2gx_lightmap_faces_window = 0u;
+        q2gx_lightmap_vertices_window = 0u;
+        q2gx_lightmap_binds_window = 0u;
+    }
+}
+
+
 static void Q2GX_DrawFlatWorld(
     refdef_t *fd)
 {
@@ -14894,7 +17224,7 @@ int leaf_index = -1;
                 "special_flat_faces=%u "
                 "texture_binds=%u "
                 "cached_textures=%u "
-                "rgba8_bytes=%u "
+                "ci8_bytes=%u "
                 "mode=wal_mip0\n",
                 wal_textured_faces,
                 wal_animated_flat_faces,
@@ -14951,7 +17281,9 @@ int leaf_index = -1;
             wal_textured_vertices;
     }
 
-Q2GX_DrawOpaqueWarpWorld(fd);
+Q2GX_DrawStaticLightmapsV2(fd);
+
+    Q2GX_DrawOpaqueWarpWorld(fd);
 
     Q2GX_DrawSkyBox(fd);
 
@@ -15129,7 +17461,7 @@ ri.Con_Printf(
             "special_flat_faces_total=%u "
             "texture_binds_total=%u "
             "cached_textures=%u "
-            "rgba8_bytes=%u "
+            "ci8_bytes=%u "
             "mode=wal_mip0\n",
             q2gx_world_frames_window,
             q2gx_world_wal_textured_faces_window,
@@ -15411,7 +17743,7 @@ static qboolean Q2GX_Init(
     q2gx_gx_initialized = true;
 
     GX_SetCopyClear(
-        q2gx_clear_color,
+        q2gx_black_clear_color,
         GX_MAX_Z24
     );
 
@@ -15500,7 +17832,7 @@ static qboolean Q2GX_Init(
 
     /*
      * Copy #1 discards initial EFB contents and clears the EFB
-     * to the configured magenta clear color.
+     * to the configured black clear color.
      */
     GX_CopyDisp(
         q2gx_xfb[0],
@@ -15510,7 +17842,7 @@ static qboolean Q2GX_Init(
     GX_DrawDone();
 
     /*
-     * Copy #2 copies the now-known-magenta EFB into XFB 0.
+     * Copy #2 copies the now-known-black EFB into XFB 0.
      */
     GX_CopyDisp(
         q2gx_xfb[0],
@@ -15541,7 +17873,7 @@ static qboolean Q2GX_Init(
 
     ri.Con_Printf(
         PRINT_ALL,
-        "Q2GC REF_GX: EXPECT SOLID MAGENTA OUTPUT\n"
+        "Q2GC REF_GX: black clear active\n"
     );
 
     return true;
@@ -15551,6 +17883,9 @@ static qboolean Q2GX_Init(
 static void Q2GX_Shutdown(void)
 {
     Q2GX_FreeWorldGeometry();
+
+    Q2GX_FreeCinematicTexture();
+    q2gx_cinematic_palette_ready = false;
 
     Q2GX_ClearPicCache();
 
@@ -16235,20 +18570,156 @@ static void Q2GX_DrawStretchRaw(
     int rows,
     byte *data)
 {
-    (void)x;
-    (void)y;
-    (void)w;
-    (void)h;
-    (void)cols;
-    (void)rows;
-    (void)data;
+    unsigned int src_x;
+    unsigned int src_y;
+
+    if (
+        !data
+        ||
+        w <= 0
+        ||
+        h <= 0
+        ||
+        cols <= 0
+        ||
+        rows <= 0
+    )
+    {
+        return;
+    }
+
+    if (!q2gx_palette_loaded)
+        return;
+
+    if (!q2gx_cinematic_palette_ready)
+        Q2GX_BuildCinematicTLUT(NULL);
+
+    if (!Q2GX_EnsureCinematicTexture(cols, rows))
+        return;
+
+    memset(
+        q2gx_cinematic_texture_data,
+        0,
+        q2gx_cinematic_texture_bytes
+    );
+
+    for (
+        src_y = 0u;
+        src_y < (unsigned int)rows;
+        ++src_y
+    )
+    {
+        const byte *source =
+            data + src_y * (unsigned int)cols;
+
+        for (
+            src_x = 0u;
+            src_x < (unsigned int)cols;
+            ++src_x
+        )
+        {
+            Q2GX_PicWriteCI8Texel(
+                q2gx_cinematic_texture_data,
+                q2gx_cinematic_padded_width,
+                src_x,
+                src_y,
+                source[src_x]
+            );
+        }
+    }
+
+    DCStoreRange(
+        q2gx_cinematic_texture_data,
+        q2gx_cinematic_texture_bytes
+    );
+
+    GX_InvalidateTexAll();
+
+    Q2GX_DrawCinematicQuad(
+        (f32)x,
+        (f32)y,
+        (f32)w,
+        (f32)h
+    );
+
+    ++q2gx_cinematic_frames_total;
+    ++q2gx_cinematic_frames_window;
+
+    if (!q2gx_cinematic_first_frame_logged)
+    {
+        q2gx_cinematic_first_frame_logged = true;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CIN FIRST FRAME: "
+            "src=%dx%d dst=%dx%d at=%d,%d "
+            "ci8_bytes=%u palette_updates=%u "
+            "mode=reuse_ci8_rgb5a3_v1\n",
+            cols,
+            rows,
+            w,
+            h,
+            x,
+            y,
+            q2gx_cinematic_texture_bytes,
+            q2gx_cinematic_palette_updates_total
+        );
+    }
+
+    if (q2gx_cinematic_frames_window >= 120u)
+    {
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CIN 120: "
+            "frames_total=%u source=%dx%d "
+            "ci8_bytes=%u allocations=%u palette_updates=%u "
+            "mode=reuse_ci8_rgb5a3_v1\n",
+            q2gx_cinematic_frames_total,
+            q2gx_cinematic_cols,
+            q2gx_cinematic_rows,
+            q2gx_cinematic_texture_bytes,
+            q2gx_cinematic_allocations_total,
+            q2gx_cinematic_palette_updates_total
+        );
+
+        q2gx_cinematic_frames_window = 0u;
+    }
 }
 
 
 static void Q2GX_CinematicSetPalette(
     const unsigned char *palette)
 {
-    (void)palette;
+    if (palette)
+    {
+        Q2GX_BuildCinematicTLUT(palette);
+        ++q2gx_cinematic_palette_updates_total;
+
+        ri.Con_Printf(
+            PRINT_ALL,
+            "Q2GC REF_GX CIN PALETTE: "
+            "update=%u tlut_bytes=%u "
+            "format=rgb5a3 mode=dedicated_cinematic_v1\n",
+            q2gx_cinematic_palette_updates_total,
+            (unsigned int)sizeof(q2gx_cinematic_tlut_storage)
+        );
+
+        return;
+    }
+
+    q2gx_cinematic_palette_ready = false;
+    Q2GX_FreeCinematicTexture();
+    Q2GX_BindPicTLUT();
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX CIN END: "
+        "frames_total=%u allocations=%u palette_updates=%u "
+        "texture_released=1 mode=reuse_ci8_rgb5a3_v1\n",
+        q2gx_cinematic_frames_total,
+        q2gx_cinematic_allocations_total,
+        q2gx_cinematic_palette_updates_total
+    );
 }
 
 
@@ -16289,7 +18760,7 @@ static void Q2GX_EndFrame(void)
      * ALSO controls whether GX_CopyDisp(clear=true) clears
      * the EFB Z buffer.
      *
-     * Therefore the old sequence could clear magenta color
+     * Therefore the old sequence could clear background color
      * every frame while leaving the previous world's depth
      * values resident.
      *
