@@ -68,7 +68,9 @@
 #define Q2_SAVE_PATH_MAX             512
 
 #define Q2_SAVE_FILE_MAX             (512u * 1024u)
-#define Q2_SAVE_BUNDLE_MAX           (512u * 1024u)
+/* Q2GC_SAVE_BUNDLE_CAP_SPLIT_V1B */
+#define Q2_SAVE_BUNDLE_MAX           (2u * 1024u * 1024u)
+#define Q2_SAVE_STORED_MAX           (512u * 1024u)
 
 #define Q2_SAVE_BUNDLE_MAGIC         0x51325356u /* Q2SV */
 #define Q2_SAVE_BUNDLE_VERSION       1u
@@ -1671,219 +1673,551 @@ static int updateSlotIndexFromDirectory(
 /* persistent slots                                                          */
 /* ------------------------------------------------------------------------- */
 
+
+/*
+ * Q2GC_SAVE_STREAM_DEFLATE_V1
+ *
+ * Large virtual save directories already exist as individual VFS
+ * file buffers. Building another contiguous ~850 KiB Q2SV image
+ * only so zlib can read it doubles save-time peak memory.
+ */
+#define Q2_SAVE_STREAM_STORED_INITIAL (128u * 1024u)
+
+
+static int Q2GC_SaveDirectoryRawSize(
+    const q2_save_directory_t *directory,
+    size_t *rawSize)
+{
+    size_t total = 12u;
+    size_t i;
+
+    if (!directory || !rawSize)
+        return 0;
+
+    for (i = 0; i < directory->count; ++i)
+    {
+        size_t nameLength = strlen(directory->files[i].name);
+        size_t fileSize = directory->files[i].size;
+
+        if (nameLength == 0 ||
+            nameLength > UINT16_MAX ||
+            fileSize > UINT32_MAX)
+        {
+            return 0;
+        }
+
+        if (total >
+            Q2_SAVE_BUNDLE_MAX -
+            8u -
+            nameLength -
+            fileSize)
+        {
+            return 0;
+        }
+
+        total += 8u + nameLength + fileSize;
+    }
+
+    *rawSize = total;
+    return 1;
+}
+
+
+static int Q2GC_SaveGrowStored(
+    unsigned char **stored,
+    size_t *storedCapacity,
+    z_stream *stream)
+{
+    size_t oldCapacity;
+    size_t newCapacity;
+    size_t nextOffset;
+    unsigned char *grown;
+
+    if (!stored || !*stored || !storedCapacity || !stream)
+        return 0;
+
+    oldCapacity = *storedCapacity;
+
+    if (oldCapacity >=
+        Q2_SAVE_STORED_HEADER_SIZE +
+        Q2_SAVE_STORED_MAX)
+    {
+        return 0;
+    }
+
+    nextOffset =
+        (size_t)(
+            stream->next_out -
+            (Bytef *)*stored
+        );
+
+    newCapacity = oldCapacity * 2u;
+
+    if (newCapacity >
+        Q2_SAVE_STORED_HEADER_SIZE +
+        Q2_SAVE_STORED_MAX)
+    {
+        newCapacity =
+            Q2_SAVE_STORED_HEADER_SIZE +
+            Q2_SAVE_STORED_MAX;
+    }
+
+    if (newCapacity <= oldCapacity)
+        return 0;
+
+    grown = realloc(*stored, newCapacity);
+
+    if (!grown)
+        return 0;
+
+    *stored = grown;
+    *storedCapacity = newCapacity;
+
+    stream->next_out =
+        (Bytef *)grown +
+        nextOffset;
+
+    stream->avail_out =
+        (uInt)(
+            newCapacity -
+            nextOffset
+        );
+
+    fprintf(
+        stderr,
+        "Q2GC SAVE: STREAM GROW stored_capacity=%lu\n",
+        (unsigned long)newCapacity
+    );
+
+    return 1;
+}
+
+
+static int Q2GC_SaveDeflateChunk(
+    z_stream *stream,
+    unsigned char **stored,
+    size_t *storedCapacity,
+    uLong *rawCrc,
+    size_t *rawWritten,
+    const void *data,
+    size_t size)
+{
+    int zResult;
+
+    if (!stream ||
+        !stored ||
+        !storedCapacity ||
+        !rawCrc ||
+        !rawWritten ||
+        (!data && size))
+    {
+        return 0;
+    }
+
+    if (size > UINT_MAX)
+        return 0;
+
+    if (!size)
+        return 1;
+
+    *rawCrc =
+        crc32(
+            *rawCrc,
+            (const Bytef *)data,
+            (uInt)size
+        );
+
+    *rawWritten += size;
+
+    stream->next_in =
+        (Bytef *)(void *)data;
+
+    stream->avail_in =
+        (uInt)size;
+
+    while (stream->avail_in)
+    {
+        if (!stream->avail_out)
+        {
+            if (!Q2GC_SaveGrowStored(
+                    stored,
+                    storedCapacity,
+                    stream))
+            {
+                return 0;
+            }
+        }
+
+        zResult = deflate(stream, Z_NO_FLUSH);
+
+        if (zResult != Z_OK)
+            return 0;
+    }
+
+    return 1;
+}
+
+
+static int Q2GC_SaveEncodeLargeCompressed(
+    const q2_save_directory_t *directory,
+    unsigned char **output,
+    size_t *outputSize,
+    size_t expectedRawSize)
+{
+    unsigned char rawHeader[12];
+    unsigned char fileHeader[8];
+
+    unsigned char *stored = NULL;
+
+    size_t storedCapacity =
+        Q2_SAVE_STORED_HEADER_SIZE +
+        Q2_SAVE_STREAM_STORED_INITIAL;
+
+    size_t rawWritten = 0u;
+    size_t compressedSize;
+    size_t i;
+
+    uLong rawCrc;
+    z_stream stream;
+
+    int initialized = 0;
+    int zResult;
+
+    if (!directory ||
+        !output ||
+        !outputSize ||
+        expectedRawSize > Q2_SAVE_BUNDLE_MAX)
+    {
+        return 0;
+    }
+
+    memset(&stream, 0, sizeof(stream));
+
+    stored = malloc(storedCapacity);
+
+    if (!stored)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE: stream deflate output allocation failed "
+            "capacity=%lu\n",
+            (unsigned long)storedCapacity
+        );
+        return 0;
+    }
+
+    stream.next_out =
+        (Bytef *)(stored + Q2_SAVE_STORED_HEADER_SIZE);
+
+    stream.avail_out =
+        (uInt)(
+            storedCapacity -
+            Q2_SAVE_STORED_HEADER_SIZE
+        );
+
+    zResult = deflateInit(&stream, Z_BEST_SPEED);
+
+    if (zResult != Z_OK)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE: stream deflate init failed: %d\n",
+            zResult
+        );
+        free(stored);
+        return 0;
+    }
+
+    initialized = 1;
+
+    rawCrc = crc32(0L, Z_NULL, 0);
+
+    writeBe32(rawHeader + 0, Q2_SAVE_BUNDLE_MAGIC);
+    writeBe32(rawHeader + 4, Q2_SAVE_BUNDLE_VERSION);
+    writeBe32(rawHeader + 8, (uint32_t)directory->count);
+
+    if (!Q2GC_SaveDeflateChunk(
+            &stream,
+            &stored,
+            &storedCapacity,
+            &rawCrc,
+            &rawWritten,
+            rawHeader,
+            sizeof(rawHeader)))
+    {
+        goto fail;
+    }
+
+    for (i = 0; i < directory->count; ++i)
+    {
+        const q2_save_file_t *file = &directory->files[i];
+        size_t nameLength = strlen(file->name);
+
+        writeBe16(fileHeader + 0, (uint16_t)nameLength);
+        writeBe16(fileHeader + 2, 0);
+        writeBe32(fileHeader + 4, (uint32_t)file->size);
+
+        if (!Q2GC_SaveDeflateChunk(
+                &stream,
+                &stored,
+                &storedCapacity,
+                &rawCrc,
+                &rawWritten,
+                fileHeader,
+                sizeof(fileHeader)) ||
+            !Q2GC_SaveDeflateChunk(
+                &stream,
+                &stored,
+                &storedCapacity,
+                &rawCrc,
+                &rawWritten,
+                file->name,
+                nameLength) ||
+            !Q2GC_SaveDeflateChunk(
+                &stream,
+                &stored,
+                &storedCapacity,
+                &rawCrc,
+                &rawWritten,
+                file->data,
+                file->size))
+        {
+            goto fail;
+        }
+    }
+
+    if (rawWritten != expectedRawSize)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE: stream deflate raw-size mismatch "
+            "expected=%lu actual=%lu\n",
+            (unsigned long)expectedRawSize,
+            (unsigned long)rawWritten
+        );
+        goto fail;
+    }
+
+    for (;;)
+    {
+        if (!stream.avail_out)
+        {
+            if (!Q2GC_SaveGrowStored(
+                    &stored,
+                    &storedCapacity,
+                    &stream))
+            {
+                goto fail;
+            }
+        }
+
+        zResult = deflate(&stream, Z_FINISH);
+
+        if (zResult == Z_STREAM_END)
+            break;
+
+        if (zResult != Z_OK)
+        {
+            fprintf(
+                stderr,
+                "Q2GC SAVE: stream deflate finish failed: %d\n",
+                zResult
+            );
+            goto fail;
+        }
+    }
+
+    compressedSize = (size_t)stream.total_out;
+
+    deflateEnd(&stream);
+    initialized = 0;
+
+    if (compressedSize > Q2_SAVE_STORED_MAX)
+        goto fail;
+
+    writeBe32(stored + 0, Q2_SAVE_STORED_MAGIC);
+    writeBe32(stored + 4, Q2_SAVE_STORED_VERSION);
+    writeBe32(stored + 8, (uint32_t)rawWritten);
+    writeBe32(stored + 12, (uint32_t)compressedSize);
+    writeBe32(stored + 16, (uint32_t)rawCrc);
+
+    *output = stored;
+    *outputSize =
+        Q2_SAVE_STORED_HEADER_SIZE +
+        compressedSize;
+
+    fprintf(
+        stderr,
+        "Q2GC SAVE: STREAM DEFLATE "
+        "raw=%lu stored=%lu capacity=%lu "
+        "mode=q2sv_piecewise_zlib_v1\n",
+        (unsigned long)rawWritten,
+        (unsigned long)*outputSize,
+        (unsigned long)storedCapacity
+    );
+
+    return 1;
+
+fail:
+    if (initialized)
+        deflateEnd(&stream);
+
+    free(stored);
+    return 0;
+}
+
+
 static int persistDirectory(
     int index)
 {
-    unsigned char *bundle =
-        NULL;
+    unsigned char *bundle = NULL;
+    unsigned char *stored = NULL;
 
-    unsigned char *stored =
-        NULL;
+    size_t bundleSize = 0u;
+    size_t rawSize = 0u;
+    size_t storedCapacity;
+    size_t storedSize = 0u;
 
-    size_t bundleSize =
-        0;
-
-    size_t storedSize;
-
-    uLongf compressedCapacity;
     uLongf compressedSize;
-
     uLong rawCrc;
 
     int zResult;
 
     CH_PersistResult result;
 
-
-    /*
-     * current/ is deliberately RAM-only.
-     */
-    if (index == 0)
-        return 1;
-
-
-    if (index <
-            Q2_SAVE_PERSIST_FIRST ||
-        index >
-            Q2_SAVE_PERSIST_LAST)
+    if (!cardReady ||
+        index < Q2_SAVE_PERSIST_FIRST ||
+        index > Q2_SAVE_PERSIST_LAST)
     {
         return 0;
     }
 
-
-    if (!cardReady)
-    {
-        fprintf(
-            stderr,
-            "Q2GC SAVE: CARD unavailable; %s remains RAM-only\n",
-            saveDirectoryNames[index]
-        );
-
-        return 0;
-    }
-
-
-    if (!encodeDirectory(
+    if (!Q2GC_SaveDirectoryRawSize(
             &saveDirectories[index],
-            &bundle,
-            &bundleSize))
+            &rawSize))
     {
         fprintf(
             stderr,
-            "Q2GC SAVE: could not encode %s\n",
+            "Q2GC SAVE: could not size %s\n",
             saveDirectoryNames[index]
         );
-
         return 0;
     }
-
-
-    /*
-     * Q2_SAVE_BUNDLE_MAX is deliberately far below zlib's uLong limit
-     * on GameCube, so these casts are bounded by our own VFS limits.
-     */
-    compressedCapacity =
-        compressBound(
-            (uLong)bundleSize
-        );
-
-
-    if ((size_t)compressedCapacity >
-        SIZE_MAX -
-            Q2_SAVE_STORED_HEADER_SIZE)
-    {
-        fprintf(
-            stderr,
-            "Q2GC SAVE: compressed-size overflow for %s\n",
-            saveDirectoryNames[index]
-        );
-
-        free(
-            bundle
-        );
-
-        return 0;
-    }
-
-
-    storedSize =
-        Q2_SAVE_STORED_HEADER_SIZE +
-        (size_t)compressedCapacity;
-
-
-    stored =
-        malloc(
-            storedSize
-        );
-
-    if (!stored)
-    {
-        free(
-            bundle
-        );
-
-        return 0;
-    }
-
-
-    compressedSize =
-        compressedCapacity;
-
-
-    /*
-     * Saves are dominated by sparse structs, configstrings and repeated
-     * state. Z_BEST_SPEED dramatically cuts CARD sectors while keeping the
-     * PowerPC-side compression pause small.
-     */
-    zResult =
-        compress2(
-            (Bytef *)(
-                stored +
-                Q2_SAVE_STORED_HEADER_SIZE
-            ),
-            &compressedSize,
-            (const Bytef *)bundle,
-            (uLong)bundleSize,
-            Z_BEST_SPEED
-        );
-
-
-    if (zResult !=
-        Z_OK)
-    {
-        fprintf(
-            stderr,
-            "Q2GC SAVE: deflate %s failed: %d\n",
-            saveDirectoryNames[index],
-            zResult
-        );
-
-        free(
-            stored
-        );
-
-        free(
-            bundle
-        );
-
-        return 0;
-    }
-
-
-    rawCrc =
-        crc32(
-            0L,
-            Z_NULL,
-            0
-        );
-
-    rawCrc =
-        crc32(
-            rawCrc,
-            (const Bytef *)bundle,
-            (uLong)bundleSize
-        );
-
-
-    writeBe32(
-        stored + 0,
-        Q2_SAVE_STORED_MAGIC
-    );
-
-    writeBe32(
-        stored + 4,
-        Q2_SAVE_STORED_VERSION
-    );
-
-    writeBe32(
-        stored + 8,
-        (uint32_t)bundleSize
-    );
-
-    writeBe32(
-        stored + 12,
-        (uint32_t)compressedSize
-    );
-
-    writeBe32(
-        stored + 16,
-        (uint32_t)rawCrc
-    );
-
-
-    storedSize =
-        Q2_SAVE_STORED_HEADER_SIZE +
-        (size_t)compressedSize;
-
 
     fprintf(
         stderr,
-        "Q2GC SAVE: DEFLATE %s raw=%lu stored=%lu\n",
-        saveDirectoryNames[index],
-        (unsigned long)bundleSize,
-        (unsigned long)storedSize
+        "Q2GC SAVE: BUNDLE CAP "
+        "raw=%lu raw_limit=%lu stored_limit=%lu "
+        "mode=raw2m_stored512k_v1b\n",
+        (unsigned long)rawSize,
+        (unsigned long)Q2_SAVE_BUNDLE_MAX,
+        (unsigned long)Q2_SAVE_STORED_MAX
     );
 
+    if (rawSize <= Q2_SAVE_STORED_MAX)
+    {
+        if (!encodeDirectory(
+                &saveDirectories[index],
+                &bundle,
+                &bundleSize))
+        {
+            fprintf(
+                stderr,
+                "Q2GC SAVE: could not encode %s\n",
+                saveDirectoryNames[index]
+            );
+            return 0;
+        }
+
+        storedCapacity =
+            Q2_SAVE_STORED_HEADER_SIZE +
+            Q2_SAVE_STORED_MAX;
+
+        stored = malloc(storedCapacity);
+
+        if (!stored)
+        {
+            free(bundle);
+            return 0;
+        }
+
+        compressedSize =
+            (uLongf)Q2_SAVE_STORED_MAX;
+
+        zResult =
+            compress2(
+                (Bytef *)(
+                    stored +
+                    Q2_SAVE_STORED_HEADER_SIZE
+                ),
+                &compressedSize,
+                (const Bytef *)bundle,
+                (uLong)bundleSize,
+                Z_BEST_SPEED
+            );
+
+        if (zResult != Z_OK)
+        {
+            fprintf(
+                stderr,
+                "Q2GC SAVE: deflate %s failed: %d\n",
+                saveDirectoryNames[index],
+                zResult
+            );
+            free(stored);
+            free(bundle);
+            return 0;
+        }
+
+        rawCrc = crc32(0L, Z_NULL, 0);
+        rawCrc =
+            crc32(
+                rawCrc,
+                (const Bytef *)bundle,
+                (uLong)bundleSize
+            );
+
+        writeBe32(stored + 0, Q2_SAVE_STORED_MAGIC);
+        writeBe32(stored + 4, Q2_SAVE_STORED_VERSION);
+        writeBe32(stored + 8, (uint32_t)bundleSize);
+        writeBe32(stored + 12, (uint32_t)compressedSize);
+        writeBe32(stored + 16, (uint32_t)rawCrc);
+
+        storedSize =
+            Q2_SAVE_STORED_HEADER_SIZE +
+            (size_t)compressedSize;
+
+        fprintf(
+            stderr,
+            "Q2GC SAVE: DEFLATE %s raw=%lu stored=%lu "
+            "mode=contiguous_small_v1\n",
+            saveDirectoryNames[index],
+            (unsigned long)bundleSize,
+            (unsigned long)storedSize
+        );
+
+        free(bundle);
+        bundle = NULL;
+    }
+    else
+    {
+        /*
+         * Q2GC_SAVE_STREAM_DEFLATE_V1
+         */
+        if (!Q2GC_SaveEncodeLargeCompressed(
+                &saveDirectories[index],
+                &stored,
+                &storedSize,
+                rawSize))
+        {
+            fprintf(
+                stderr,
+                "Q2GC SAVE: stream deflate %s failed\n",
+                saveDirectoryNames[index]
+            );
+            return 0;
+        }
+    }
 
     result =
         CH_PersistPut(
@@ -1898,18 +2232,9 @@ static int persistDirectory(
             storedSize
         );
 
+    free(stored);
 
-    free(
-        stored
-    );
-
-    free(
-        bundle
-    );
-
-
-    if (result !=
-        CH_PERSIST_RESULT_OK)
+    if (result != CH_PERSIST_RESULT_OK)
     {
         fprintf(
             stderr,
@@ -1917,10 +2242,8 @@ static int persistDirectory(
             saveDirectoryNames[index],
             (int)result
         );
-
         return 0;
     }
-
 
     fprintf(
         stderr,
@@ -1928,18 +2251,20 @@ static int persistDirectory(
         "(%lu files raw=%lu stored=%lu)\n",
         saveDirectoryNames[index],
         (unsigned long)saveDirectories[index].count,
-        (unsigned long)bundleSize,
+        (unsigned long)rawSize,
         (unsigned long)storedSize
     );
 
 
     /*
-     * The full save bundle is authoritative.
+     * Q2GC_SAVE_MENU_INDEX_REFRESH_RESTORE_V1
      *
-     * Only after that transaction succeeds do we publish its tiny menu
-     * comment.  A power loss between these two operations can therefore
-     * leave stale menu metadata, but can never advertise an uncommitted
-     * save as valid.
+     * Q2GC_SAVE_STREAM_DEFLATE_V1 replaced persistDirectory() and
+     * accidentally dropped the already-proven post-PUT menu-index update.
+     *
+     * The full save bundle above is authoritative. Only after that PUT
+     * succeeds do we publish the exact 32-byte server.ssv comment used by
+     * Quake II's Save/Load menus.
      */
     if (!updateSlotIndexFromDirectory(
             index))
@@ -1955,8 +2280,609 @@ static int persistDirectory(
     }
 
 
+    fprintf(
+        stderr,
+        "Q2GC SAVE MENU: refresh after %s OK\n",
+        saveDirectoryNames[index]
+    );
+
     return 1;
 }
+
+
+/*
+ * Q2GC_SAVE_STREAM_INFLATE_V1
+ *
+ * Inflate compressed Q2SV directly into final per-file buffers.
+ * This removes the aggregate malloc(rawSize) from the compressed
+ * GET path while preserving Q2Z1/Q2SV framing and CRC semantics.
+ */
+static int Q2GC_SaveInflateExact(
+    z_stream *stream,
+    void *destination,
+    size_t size,
+    uLong *rawCrc,
+    size_t *rawWritten,
+    int *streamEnded)
+{
+    if (!stream ||
+        (!destination && size) ||
+        !rawCrc ||
+        !rawWritten ||
+        !streamEnded)
+    {
+        return 0;
+    }
+
+
+    if (!size)
+        return 1;
+
+
+    stream->next_out =
+        (Bytef *)destination;
+
+    stream->avail_out =
+        (uInt)size;
+
+
+    while (stream->avail_out)
+    {
+        uInt before =
+            stream->avail_out;
+
+        int zResult =
+            inflate(
+                stream,
+                Z_NO_FLUSH
+            );
+
+
+        if (zResult ==
+            Z_STREAM_END)
+        {
+            *streamEnded =
+                1;
+
+            if (stream->avail_out)
+                return 0;
+
+            break;
+        }
+
+
+        if (zResult !=
+            Z_OK)
+        {
+            return 0;
+        }
+
+
+        if (stream->avail_out ==
+                before &&
+            stream->avail_in ==
+                0)
+        {
+            return 0;
+        }
+    }
+
+
+    *rawCrc =
+        crc32(
+            *rawCrc,
+            (const Bytef *)destination,
+            (uInt)size
+        );
+
+    *rawWritten +=
+        size;
+
+
+    return 1;
+}
+
+
+static int Q2GC_SaveInflateFinish(
+    z_stream *stream,
+    int *streamEnded)
+{
+    unsigned char extraByte;
+
+    uLong beforeOut;
+
+    int zResult;
+
+
+    if (!stream ||
+        !streamEnded)
+    {
+        return 0;
+    }
+
+
+    if (*streamEnded)
+        return 1;
+
+
+    beforeOut =
+        stream->total_out;
+
+    stream->next_out =
+        &extraByte;
+
+    stream->avail_out =
+        1u;
+
+
+    zResult =
+        inflate(
+            stream,
+            Z_FINISH
+        );
+
+
+    if (zResult !=
+        Z_STREAM_END)
+    {
+        return 0;
+    }
+
+
+    if (stream->total_out !=
+        beforeOut)
+    {
+        return 0;
+    }
+
+
+    *streamEnded =
+        1;
+
+
+    return 1;
+}
+
+
+static int Q2GC_SaveDecodeCompressedStream(
+    int index,
+    const unsigned char *stored,
+    size_t storedSize)
+{
+    unsigned char rawHeader[12];
+    unsigned char fileHeader[8];
+
+    q2_save_directory_t *directory;
+
+    uint32_t rawSize;
+    uint32_t compressedSize;
+    uint32_t expectedCrc;
+    uint32_t fileCount;
+
+    size_t rawWritten =
+        0u;
+
+    size_t i;
+
+    uLong actualCrc;
+
+    z_stream stream;
+
+    int initialized =
+        0;
+
+    int streamEnded =
+        0;
+
+    int zResult;
+
+
+    if (index <
+            Q2_SAVE_PERSIST_FIRST ||
+        index >
+            Q2_SAVE_PERSIST_LAST ||
+        !stored ||
+        storedSize <
+            Q2_SAVE_STORED_HEADER_SIZE)
+    {
+        return 0;
+    }
+
+
+    if (readBe32(
+            stored + 0) !=
+            Q2_SAVE_STORED_MAGIC ||
+        readBe32(
+            stored + 4) !=
+            Q2_SAVE_STORED_VERSION)
+    {
+        return 0;
+    }
+
+
+    rawSize =
+        readBe32(
+            stored + 8
+        );
+
+    compressedSize =
+        readBe32(
+            stored + 12
+        );
+
+    expectedCrc =
+        readBe32(
+            stored + 16
+        );
+
+
+    if (rawSize <
+            sizeof(rawHeader) ||
+        rawSize >
+            Q2_SAVE_BUNDLE_MAX ||
+        compressedSize !=
+            storedSize -
+            Q2_SAVE_STORED_HEADER_SIZE)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE: STREAM INFLATE FAIL %s "
+            "reason=header raw=%lu stored=%lu compressed=%lu\n",
+            saveDirectoryNames[index],
+            (unsigned long)rawSize,
+            (unsigned long)storedSize,
+            (unsigned long)compressedSize
+        );
+
+        return 0;
+    }
+
+
+    directory =
+        &saveDirectories[index];
+
+    clearDirectory(
+        directory
+    );
+
+
+    memset(
+        &stream,
+        0,
+        sizeof(stream)
+    );
+
+
+    stream.next_in =
+        (Bytef *)(
+            stored +
+            Q2_SAVE_STORED_HEADER_SIZE
+        );
+
+    stream.avail_in =
+        (uInt)compressedSize;
+
+
+    zResult =
+        inflateInit(
+            &stream
+        );
+
+    if (zResult !=
+        Z_OK)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE: STREAM INFLATE FAIL %s "
+            "reason=inflate_init z=%d\n",
+            saveDirectoryNames[index],
+            zResult
+        );
+
+        return 0;
+    }
+
+    initialized =
+        1;
+
+
+    actualCrc =
+        crc32(
+            0L,
+            Z_NULL,
+            0
+        );
+
+
+    if (!Q2GC_SaveInflateExact(
+            &stream,
+            rawHeader,
+            sizeof(rawHeader),
+            &actualCrc,
+            &rawWritten,
+            &streamEnded))
+    {
+        goto fail;
+    }
+
+
+    if (readBe32(
+            rawHeader + 0) !=
+            Q2_SAVE_BUNDLE_MAGIC ||
+        readBe32(
+            rawHeader + 4) !=
+            Q2_SAVE_BUNDLE_VERSION)
+    {
+        goto fail;
+    }
+
+
+    fileCount =
+        readBe32(
+            rawHeader + 8
+        );
+
+
+    if (fileCount >
+        Q2_SAVE_MAX_FILES)
+    {
+        goto fail;
+    }
+
+
+    for (i = 0;
+         i < (size_t)fileCount;
+         ++i)
+    {
+        q2_save_file_t *file;
+
+        uint16_t nameLength;
+        uint16_t reserved;
+
+        uint32_t fileSize;
+
+        size_t j;
+
+
+        if (!Q2GC_SaveInflateExact(
+                &stream,
+                fileHeader,
+                sizeof(fileHeader),
+                &actualCrc,
+                &rawWritten,
+                &streamEnded))
+        {
+            goto fail;
+        }
+
+
+        nameLength =
+            readBe16(
+                fileHeader + 0
+            );
+
+        reserved =
+            readBe16(
+                fileHeader + 2
+            );
+
+        fileSize =
+            readBe32(
+                fileHeader + 4
+            );
+
+
+        if (!nameLength ||
+            nameLength >=
+                Q2_SAVE_NAME_MAX ||
+            reserved !=
+                0u ||
+            fileSize >
+                Q2_SAVE_FILE_MAX)
+        {
+            goto fail;
+        }
+
+
+        if (rawWritten >
+                (size_t)rawSize ||
+            (size_t)nameLength >
+                (size_t)rawSize -
+                rawWritten)
+        {
+            goto fail;
+        }
+
+
+        file =
+            &directory->files[
+                directory->count
+            ];
+
+        memset(
+            file,
+            0,
+            sizeof(*file)
+        );
+
+
+        if (!Q2GC_SaveInflateExact(
+                &stream,
+                file->name,
+                (size_t)nameLength,
+                &actualCrc,
+                &rawWritten,
+                &streamEnded))
+        {
+            goto fail;
+        }
+
+
+        file->name[
+            nameLength
+        ] =
+            '\0';
+
+
+        for (j = 0;
+             j < directory->count;
+             ++j)
+        {
+            if (!strcmp(
+                    directory->files[j].name,
+                    file->name))
+            {
+                goto fail;
+            }
+        }
+
+
+        if (rawWritten >
+                (size_t)rawSize ||
+            (size_t)fileSize >
+                (size_t)rawSize -
+                rawWritten)
+        {
+            goto fail;
+        }
+
+
+        if (fileSize)
+        {
+            file->data =
+                malloc(
+                    (size_t)fileSize
+                );
+
+            if (!file->data)
+            {
+                fprintf(
+                    stderr,
+                    "Q2GC SAVE: STREAM INFLATE FAIL %s "
+                    "reason=file_alloc file=%s bytes=%lu\n",
+                    saveDirectoryNames[index],
+                    file->name,
+                    (unsigned long)fileSize
+                );
+
+                goto fail;
+            }
+
+
+            file->capacity =
+                (size_t)fileSize;
+
+
+            if (!Q2GC_SaveInflateExact(
+                    &stream,
+                    file->data,
+                    (size_t)fileSize,
+                    &actualCrc,
+                    &rawWritten,
+                    &streamEnded))
+            {
+                goto fail;
+            }
+        }
+
+
+        file->size =
+            (size_t)fileSize;
+
+        directory->count++;
+
+
+        fprintf(
+            stderr,
+            "Q2GC SAVE: STREAM INFLATE FILE %s "
+            "%lu/%lu name=%s bytes=%lu\n",
+            saveDirectoryNames[index],
+            (unsigned long)directory->count,
+            (unsigned long)fileCount,
+            file->name,
+            (unsigned long)file->size
+        );
+    }
+
+
+    if (rawWritten !=
+            (size_t)rawSize ||
+        !Q2GC_SaveInflateFinish(
+            &stream,
+            &streamEnded))
+    {
+        goto fail;
+    }
+
+
+    if ((uint32_t)actualCrc !=
+        expectedCrc)
+    {
+        fprintf(
+            stderr,
+            "Q2GC SAVE: STREAM INFLATE FAIL %s "
+            "reason=crc expected=%lu actual=%lu\n",
+            saveDirectoryNames[index],
+            (unsigned long)expectedCrc,
+            (unsigned long)(
+                (uint32_t)actualCrc
+            )
+        );
+
+        goto fail;
+    }
+
+
+    inflateEnd(
+        &stream
+    );
+
+    initialized =
+        0;
+
+
+    fprintf(
+        stderr,
+        "Q2GC SAVE: STREAM INFLATE %s OK "
+        "files=%lu raw=%lu stored=%lu "
+        "mode=q2sv_direct_files_v1\n",
+        saveDirectoryNames[index],
+        (unsigned long)directory->count,
+        (unsigned long)rawSize,
+        (unsigned long)storedSize
+    );
+
+
+    return 1;
+
+
+fail:
+    if (initialized)
+    {
+        inflateEnd(
+            &stream
+        );
+    }
+
+
+    clearDirectory(
+        directory
+    );
+
+
+    fprintf(
+        stderr,
+        "Q2GC SAVE: STREAM INFLATE FAIL %s "
+        "reason=parse raw_written=%lu raw_expected=%lu\n",
+        saveDirectoryNames[index],
+        (unsigned long)rawWritten,
+        (unsigned long)rawSize
+    );
+
+
+    return 0;
+}
+
 
 static void loadPersistentDirectory(
     int index)
@@ -1996,9 +2922,7 @@ static void loadPersistentDirectory(
      *   - new framed compressed Q2Z1 object
      */
     bound =
-        compressBound(
-            (uLong)Q2_SAVE_BUNDLE_MAX
-        );
+        (uLong)Q2_SAVE_STORED_MAX;
 
 
     if ((size_t)bound >
@@ -2083,177 +3007,42 @@ static void loadPersistentDirectory(
         readBe32(stored + 4) ==
             Q2_SAVE_STORED_VERSION)
     {
-        uint32_t rawSize =
-            readBe32(
-                stored + 8
-            );
-
-        uint32_t compressedSize =
-            readBe32(
-                stored + 12
-            );
-
-        uint32_t expectedCrc =
-            readBe32(
-                stored + 16
-            );
-
-        uLongf outputSize;
-
-        uLong actualCrc;
-
-        int zResult;
-
-
-        if (rawSize < 12u ||
-            rawSize >
-                Q2_SAVE_BUNDLE_MAX ||
-            compressedSize !=
-                storedSize -
-                Q2_SAVE_STORED_HEADER_SIZE)
-        {
-            fprintf(
-                stderr,
-                "Q2GC SAVE: %s compressed header corrupt\n",
-                saveDirectoryNames[index]
-            );
-
-            free(
-                stored
-            );
-
-            return;
-        }
-
-
-        bundle =
-            malloc(
-                rawSize
-            );
-
-        if (!bundle)
-        {
-            free(
-                stored
-            );
-
-            return;
-        }
-
-
-        outputSize =
-            (uLongf)rawSize;
-
-
-        zResult =
-            uncompress(
-                (Bytef *)bundle,
-                &outputSize,
-                (const Bytef *)(
-                    stored +
-                    Q2_SAVE_STORED_HEADER_SIZE
-                ),
-                (uLong)compressedSize
-            );
-
-
-        if (zResult !=
-                Z_OK ||
-            outputSize !=
-                (uLongf)rawSize)
-        {
-            fprintf(
-                stderr,
-                "Q2GC SAVE: inflate %s failed: %d\n",
-                saveDirectoryNames[index],
-                zResult
-            );
-
-            free(
-                bundle
-            );
-
-            free(
-                stored
-            );
-
-            return;
-        }
-
-
-        actualCrc =
-            crc32(
-                0L,
-                Z_NULL,
-                0
-            );
-
-        actualCrc =
-            crc32(
-                actualCrc,
-                (const Bytef *)bundle,
-                outputSize
-            );
-
-
-        if ((uint32_t)actualCrc !=
-            expectedCrc)
-        {
-            fprintf(
-                stderr,
-                "Q2GC SAVE: %s CRC mismatch\n",
-                saveDirectoryNames[index]
-            );
-
-            free(
-                bundle
-            );
-
-            free(
-                stored
-            );
-
-            return;
-        }
-
-
-        bundleSize =
-            rawSize;
-
-
-        if (!decodeDirectory(
-                &saveDirectories[index],
-                bundle,
-                bundleSize))
+        /*
+         * Q2GC_SAVE_STREAM_INFLATE_V1
+         *
+         * Do not allocate one aggregate raw Q2SV buffer.
+         */
+        if (!Q2GC_SaveDecodeCompressedStream(
+                index,
+                stored,
+                storedSize))
         {
             fprintf(
                 stderr,
                 "Q2GC SAVE: %s bundle corrupt\n",
                 saveDirectoryNames[index]
             );
-
-            clearDirectory(
-                &saveDirectories[index]
-            );
         }
         else
         {
+            size_t rawSize =
+                (size_t)readBe32(
+                    stored + 8
+                );
+
+
             fprintf(
                 stderr,
                 "Q2GC SAVE: GET %s OK "
-                "(%lu files raw=%lu stored=%lu)\n",
+                "(%lu files raw=%lu stored=%lu) "
+                "mode=stream_inflate_v1\n",
                 saveDirectoryNames[index],
                 (unsigned long)saveDirectories[index].count,
-                (unsigned long)bundleSize,
+                (unsigned long)rawSize,
                 (unsigned long)storedSize
             );
         }
-
-
-        free(
-            bundle
-        );
-    }
+}
     else
     {
         /*
@@ -2820,9 +3609,47 @@ int Q2_SaveBatchBegin(
 
     initializeVfs();
 
-    ensurePersistentDirectoryLoaded(
-        index
-    );
+    /*
+     * Q2GC_SAVE_FRESH_DESTINATION_V1
+     *
+     * SV_CopySaveGame() has already prepared the source and will
+     * immediately SV_WipeSavegame(dst) before copying every save
+     * file into dst.
+     *
+     * Loading the old persistent destination here is therefore
+     * pure peak-memory and CARD-I/O overhead. Start persistent
+     * destination batches from a known-empty decoded directory
+     * instead. Mark it loaded so the wipe/remove calls inside the
+     * active batch cannot lazily fetch the obsolete CARD object.
+     *
+     * current/ remains the existing RAM-only path.
+     */
+    if (index > 0)
+    {
+        size_t oldCount =
+            saveDirectories[
+                index
+            ].count;
+
+        clearDirectory(
+            &saveDirectories[
+                index
+            ]
+        );
+
+        persistentDirectoryLoaded[
+            index
+        ] =
+            1;
+
+        fprintf(
+            stderr,
+            "Q2GC SAVE: BATCH FRESH %s "
+            "old_files=%lu old_destination_read=skipped\n",
+            saveDirectoryNames[index],
+            (unsigned long)oldCount
+        );
+    }
 
 
     batchActive =
