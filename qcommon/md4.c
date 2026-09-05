@@ -1,6 +1,7 @@
 /* GLOBAL.H - RSAREF types and constants */
 
 #include <string.h>
+#include "qcommon.h"
 
 /* POINTER defines a generic pointer type */
 typedef unsigned char *POINTER;
@@ -269,6 +270,48 @@ unsigned Com_BlockChecksum (void *buffer, int length)
 	MD4Update (&ctx, (unsigned char *)buffer, length);
 	MD4Final ( (unsigned char *)digest, &ctx);
 	
+	val = digest[0] ^ digest[1] ^ digest[2] ^ digest[3];
+
+	return val;
+}
+
+/*
+ * Q2GC_CM_STREAM_LUMPS_V1
+ *
+ * Exact Com_BlockChecksum equivalent for a FILE stream.
+ */
+unsigned Com_FileChecksum (FILE *f, int length)
+{
+	int digest[4];
+	unsigned val;
+	MD4_CTX ctx;
+	unsigned char *scratch;
+	int remaining;
+
+	if (!f || length < 0)
+		return 0;
+
+	scratch = Z_Malloc (32 * 1024);
+
+	MD4Init (&ctx);
+	remaining = length;
+
+	while (remaining > 0)
+	{
+		int chunk = remaining;
+
+		if (chunk > 32 * 1024)
+			chunk = 32 * 1024;
+
+		FS_Read (scratch, chunk, f);
+		MD4Update (&ctx, scratch, chunk);
+
+		remaining -= chunk;
+	}
+
+	MD4Final ((unsigned char *)digest, &ctx);
+	Z_Free (scratch);
+
 	val = digest[0] ^ digest[1] ^ digest[2] ^ digest[3];
 
 	return val;
