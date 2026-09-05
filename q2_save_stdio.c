@@ -68,6 +68,19 @@
 #define Q2_SAVE_PATH_MAX             512
 
 #define Q2_SAVE_FILE_MAX             (512u * 1024u)
+
+/*
+ * Q2GC_SAVE_FILE_GROWTH_V1
+ *
+ * Quake II level saves commonly cross 256 KiB. Doubling a 256 KiB
+ * virtual file straight to 512 KiB creates an unnecessary contiguous
+ * allocation cliff under renderer pressure.
+ *
+ * Keep geometric growth while files are small, then use 32 KiB steps.
+ */
+#define Q2_SAVE_FILE_GROW_LINEAR_THRESHOLD (256u * 1024u)
+#define Q2_SAVE_FILE_GROW_CHUNK            (32u * 1024u)
+
 /* Q2GC_SAVE_BUNDLE_CAP_SPLIT_V1B */
 #define Q2_SAVE_BUNDLE_MAX           (2u * 1024u * 1024u)
 #define Q2_SAVE_STORED_MAX           (512u * 1024u)
@@ -134,6 +147,13 @@ typedef struct q2_save_file_s
 
     size_t size;
     size_t capacity;
+
+    /*
+     * A failed fwrite poisons this virtual file. Stock Quake II does
+     * not check every fwrite result, so persistence must reject it.
+     */
+    int write_failed;
+
 
 } q2_save_file_t;
 
@@ -547,6 +567,10 @@ static q2_save_file_t *createFile(
         file->capacity =
             0;
 
+        file->write_failed =
+            0;
+
+
         return file;
     }
 
@@ -578,6 +602,33 @@ static q2_save_file_t *createFile(
 
 
     return file;
+}
+
+
+static int directoryHasWriteFailure(
+    const q2_save_directory_t *directory,
+    const char **nameOut)
+{
+    size_t i;
+
+    if (nameOut)
+        *nameOut = NULL;
+
+    if (!directory)
+        return 1;
+
+    for (i = 0u; i < directory->count; ++i)
+    {
+        if (directory->files[i].write_failed)
+        {
+            if (nameOut)
+                *nameOut = directory->files[i].name;
+
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 
@@ -3565,6 +3616,28 @@ int Q2_SavePrepareSource(
     );
 
 
+    {
+        const char *failedName = NULL;
+
+        if (directoryHasWriteFailure(
+                &saveDirectories[index],
+                &failedName))
+        {
+            fprintf(
+                stderr,
+                "Q2GC SAVE: SOURCE REJECT %s "
+                "write_failed_file=%s\n",
+                saveDirectoryNames[index],
+                failedName
+                    ? failedName
+                    : "(unknown)"
+            );
+
+            return 0;
+        }
+    }
+
+
     fprintf(
         stderr,
         "Q2GC SAVE: SOURCE READY %s\n",
@@ -3727,6 +3800,28 @@ int Q2_SaveBatchEnd(void)
         );
 
         return 1;
+    }
+
+
+    {
+        const char *failedName = NULL;
+
+        if (directoryHasWriteFailure(
+                &saveDirectories[index],
+                &failedName))
+        {
+            fprintf(
+                stderr,
+                "Q2GC SAVE: BATCH REJECT %s "
+                "write_failed_file=%s\n",
+                saveDirectoryNames[index],
+                failedName
+                    ? failedName
+                    : "(unknown)"
+            );
+
+            return 0;
+        }
     }
 
 
@@ -4077,10 +4172,16 @@ size_t Q2_SaveFWrite(
     if (required >
         Q2_SAVE_FILE_MAX)
     {
+        stream->entry->write_failed =
+            1;
+
         fprintf(
             stderr,
-            "Q2GC SAVE: file %s exceeds %u-byte limit\n",
+            "Q2GC SAVE: FILE WRITE FAILED "
+            "file=%s reason=file_limit "
+            "required=%lu limit=%u\n",
             stream->entry->name,
+            (unsigned long)required,
             (unsigned int)Q2_SAVE_FILE_MAX
         );
 
@@ -4095,35 +4196,93 @@ size_t Q2_SaveFWrite(
     if (required >
         entry->capacity)
     {
-        newCapacity =
-            entry->capacity
-                ? entry->capacity
-                : 4096u;
+        size_t oldCapacity =
+            entry->capacity;
 
-
-        while (newCapacity <
-               required)
+        if (required <=
+            Q2_SAVE_FILE_GROW_LINEAR_THRESHOLD)
         {
-            size_t next =
-                newCapacity * 2u;
+            newCapacity =
+                entry->capacity
+                    ? entry->capacity
+                    : 4096u;
 
-
-            if (next <
-                    newCapacity ||
-                next >
-                    Q2_SAVE_FILE_MAX)
+            while (newCapacity <
+                   required)
             {
-                newCapacity =
-                    required;
+                size_t next =
+                    newCapacity * 2u;
 
-                break;
+                if (next <
+                        newCapacity ||
+                    next >
+                        Q2_SAVE_FILE_GROW_LINEAR_THRESHOLD)
+                {
+                    newCapacity =
+                        required;
+
+                    break;
+                }
+
+                newCapacity =
+                    next;
+            }
+        }
+        else
+        {
+            size_t rounded;
+
+            if (required >
+                SIZE_MAX -
+                    (Q2_SAVE_FILE_GROW_CHUNK - 1u))
+            {
+                entry->write_failed =
+                    1;
+
+                fprintf(
+                    stderr,
+                    "Q2GC SAVE: FILE WRITE FAILED "
+                    "file=%s reason=growth_overflow "
+                    "required=%lu\n",
+                    entry->name,
+                    (unsigned long)required
+                );
+
+                return 0;
             }
 
+            rounded =
+                (
+                    required
+                    +
+                    (Q2_SAVE_FILE_GROW_CHUNK - 1u)
+                )
+                &
+                ~(
+                    (size_t)
+                    (Q2_SAVE_FILE_GROW_CHUNK - 1u)
+                );
+
+            if (rounded >
+                Q2_SAVE_FILE_MAX)
+            {
+                rounded =
+                    required;
+            }
 
             newCapacity =
-                next;
+                rounded;
         }
 
+        fprintf(
+            stderr,
+            "Q2GC SAVE: FILE GROW "
+            "file=%s old=%lu required=%lu target=%lu\n",
+            entry->name,
+            (unsigned long)oldCapacity,
+            (unsigned long)required,
+            (unsigned long)newCapacity
+        );
 
         newData =
             realloc(
@@ -4131,8 +4290,50 @@ size_t Q2_SaveFWrite(
                 newCapacity
             );
 
+        /*
+         * Headroom is optional. If the rounded allocation fails,
+         * retry the exact bytes needed by this write.
+         */
+        if (!newData &&
+            newCapacity != required)
+        {
+            fprintf(
+                stderr,
+                "Q2GC SAVE: FILE GROW RETRY "
+                "file=%s target=%lu exact=%lu\n",
+                entry->name,
+                (unsigned long)newCapacity,
+                (unsigned long)required
+            );
+
+            newCapacity =
+                required;
+
+            newData =
+                realloc(
+                    entry->data,
+                    newCapacity
+                );
+        }
+
         if (!newData)
+        {
+            entry->write_failed =
+                1;
+
+            fprintf(
+                stderr,
+                "Q2GC SAVE: FILE WRITE FAILED "
+                "file=%s reason=realloc "
+                "old=%lu required=%lu target=%lu\n",
+                entry->name,
+                (unsigned long)oldCapacity,
+                (unsigned long)required,
+                (unsigned long)newCapacity
+            );
+
             return 0;
+        }
 
 
         entry->data =
