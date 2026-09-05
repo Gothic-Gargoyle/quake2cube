@@ -545,9 +545,113 @@ CM_LoadMap
 Loads in the map and all submodels
 ==================
 */
+
+/*
+ * Q2GC_CM_STREAM_LUMPS_V1
+ *
+ * Feed the existing CMod_Load* parsers one collision-relevant
+ * BSP lump at a time through a reusable scratch allocation.
+ */
+typedef void (*q2gc_cmod_lump_loader_t)(lump_t *l);
+
+
+static int Q2GC_CModMaxRequiredLump(const dheader_t *header)
+{
+	const int required[] =
+	{
+		LUMP_TEXINFO,
+		LUMP_LEAFS,
+		LUMP_LEAFBRUSHES,
+		LUMP_PLANES,
+		LUMP_BRUSHES,
+		LUMP_BRUSHSIDES,
+		LUMP_MODELS,
+		LUMP_NODES,
+		LUMP_AREAS,
+		LUMP_AREAPORTALS,
+		LUMP_VISIBILITY,
+		LUMP_ENTITIES
+	};
+
+	int i;
+	int max_len = 0;
+
+	for (i = 0; i < (int)(sizeof(required) / sizeof(required[0])); ++i)
+	{
+		int len = header->lumps[required[i]].filelen;
+
+		if (len > max_len)
+			max_len = len;
+	}
+
+	return max_len;
+}
+
+
+static void Q2GC_CModLoadLump(
+	FILE *f,
+	long file_base,
+	const lump_t *source_lump,
+	byte *scratch,
+	int scratch_size,
+	q2gc_cmod_lump_loader_t loader)
+{
+	lump_t local_lump;
+
+	if (!f || !source_lump || !scratch || !loader)
+		Com_Error (ERR_DROP, "Q2GC_CModLoadLump: bad argument");
+
+	if (
+		source_lump->fileofs < 0
+		||
+		source_lump->filelen < 0
+		||
+		source_lump->filelen > scratch_size
+	)
+	{
+		Com_Error (
+			ERR_DROP,
+			"Q2GC_CModLoadLump: bad lump ofs=%i len=%i scratch=%i",
+			source_lump->fileofs,
+			source_lump->filelen,
+			scratch_size
+		);
+	}
+
+	if (
+		fseek(
+			f,
+			file_base + (long)source_lump->fileofs,
+			SEEK_SET
+		) != 0
+	)
+	{
+		Com_Error (
+			ERR_DROP,
+			"Q2GC_CModLoadLump: seek failed ofs=%i len=%i",
+			source_lump->fileofs,
+			source_lump->filelen
+		);
+	}
+
+	if (source_lump->filelen > 0)
+		FS_Read (scratch, source_lump->filelen, f);
+
+	local_lump = *source_lump;
+	local_lump.fileofs = 0;
+
+	cmod_base = scratch;
+	loader (&local_lump);
+	cmod_base = NULL;
+}
+
+
 cmodel_t *CM_LoadMap (char *name, qboolean clientload, unsigned *checksum)
 {
-	unsigned		*buf;
+	FILE			*f;
+	long			file_base;
+	byte			*scratch;
+	int				scratch_size;
 	int				i;
 	dheader_t		header;
 	int				length;
@@ -586,16 +690,18 @@ cmodel_t *CM_LoadMap (char *name, qboolean clientload, unsigned *checksum)
 	}
 
 	//
-	// load the file
+	// stream the file instead of allocating the entire BSP
 	//
-	length = FS_LoadFile (name, (void **)&buf);
-	if (!buf)
+	length = FS_FOpenFile (name, &f);
+	if (!f || length < (int)sizeof(header))
 		Com_Error (ERR_DROP, "Couldn't load %s", name);
 
-	last_checksum = LittleLong (Com_BlockChecksum (buf, length));
-	*checksum = last_checksum;
+	file_base = ftell (f);
+	if (file_base < 0)
+		Com_Error (ERR_DROP, "Couldn't locate start of %s", name);
 
-	header = *(dheader_t *)buf;
+	FS_Read (&header, sizeof(header), f);
+
 	for (i=0 ; i<sizeof(dheader_t)/4 ; i++)
 		((int *)&header)[i] = LittleLong ( ((int *)&header)[i]);
 
@@ -603,23 +709,66 @@ cmodel_t *CM_LoadMap (char *name, qboolean clientload, unsigned *checksum)
 		Com_Error (ERR_DROP, "CMod_LoadBrushModel: %s has wrong version number (%i should be %i)"
 		, name, header.version, BSPVERSION);
 
-	cmod_base = (byte *)buf;
+	if (fseek (f, file_base, SEEK_SET) != 0)
+		Com_Error (ERR_DROP, "Couldn't rewind %s for checksum", name);
 
-	// load into heap
-	CMod_LoadSurfaces (&header.lumps[LUMP_TEXINFO]);
-	CMod_LoadLeafs (&header.lumps[LUMP_LEAFS]);
-	CMod_LoadLeafBrushes (&header.lumps[LUMP_LEAFBRUSHES]);
-	CMod_LoadPlanes (&header.lumps[LUMP_PLANES]);
-	CMod_LoadBrushes (&header.lumps[LUMP_BRUSHES]);
-	CMod_LoadBrushSides (&header.lumps[LUMP_BRUSHSIDES]);
-	CMod_LoadSubmodels (&header.lumps[LUMP_MODELS]);
-	CMod_LoadNodes (&header.lumps[LUMP_NODES]);
-	CMod_LoadAreas (&header.lumps[LUMP_AREAS]);
-	CMod_LoadAreaPortals (&header.lumps[LUMP_AREAPORTALS]);
-	CMod_LoadVisibility (&header.lumps[LUMP_VISIBILITY]);
-	CMod_LoadEntityString (&header.lumps[LUMP_ENTITIES]);
+	last_checksum = LittleLong (Com_FileChecksum (f, length));
+	*checksum = last_checksum;
 
-	FS_FreeFile (buf);
+	scratch_size = Q2GC_CModMaxRequiredLump (&header);
+	if (scratch_size < 1)
+		scratch_size = 1;
+
+	scratch = Z_Malloc (scratch_size);
+
+	Com_Printf (
+		"Q2GC CM STREAM BEGIN: path=%s length=%i scratch=%i "
+		"checksum=%u mode=collision_lumps_v1\n",
+		name,
+		length,
+		scratch_size,
+		last_checksum
+	);
+
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_TEXINFO],
+		scratch, scratch_size, CMod_LoadSurfaces);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_LEAFS],
+		scratch, scratch_size, CMod_LoadLeafs);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_LEAFBRUSHES],
+		scratch, scratch_size, CMod_LoadLeafBrushes);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_PLANES],
+		scratch, scratch_size, CMod_LoadPlanes);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_BRUSHES],
+		scratch, scratch_size, CMod_LoadBrushes);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_BRUSHSIDES],
+		scratch, scratch_size, CMod_LoadBrushSides);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_MODELS],
+		scratch, scratch_size, CMod_LoadSubmodels);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_NODES],
+		scratch, scratch_size, CMod_LoadNodes);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_AREAS],
+		scratch, scratch_size, CMod_LoadAreas);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_AREAPORTALS],
+		scratch, scratch_size, CMod_LoadAreaPortals);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_VISIBILITY],
+		scratch, scratch_size, CMod_LoadVisibility);
+	Q2GC_CModLoadLump (f, file_base, &header.lumps[LUMP_ENTITIES],
+		scratch, scratch_size, CMod_LoadEntityString);
+
+	Z_Free (scratch);
+	scratch = NULL;
+	cmod_base = NULL;
+
+	FS_FCloseFile (f);
+
+	Com_Printf (
+		"Q2GC CM STREAM END: path=%s length=%i scratch=%i "
+		"checksum=%u mode=collision_lumps_v1\n",
+		name,
+		length,
+		scratch_size,
+		last_checksum
+	);
 
 	CM_InitBoxHull ();
 
