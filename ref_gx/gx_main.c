@@ -4695,6 +4695,210 @@ static void Q2GX_FreeWorldWALTextureArray(
     free(textures);
 }
 
+/*
+ * Q2GC_WORLD_WAL_REUSE_V1
+ *
+ * A map transition may reuse CI8 WAL payloads from exactly the previous
+ * world. Map-specific batching arrays are never retained.
+ */
+static q2gx_world_wal_texture_t *
+Q2GX_DetachWorldWALTexturesForReuse(
+    unsigned int *count_out,
+    unsigned int *bytes_out)
+{
+    q2gx_world_wal_texture_t *textures =
+        q2gx_world_wal_textures;
+
+    unsigned int count =
+        q2gx_world_wal_texture_count;
+
+    unsigned int bytes =
+        q2gx_world_wal_texture_bytes;
+
+    unsigned int index;
+
+    if (count_out)
+        *count_out = count;
+
+    if (bytes_out)
+        *bytes_out = bytes;
+
+    for (index = 0u; index < count; ++index)
+    {
+        if (textures && textures[index].face_indices)
+        {
+            free(
+                textures[index].face_indices
+            );
+
+            textures[index].face_indices = NULL;
+            textures[index].face_count = 0u;
+        }
+    }
+
+    q2gx_world_wal_textures = NULL;
+    q2gx_world_wal_texture_count = 0u;
+    q2gx_world_wal_texture_bytes = 0u;
+
+    return textures;
+}
+
+
+static qboolean Q2GX_ReuseNameNeededByTexinfos(
+    const char *name,
+    const q2gx_world_texinfo_t *texinfos,
+    unsigned int texinfo_count)
+{
+    unsigned int index;
+
+    if (!name || !name[0] || !texinfos)
+        return false;
+
+    for (index = 0u; index < texinfo_count; ++index)
+    {
+        if (
+            strcmp(
+                name,
+                texinfos[index].texture
+            ) == 0
+        )
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+static void Q2GX_PruneReusableWorldWALTextures(
+    q2gx_world_wal_texture_t *textures,
+    unsigned int count,
+    const q2gx_world_texinfo_t *texinfos,
+    unsigned int texinfo_count,
+    unsigned int *kept_out,
+    unsigned int *pruned_out,
+    unsigned int *pruned_bytes_out)
+{
+    unsigned int index;
+    unsigned int kept = 0u;
+    unsigned int pruned = 0u;
+    unsigned int pruned_bytes = 0u;
+
+    if (!textures)
+    {
+        if (kept_out) *kept_out = 0u;
+        if (pruned_out) *pruned_out = 0u;
+        if (pruned_bytes_out) *pruned_bytes_out = 0u;
+        return;
+    }
+
+    for (index = 0u; index < count; ++index)
+    {
+        q2gx_world_wal_texture_t *texture =
+            &textures[index];
+
+        if (!texture->allocation)
+            continue;
+
+        if (
+            Q2GX_ReuseNameNeededByTexinfos(
+                texture->name,
+                texinfos,
+                texinfo_count
+            )
+        )
+        {
+            ++kept;
+            continue;
+        }
+
+        pruned_bytes += texture->texture_bytes;
+
+        free(texture->allocation);
+
+        texture->allocation = NULL;
+        texture->texture_data = NULL;
+        texture->texture_bytes = 0u;
+        texture->width = 0u;
+        texture->height = 0u;
+        texture->face_indices = NULL;
+        texture->face_count = 0u;
+        texture->name[0] = '\0';
+
+        ++pruned;
+    }
+
+    if (kept_out) *kept_out = kept;
+    if (pruned_out) *pruned_out = pruned;
+    if (pruned_bytes_out) *pruned_bytes_out = pruned_bytes;
+}
+
+
+static qboolean Q2GX_TakeReusableWorldWALTexture(
+    q2gx_world_wal_texture_t *textures,
+    unsigned int count,
+    const char *name,
+    q2gx_world_wal_texture_t *destination)
+{
+    unsigned int index;
+
+    if (!textures || !name || !name[0] || !destination)
+        return false;
+
+    for (index = 0u; index < count; ++index)
+    {
+        q2gx_world_wal_texture_t *source =
+            &textures[index];
+
+        if (
+            !source->allocation
+            ||
+            strcmp(source->name, name) != 0
+        )
+        {
+            continue;
+        }
+
+        *destination = *source;
+
+        destination->face_indices = NULL;
+        destination->face_count = 0u;
+
+        source->allocation = NULL;
+        source->texture_data = NULL;
+        source->texture_bytes = 0u;
+        source->width = 0u;
+        source->height = 0u;
+        source->face_indices = NULL;
+        source->face_count = 0u;
+        source->name[0] = '\0';
+
+        GX_InitTexObjCI(
+            &destination->texture,
+            destination->texture_data,
+            (u16)destination->width,
+            (u16)destination->height,
+            GX_TF_CI8,
+            GX_REPEAT,
+            GX_REPEAT,
+            GX_FALSE,
+            GX_TLUT0
+        );
+
+        GX_InitTexObjFilterMode(
+            &destination->texture,
+            GX_NEAR,
+            GX_NEAR
+        );
+
+        return true;
+    }
+
+    return false;
+}
+
+
 
 static int Q2GX_FindWorldWALTexture(
     q2gx_world_wal_texture_t *textures,
@@ -5356,6 +5560,18 @@ static qboolean Q2GX_LoadWorldGeometry(
     unsigned int world_wal_texture_count = 0u;
     unsigned int world_wal_texture_bytes = 0u;
 
+    q2gx_world_wal_texture_t *reuse_wal_textures = NULL;
+    unsigned int reuse_wal_texture_count = 0u;
+    unsigned int reuse_wal_texture_bytes = 0u;
+
+    unsigned int reuse_kept = 0u;
+    unsigned int reuse_pruned = 0u;
+    unsigned int reuse_pruned_bytes = 0u;
+    unsigned int reuse_hits = 0u;
+    unsigned int reuse_misses = 0u;
+    unsigned int reuse_bytes = 0u;
+
+
     unsigned int wal_textured_face_count = 0u;
     unsigned int wal_animated_flat_face_count = 0u;
     unsigned int wal_special_flat_face_count = 0u;
@@ -5466,6 +5682,12 @@ static qboolean Q2GX_LoadWorldGeometry(
     unsigned int face_index;
     unsigned int output_index;
     unsigned int index;
+
+    reuse_wal_textures =
+        Q2GX_DetachWorldWALTexturesForReuse(
+            &reuse_wal_texture_count,
+            &reuse_wal_texture_bytes
+        );
 
     Q2GX_FreeWorldGeometry();
 
@@ -6044,6 +6266,16 @@ triangle_count = 0u;
         goto fail;
     }
 
+    Q2GX_PruneReusableWorldWALTextures(
+        reuse_wal_textures,
+        reuse_wal_texture_count,
+        world_texinfos,
+        texinfo_count,
+        &reuse_kept,
+        &reuse_pruned,
+        &reuse_pruned_bytes
+    );
+
     allocation_bytes = (size_t)gx_vertex_count * sizeof(*world_vertices);
     face_allocation_bytes = (size_t)face_count * sizeof(*world_faces);
     node_allocation_bytes = (size_t)node_count * sizeof(*world_nodes);
@@ -6586,6 +6818,23 @@ triangle_count = 0u;
                             ];
 
                         if (
+                            Q2GX_TakeReusableWorldWALTexture(
+                                reuse_wal_textures,
+                                reuse_wal_texture_count,
+                                face_texinfo->texture,
+                                wal_texture
+                            )
+                        )
+                        {
+                            ++reuse_hits;
+                            reuse_bytes +=
+                                wal_texture->texture_bytes;
+                        }
+                        else
+                        {
+                            ++reuse_misses;
+
+                        if (
                             !Q2GX_LoadWorldWALTexture(
                                 face_texinfo->texture,
                                 wal_texture
@@ -6599,6 +6848,7 @@ triangle_count = 0u;
                             );
 
                             goto fail;
+                        }
                         }
 
                         cache_index =
@@ -7157,6 +7407,35 @@ q2gx_world_vertices = world_vertices;
     q2gx_world_texinfos = world_texinfos;
     q2gx_world_texinfo_count = texinfo_count;
 
+    Q2GX_FreeWorldWALTextureArray(
+        reuse_wal_textures,
+        reuse_wal_texture_count
+    );
+
+    reuse_wal_textures = NULL;
+
+    ri.Con_Printf(
+        PRINT_ALL,
+        "Q2GC REF_GX WAL REUSE: "
+        "path=%s source=%u source_bytes=%u "
+        "kept=%u pruned=%u pruned_bytes=%u "
+        "hits=%u misses=%u reused_bytes=%u "
+        "new_cached=%u new_bytes=%u "
+        "mode=previous_map_move_prune_v1\n",
+        path,
+        reuse_wal_texture_count,
+        reuse_wal_texture_bytes,
+        reuse_kept,
+        reuse_pruned,
+        reuse_pruned_bytes,
+        reuse_hits,
+        reuse_misses,
+        reuse_bytes,
+        world_wal_texture_count,
+        world_wal_texture_bytes
+    );
+
+
     q2gx_world_wal_textures =
         world_wal_textures;
 
@@ -7400,6 +7679,14 @@ fail:
         wal_face_fill_counts =
             NULL;
     }
+
+
+    Q2GX_FreeWorldWALTextureArray(
+        reuse_wal_textures,
+        reuse_wal_texture_count
+    );
+
+    reuse_wal_textures = NULL;
 
 
     Q2GX_FreeWorldWALTextureArray(
